@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/speech-core-protocol",
+    "crates/speech-core-daemon",
+    "crates/speech-core-mic-adapter",
+    "crates/speech-core-watch",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/speech-core"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytes = "1.6"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.23"
+tungstenite = "0.23"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

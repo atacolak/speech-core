@@ -1,0 +1,18 @@
+[package]
+name = "speech-core-mic-adapter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cpal = "0.15"
+futures-util.workspace = true
+serde_json.workspace = true
+speech-core-protocol = { path = "../speech-core-protocol" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

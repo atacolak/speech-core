@@ -1,0 +1,12 @@
+/target/
+/logs/
+/result
+/result-*
+.direnv/
+.env
+*.log
+*.pid
+*.tmp
+.DS_Store
+
+.pi/
