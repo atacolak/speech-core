@@ -41,6 +41,7 @@ echo "  vad_threshold:     $vad_threshold"
 echo "  vad_hangover_ms:   $((vad_hangover_frames * 30))"
 echo "  eou_model_dir:     $eou_model_dir"
 echo "  eou_chunk_ms:      $eou_chunk_ms"
+echo "  eou_reset_on_token:$eou_reset_on_token"
 echo "  vad_close:         $turn_vad_close_enabled"
 echo
 echo "sfnix client example:"

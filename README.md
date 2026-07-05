@@ -181,7 +181,7 @@ eou_token_detected
 eou_session_end
 ```
 
-Important latency reality: the vendored Parakeet EOU path waits for 1 second of audio before first inference and was observed on live laptop speech to emit some EOU tokens several seconds after Silero's speech_end. Its per-chunk CPU inference is roughly 70-110 ms; the bad part is model decision latency/state behavior, not websocket transport. Therefore the production default uses Silero VAD speech_end for fast turn closure, with Parakeet EOU retained as non-degraded model evidence when it arrives.
+Important latency reality: the vendored Parakeet EOU path waits for 1 second of audio before first inference and was observed on live laptop speech to emit some EOU tokens several seconds after Silero's speech_end. Its per-chunk CPU inference is roughly 40-110 ms; the bad part is model decision latency/state behavior, not websocket transport. Therefore the production default uses Silero VAD speech_end for fast turn closure, with Parakeet EOU retained as non-degraded model evidence when it arrives.
 
 Current installed default policy:
 
@@ -190,7 +190,21 @@ SPEECH_CORE_VAD_HANGOVER_FRAMES=4      # 4 * 30ms = ~120ms decision delay after 
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true
 SPEECH_CORE_EOU_CHUNK_MS=160           # model-native-ish; lowering this alone will not fix seconds-late EOU
+SPEECH_CORE_EOU_RESET_ON_TOKEN=false   # raw model EOU is evidence; accepted turn closure owns reset
 ```
+
+EOU reset policy is deliberately split now:
+
+```text
+raw eou token emitted by Parakeet        -> candidate only, no automatic reset
+suppressed model EOU                    -> no reset
+new VAD-started turn                    -> stream reset anchored to VAD start_sample, with recent-audio replay
+accepted VAD or model turn closure      -> decoder-state reset only
+```
+
+The reason to reset at all: Parakeet EOU is an RNNT-style streaming decoder with prediction-network state (`state_h`, `state_c`, `last_token`) and encoder cache. After an accepted turn boundary, decoder state should not carry the prior utterance into the next turn. The bug was resetting immediately on any raw `<EOU>` token, before the turn manager knew whether that EOU was valid. Startup/silence or in-speech EOU tokens could therefore reset/poison state even when later suppressed. The daemon now lets the turn manager arbitrate first.
+
+On VAD speech start, the daemon keeps a 4-second recent-audio ring buffer and replays from the VAD `start_sample` into the EOU stream reset. This avoids losing pre-roll/onset audio and avoids anchoring Parakeet warmup at the later VAD decision sample.
 
 The turn manager consumes detector signals and emits:
 
@@ -215,8 +229,23 @@ cargo run -p speech-core-file-adapter -- \
   --url ws://127.0.0.1:8765/ws/audio-ingress \
   --realtime \
   --append-silence-ms 3000 \
+  --hold-open-ms 2500 \
   /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
 ```
+
+`--hold-open-ms` keeps the websocket open after replayed samples finish, which prevents session-end silence flushing from being mistaken for normal live-mic behavior during latency probes.
+
+Observed local file-replay smoke after the reset repair:
+
+```text
+fixture: stt-nemotron.../test_wavs/0.wav, realtime, +5000ms silence, hold-open=2500ms
+model-only closure: source=model decision=111840 samples
+vad speech_end:     end=98400, decision=100320 samples
+model lag:          ~840ms after true VAD end, ~720ms after VAD decision
+fast product mode:  source=vad closes at VAD decision, ~120ms after VAD end
+```
+
+JFK remains a messy multi-pause fixture and can still group rapid subsegments under model-only closure. That is expected; the product path should stay VAD-fast unless/until Parakeet EOU proves consistently better on real live utterances.
 
 ## Install and persistence
 
