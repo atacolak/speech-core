@@ -70,7 +70,7 @@ struct Args {
     vad_onset_frames: usize,
 
     /// Consecutive 30ms non-speech frames required before speech_end.
-    #[arg(long, default_value_t = 8, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
+    #[arg(long, default_value_t = 12, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
     vad_hangover_frames: usize,
 
     /// Pre-roll 30ms frames included in reported VAD speech start sample.

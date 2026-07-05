@@ -2,6 +2,19 @@
 
 Durable Rust scaffold for speech-core central inference-host ingress plus source-device microphone adapters. The default path remains transport-only: timestamped PCM frames over persistent WebSocket, daemon-side validation/metrics, and JSONL event logs. The daemon can optionally load a transcribe.cpp Nemotron streaming GGUF and emit model/transcript JSONL events behind the same ingress.
 
+## current operational docs
+
+start here if you are continuing work in a new session:
+
+```text
+docs/current-state.md      current runtime, commands, what works/does not
+docs/turn-detection.md    exact `<EOU>` trigger and tuning knobs
+docs/seams.md             component boundaries and contracts
+docs/session-handoff.md   compact context for the next assistant session
+```
+
+short version: current `<EOU>` is silero vad turn closure, not a language-aware eou model. a pause of about 360ms can close a turn if the speech segment was at least 700ms long.
+
 ## Workspace
 
 ```text
@@ -173,7 +186,7 @@ vad_session_end
 Current installed default policy:
 
 ```text
-SPEECH_CORE_VAD_HANGOVER_FRAMES=8        # 8 * 30ms = ~240ms silence before speech_end
+SPEECH_CORE_VAD_HANGOVER_FRAMES=12        # 12 * 30ms = ~360ms silence before speech_end
 SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=700   # suppress short mic clicks / noise bursts
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
 SPEECH_CORE_EOU_MODEL_DIR=               # empty: Parakeet realtime EOU worker disabled
