@@ -12,6 +12,7 @@ const DETECTOR: &str = "parakeet_realtime_eou_120m_v1";
 const MODEL_NAME: &str = "parakeet_realtime_eou_120m-v1";
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_CHUNK_MS: u32 = 160;
+const MIN_BUFFER_SAMPLES: u64 = SAMPLE_RATE as u64;
 
 #[derive(Debug, Clone)]
 pub struct ParakeetEouConfig {
@@ -243,6 +244,7 @@ impl AudioDetector for ParakeetEouDetector {
                         session.model.reset_stream_state();
                         session.buffer.clear();
                         session.next_chunk_sample_start = *decision_sample;
+                        session.samples_since_stream_reset = 0;
                         session.stream_resets = session.stream_resets.saturating_add(1);
                     }
                     EouResetMode::Decoder => {
@@ -281,6 +283,7 @@ struct EouSession {
     eou_tokens_detected: u32,
     decoder_resets: u32,
     stream_resets: u32,
+    samples_since_stream_reset: u64,
 }
 
 impl EouSession {
@@ -296,6 +299,7 @@ impl EouSession {
             eou_tokens_detected: 0,
             decoder_resets: 0,
             stream_resets: 0,
+            samples_since_stream_reset: 0,
         }
     }
 
@@ -316,6 +320,10 @@ impl EouSession {
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorSignal>> {
         let detector_start_mono_ns = now_mono_ns();
+        let samples_since_stream_reset_before = self.samples_since_stream_reset;
+        let samples_since_stream_reset_after = self
+            .samples_since_stream_reset
+            .saturating_add(chunk.len() as u64);
         // `reset_on_eou` is intentionally normally false in speech-core.  A raw `<EOU>` token is
         // only evidence; the turn manager decides whether that candidate is accepted.  Accepted
         // turn closures send a ResetEouState action back to this detector.
@@ -324,6 +332,7 @@ impl EouSession {
             .transcribe(chunk, reset_on_eou)
             .map_err(|e| anyhow::anyhow!("Parakeet EOU inference failed: {e}"))?;
         let detector_end_mono_ns = now_mono_ns();
+        self.samples_since_stream_reset = samples_since_stream_reset_after;
         self.chunks_processed = self.chunks_processed.saturating_add(1);
         let eou_detected = raw_text.contains("[EOU]") || raw_text.contains("<EOU>");
         let text_delta = raw_text
@@ -355,9 +364,19 @@ impl EouSession {
             },
             eou_detected,
             reset_on_eou,
+            samples_since_stream_reset_before,
+            samples_since_stream_reset_after,
+            warmup_complete: samples_since_stream_reset_after >= MIN_BUFFER_SAMPLES,
+            min_buffer_samples: MIN_BUFFER_SAMPLES,
             ingress_receive_mono_ns,
             detector_start_mono_ns,
             detector_end_mono_ns,
+            detector_start_lag_ms: ns_to_ms(
+                detector_start_mono_ns.saturating_sub(ingress_receive_mono_ns),
+            ),
+            detector_end_lag_ms: ns_to_ms(
+                detector_end_mono_ns.saturating_sub(ingress_receive_mono_ns),
+            ),
             detector_duration_ms: ns_to_ms(
                 detector_end_mono_ns.saturating_sub(detector_start_mono_ns),
             ),
@@ -433,9 +452,15 @@ struct EouChunkProcessedEvent {
     transcript_text: Option<String>,
     eou_detected: bool,
     reset_on_eou: bool,
+    samples_since_stream_reset_before: u64,
+    samples_since_stream_reset_after: u64,
+    warmup_complete: bool,
+    min_buffer_samples: u64,
     ingress_receive_mono_ns: u64,
     detector_start_mono_ns: u64,
     detector_end_mono_ns: u64,
+    detector_start_lag_ms: f64,
+    detector_end_lag_ms: f64,
     detector_duration_ms: f64,
 }
 

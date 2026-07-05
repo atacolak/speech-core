@@ -126,6 +126,7 @@ impl TurnManager {
                 session.saw_vad_signal = true;
                 session.in_speech = false;
                 session.last_vad_end_sample = Some(end_sample);
+                session.last_vad_end_decision_sample = Some(decision_sample);
                 let turn_id = session
                     .open_turn
                     .as_ref()
@@ -145,6 +146,8 @@ impl TurnManager {
                     end_sample,
                     decision_sample,
                     text_delta: None,
+                    vad_end_to_model_eou_ms: None,
+                    vad_decision_to_model_eou_ms: None,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
                 let mut actions = Vec::new();
@@ -236,6 +239,14 @@ impl TurnManager {
                     .last_vad_end_sample
                     .filter(|sample| *sample <= decision_sample)
                     .unwrap_or(end_sample);
+                let vad_end_to_model_eou_ms = session
+                    .last_vad_end_sample
+                    .filter(|sample| *sample <= decision_sample)
+                    .map(|sample| samples_to_ms(decision_sample.saturating_sub(sample)));
+                let vad_decision_to_model_eou_ms = session
+                    .last_vad_end_decision_sample
+                    .filter(|sample| *sample <= decision_sample)
+                    .map(|sample| samples_to_ms(decision_sample.saturating_sub(sample)));
                 let turn_id = session
                     .open_turn
                     .as_ref()
@@ -255,6 +266,8 @@ impl TurnManager {
                     end_sample: effective_end_sample,
                     decision_sample,
                     text_delta: Some(text_delta),
+                    vad_end_to_model_eou_ms,
+                    vad_decision_to_model_eou_ms,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
                 let mut actions = Vec::new();
@@ -365,6 +378,7 @@ struct TurnSession {
     saw_vad_signal: bool,
     last_vad_start_sample: Option<u64>,
     last_vad_end_sample: Option<u64>,
+    last_vad_end_decision_sample: Option<u64>,
     last_closed_end_sample: Option<u64>,
     last_closed_decision_sample: Option<u64>,
 }
@@ -381,6 +395,7 @@ impl TurnSession {
             saw_vad_signal: false,
             last_vad_start_sample: None,
             last_vad_end_sample: None,
+            last_vad_end_decision_sample: None,
             last_closed_end_sample: None,
             last_closed_decision_sample: None,
         }
@@ -553,6 +568,10 @@ struct TurnEouCandidateEvent {
     end_sample: u64,
     decision_sample: u64,
     text_delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vad_end_to_model_eou_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vad_decision_to_model_eou_ms: Option<u64>,
     daemon_mono_ns: u64,
 }
 

@@ -78,7 +78,12 @@ struct Args {
     vad_pre_speech_frames: usize,
 
     /// Emit every Silero VAD frame probability event. Verbose, useful for tuning.
-    #[arg(long, default_value_t = false, env = "SPEECH_CORE_VAD_EMIT_FRAMES")]
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "SPEECH_CORE_VAD_EMIT_FRAMES"
+    )]
     vad_emit_frames: bool,
 
     /// Optional Parakeet realtime EOU ONNX directory. Enables model EOU events when set.
@@ -94,11 +99,21 @@ struct Args {
     /// Default false: speech-core treats raw model EOU as evidence and resets only when the
     /// turn manager accepts a boundary. This prevents suppressed startup/silence EOU candidates
     /// from poisoning the decoder state.
-    #[arg(long, default_value_t = false, env = "SPEECH_CORE_EOU_RESET_ON_TOKEN")]
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "SPEECH_CORE_EOU_RESET_ON_TOKEN"
+    )]
     eou_reset_on_token: bool,
 
     /// Emit accumulated Parakeet EOU transcript text in eou_chunk_processed events.
-    #[arg(long, default_value_t = true, env = "SPEECH_CORE_EOU_EMIT_TRANSCRIPT")]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "SPEECH_CORE_EOU_EMIT_TRANSCRIPT"
+    )]
     eou_emit_transcript: bool,
 
     /// Bounded detector-worker input queue depth in audio frames.
@@ -109,6 +124,7 @@ struct Args {
     #[arg(
         long,
         default_value_t = false,
+        action = clap::ArgAction::Set,
         env = "SPEECH_CORE_TURN_VAD_CLOSE_ENABLED"
     )]
     turn_vad_close_enabled: bool,
@@ -117,6 +133,7 @@ struct Args {
     #[arg(
         long,
         default_value_t = true,
+        action = clap::ArgAction::Set,
         env = "SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED"
     )]
     turn_model_eou_close_enabled: bool,
