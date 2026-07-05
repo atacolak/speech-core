@@ -355,13 +355,14 @@ pub enum DetectorAction {
         stream_session_id: String,
         adapter_id: String,
         mode: EouResetMode,
+        anchor_sample: u64,
         source: &'static str,
         reason: &'static str,
         decision_sample: u64,
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EouResetMode {
     /// Reset encoder cache, decoder state, and detector-local queued audio.
     Stream,
@@ -447,5 +448,299 @@ pub(crate) fn decode_frame_to_f32(frame: &AudioFrame) -> Result<Vec<f32>> {
                 })
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+    use tokio::sync::broadcast;
+
+    #[derive(Debug, Default)]
+    struct MockDetector {
+        signal_batches: Arc<Mutex<Vec<Vec<DetectorSignal>>>>,
+        actions: Arc<Mutex<Vec<DetectorAction>>>,
+    }
+
+    impl AudioDetector for MockDetector {
+        fn start_session(
+            &mut self,
+            _hello: &HelloState,
+            _writer: &mut DetectorWriter<'_>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn ingest_frame(
+            &mut self,
+            _frame: &AudioFrame,
+            _samples: &[f32],
+            _ingress_receive_mono_ns: u64,
+            _writer: &mut DetectorWriter<'_>,
+        ) -> Result<Vec<DetectorSignal>> {
+            Ok(self
+                .signal_batches
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_default())
+        }
+
+        fn end_session(
+            &mut self,
+            _stream_session_id: &str,
+            _reason: &str,
+            _writer: &mut DetectorWriter<'_>,
+        ) -> Result<Vec<DetectorSignal>> {
+            Ok(Vec::new())
+        }
+
+        fn handle_action(
+            &mut self,
+            action: &DetectorAction,
+            _writer: &mut DetectorWriter<'_>,
+        ) -> Result<()> {
+            self.actions.lock().unwrap().push(action.clone());
+            Ok(())
+        }
+    }
+
+    fn test_frame() -> AudioFrame {
+        let provenance = speech_core_protocol::TimestampProvenance::uncalibrated(
+            "test-clock",
+            speech_core_protocol::ClockDomain::HostMonotonic,
+            speech_core_protocol::TimestampQuality::SyntheticScheduled,
+        );
+        AudioFrame::new(
+            speech_core_protocol::AudioFrameHeader {
+                stream_id: "test.stream".into(),
+                stream_session_id: "test.session".into(),
+                adapter_id: "test.adapter".into(),
+                source_kind: speech_core_protocol::SourceKind::Synthetic,
+                seq: 0,
+                format: PcmFormat::PcmS16Le,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                source_sample_start: 0,
+                sample_count: 320,
+                source_capture_mono_ns: 1,
+                adapter_send_mono_ns: 2,
+                timestamp_provenance: provenance,
+                preceding_source_gap: None,
+            },
+            vec![0_u8; 640],
+        )
+        .unwrap()
+    }
+
+    fn with_worker<
+        F: FnOnce(
+            &mut DetectorWorker,
+            &Runtime,
+            Arc<Mutex<Vec<DetectorAction>>>,
+            Arc<Mutex<Vec<Vec<DetectorSignal>>>>,
+        ),
+    >(
+        turn_config: TurnManagerConfig,
+        f: F,
+    ) {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let logger = runtime.block_on(async {
+            let (event_tx, _) = broadcast::channel(16);
+            JsonlLogger::open(dir.path().to_path_buf(), event_tx)
+                .await
+                .unwrap()
+        });
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let signal_batches = Arc::new(Mutex::new(Vec::new()));
+        let detector = MockDetector {
+            signal_batches: Arc::clone(&signal_batches),
+            actions: Arc::clone(&actions),
+        };
+        let mut worker = DetectorWorker {
+            logger,
+            runtime: runtime.handle().clone(),
+            detectors: vec![Box::new(detector)],
+            turn_manager: TurnManager::new(turn_config),
+        };
+        f(&mut worker, &runtime, actions, signal_batches);
+    }
+
+    #[test]
+    fn vad_start_dispatches_stream_reset_anchored_to_speech_start() {
+        with_worker(
+            TurnManagerConfig {
+                vad_close_enabled: true,
+                model_eou_close_enabled: true,
+                ..Default::default()
+            },
+            |worker, runtime, actions, _signal_batches| {
+                let logger = worker.logger.clone();
+                let mut writer = DetectorWriter::new(&logger, runtime.handle());
+                let signal = DetectorSignal::VadSegmentStart {
+                    detector: "silero_vad",
+                    stream_id: "test.stream".into(),
+                    stream_session_id: "test.session".into(),
+                    adapter_id: "test.adapter".into(),
+                    start_sample: 1_600,
+                    decision_sample: 4_800,
+                    confidence: Some(0.9),
+                };
+                worker.handle_signals(vec![signal], &mut writer).unwrap();
+                let actions = actions.lock().unwrap();
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    DetectorAction::ResetEouState {
+                        mode,
+                        anchor_sample,
+                        decision_sample,
+                        reason,
+                        ..
+                    } => {
+                        assert_eq!(*mode, EouResetMode::Stream);
+                        assert_eq!(*anchor_sample, 1_600);
+                        assert_eq!(*decision_sample, 4_800);
+                        assert_eq!(*reason, "vad_speech_start");
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn suppressed_model_eou_does_not_dispatch_reset() {
+        with_worker(
+            TurnManagerConfig {
+                vad_close_enabled: true,
+                model_eou_close_enabled: true,
+                ..Default::default()
+            },
+            |worker, runtime, actions, _signal_batches| {
+                let logger = worker.logger.clone();
+                let mut writer = DetectorWriter::new(&logger, runtime.handle());
+                let signals = vec![
+                    DetectorSignal::VadSegmentStart {
+                        detector: "silero_vad",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        start_sample: 0,
+                        decision_sample: 3_200,
+                        confidence: Some(0.9),
+                    },
+                    DetectorSignal::ModelEou {
+                        detector: "parakeet_realtime_eou_120m_v1",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        end_sample: 8_000,
+                        decision_sample: 8_000,
+                        text_delta: String::new(),
+                        confidence: None,
+                    },
+                ];
+                worker.handle_signals(signals, &mut writer).unwrap();
+                let actions = actions.lock().unwrap();
+                assert_eq!(actions.len(), 1);
+                match &actions[0] {
+                    DetectorAction::ResetEouState { reason, .. } => {
+                        assert_eq!(*reason, "vad_speech_start");
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn accepted_model_eou_dispatches_decoder_reset() {
+        with_worker(
+            TurnManagerConfig {
+                vad_close_enabled: false,
+                model_eou_close_enabled: true,
+                ..Default::default()
+            },
+            |worker, runtime, actions, _signal_batches| {
+                let logger = worker.logger.clone();
+                let mut writer = DetectorWriter::new(&logger, runtime.handle());
+                let signals = vec![
+                    DetectorSignal::VadSegmentStart {
+                        detector: "silero_vad",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        start_sample: 0,
+                        decision_sample: 3_200,
+                        confidence: Some(0.9),
+                    },
+                    DetectorSignal::VadSegmentEnd {
+                        detector: "silero_vad",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        start_sample: 0,
+                        end_sample: 16_000,
+                        decision_sample: 17_920,
+                        confidence: Some(0.1),
+                    },
+                    DetectorSignal::ModelEou {
+                        detector: "parakeet_realtime_eou_120m_v1",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        end_sample: 24_000,
+                        decision_sample: 24_000,
+                        text_delta: String::new(),
+                        confidence: None,
+                    },
+                ];
+                worker.handle_signals(signals, &mut writer).unwrap();
+                let actions = actions.lock().unwrap();
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    DetectorAction::ResetEouState {
+                        mode: EouResetMode::Decoder,
+                        reason: "eou_token_detected",
+                        anchor_sample: 24_000,
+                        ..
+                    }
+                )));
+            },
+        );
+    }
+
+    #[test]
+    fn worker_routes_actions_to_later_detectors_in_same_audio_frame() {
+        with_worker(
+            TurnManagerConfig {
+                vad_close_enabled: true,
+                model_eou_close_enabled: true,
+                ..Default::default()
+            },
+            |worker, _runtime, actions, signal_batches| {
+                signal_batches
+                    .lock()
+                    .unwrap()
+                    .push(vec![DetectorSignal::VadSegmentStart {
+                        detector: "silero_vad",
+                        stream_id: "test.stream".into(),
+                        stream_session_id: "test.session".into(),
+                        adapter_id: "test.adapter".into(),
+                        start_sample: 960,
+                        decision_sample: 4_320,
+                        confidence: Some(0.9),
+                    }]);
+                worker.handle(DetectorCommand::AudioFrame {
+                    frame: test_frame(),
+                    ingress_receive_mono_ns: 42,
+                });
+                let actions = actions.lock().unwrap();
+                assert_eq!(actions.len(), 1);
+            },
+        );
     }
 }

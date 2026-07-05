@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use parakeet_rs::{ParakeetEOU, ParakeetEOUHandle};
 use serde::Serialize;
 use speech_core_protocol::{now_mono_ns, AudioFrame, PcmFormat};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use super::{AudioDetector, DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
@@ -232,6 +232,7 @@ impl AudioDetector for ParakeetEouDetector {
                 stream_session_id,
                 adapter_id,
                 mode,
+                anchor_sample,
                 source,
                 reason,
                 decision_sample,
@@ -241,11 +242,15 @@ impl AudioDetector for ParakeetEouDetector {
                 };
                 match mode {
                     EouResetMode::Stream => {
+                        let mut replay = session.replay_from(*anchor_sample);
+                        let replay_samples = std::mem::take(&mut replay.samples);
                         session.model.reset_stream_state();
-                        session.buffer.clear();
-                        session.next_chunk_sample_start = *decision_sample;
+                        session.buffer = replay_samples;
+                        session.next_chunk_sample_start =
+                            replay.start_sample.unwrap_or(*anchor_sample);
                         session.samples_since_stream_reset = 0;
                         session.stream_resets = session.stream_resets.saturating_add(1);
+                        session.last_replay = Some(replay);
                     }
                     EouResetMode::Decoder => {
                         session.model.reset_decoder_state();
@@ -253,6 +258,7 @@ impl AudioDetector for ParakeetEouDetector {
                     }
                 }
                 let reset_index = session.decoder_resets.saturating_add(session.stream_resets);
+                let replay = session.last_replay.take();
                 writer.write(&EouStateResetEvent {
                     event: "eou_state_reset",
                     stream_id: stream_id.clone(),
@@ -261,6 +267,12 @@ impl AudioDetector for ParakeetEouDetector {
                     detector: DETECTOR,
                     reset_index,
                     mode: mode.as_str(),
+                    anchor_sample: *anchor_sample,
+                    replay_start_sample: replay.as_ref().and_then(|replay| replay.start_sample),
+                    replay_sample_count: replay.as_ref().map_or(0, |replay| replay.sample_count),
+                    replay_anchor_available: replay
+                        .as_ref()
+                        .is_none_or(|replay| replay.anchor_available),
                     source,
                     reason,
                     decision_sample: *decision_sample,
@@ -272,11 +284,22 @@ impl AudioDetector for ParakeetEouDetector {
     }
 }
 
+struct ReplayAudio {
+    samples: Vec<f32>,
+    start_sample: Option<u64>,
+    sample_count: u64,
+    anchor_available: bool,
+}
+
 struct EouSession {
     hello: HelloState,
     model: ParakeetEOU,
     buffer: Vec<f32>,
     chunk_samples: usize,
+    recent_audio: VecDeque<f32>,
+    recent_audio_start_sample: u64,
+    recent_audio_capacity: usize,
+    last_replay: Option<ReplayAudio>,
     next_chunk_sample_start: u64,
     transcript: String,
     chunks_processed: u64,
@@ -293,6 +316,10 @@ impl EouSession {
             model,
             buffer: Vec::with_capacity(chunk_samples * 2),
             chunk_samples,
+            recent_audio: VecDeque::with_capacity(SAMPLE_RATE as usize * 4),
+            recent_audio_start_sample: 0,
+            recent_audio_capacity: SAMPLE_RATE as usize * 4,
+            last_replay: None,
             next_chunk_sample_start: 0,
             transcript: String::new(),
             chunks_processed: 0,
@@ -304,10 +331,64 @@ impl EouSession {
     }
 
     fn push_samples(&mut self, frame: &AudioFrame, samples: &[f32]) {
+        self.push_recent_audio(frame.header.source_sample_start, samples);
         if self.buffer.is_empty() {
             self.next_chunk_sample_start = frame.header.source_sample_start;
         }
         self.buffer.extend_from_slice(samples);
+    }
+
+    fn push_recent_audio(&mut self, source_sample_start: u64, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        if self.recent_audio.is_empty() {
+            self.recent_audio_start_sample = source_sample_start;
+            self.recent_audio.extend(samples.iter().copied());
+        } else {
+            let recent_end = self
+                .recent_audio_start_sample
+                .saturating_add(self.recent_audio.len() as u64);
+            if source_sample_start > recent_end {
+                self.recent_audio.clear();
+                self.recent_audio_start_sample = source_sample_start;
+                self.recent_audio.extend(samples.iter().copied());
+            } else if source_sample_start < recent_end {
+                let overlap = recent_end.saturating_sub(source_sample_start) as usize;
+                if overlap < samples.len() {
+                    self.recent_audio.extend(samples[overlap..].iter().copied());
+                }
+            } else {
+                self.recent_audio.extend(samples.iter().copied());
+            }
+        }
+        while self.recent_audio.len() > self.recent_audio_capacity {
+            self.recent_audio.pop_front();
+            self.recent_audio_start_sample = self.recent_audio_start_sample.saturating_add(1);
+        }
+    }
+
+    fn replay_from(&self, anchor_sample: u64) -> ReplayAudio {
+        let recent_end = self
+            .recent_audio_start_sample
+            .saturating_add(self.recent_audio.len() as u64);
+        if self.recent_audio.is_empty() || anchor_sample >= recent_end {
+            return ReplayAudio {
+                samples: Vec::new(),
+                start_sample: None,
+                sample_count: 0,
+                anchor_available: anchor_sample == recent_end,
+            };
+        }
+        let start_sample = anchor_sample.max(self.recent_audio_start_sample);
+        let offset = start_sample.saturating_sub(self.recent_audio_start_sample) as usize;
+        let samples: Vec<f32> = self.recent_audio.iter().skip(offset).copied().collect();
+        ReplayAudio {
+            sample_count: samples.len() as u64,
+            samples,
+            start_sample: Some(start_sample),
+            anchor_available: start_sample == anchor_sample,
+        }
     }
 
     fn process_chunk(
@@ -505,6 +586,10 @@ struct EouStateResetEvent {
     detector: &'static str,
     reset_index: u32,
     mode: &'static str,
+    anchor_sample: u64,
+    replay_start_sample: Option<u64>,
+    replay_sample_count: u64,
+    replay_anchor_available: bool,
     source: &'static str,
     reason: &'static str,
     decision_sample: u64,

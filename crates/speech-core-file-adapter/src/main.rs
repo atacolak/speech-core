@@ -49,6 +49,14 @@ struct Args {
     /// Append this many milliseconds of silence after the wav.
     #[arg(long, default_value_t = 1200)]
     append_silence_ms: u32,
+
+    /// Keep the websocket open this many milliseconds after all samples are sent.
+    ///
+    /// Useful when testing realtime detector latency: if this is zero, connection teardown can
+    /// trigger session-end silence flushes that are not representative of a still-open microphone
+    /// stream.
+    #[arg(long, default_value_t = 0)]
+    hold_open_ms: u32,
 }
 
 #[tokio::main]
@@ -125,6 +133,11 @@ async fn main() -> Result<()> {
         drain_available_text(&mut ws).await?;
         seq = seq.saturating_add(1);
         source_sample_start = source_sample_start.saturating_add(u64::from(sample_count));
+    }
+
+    if args.hold_open_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(args.hold_open_ms as u64)).await;
+        drain_available_text(&mut ws).await?;
     }
 
     ws.close(None).await.ok();

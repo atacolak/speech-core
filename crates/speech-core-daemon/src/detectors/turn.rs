@@ -80,7 +80,8 @@ impl TurnManager {
                 confidence,
             } => {
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
-                if session.open_turn.is_none() {
+                let started_new_turn = session.open_turn.is_none();
+                if started_new_turn {
                     session.start_turn(start_sample, "vad", writer)?;
                 }
                 session.saw_vad_signal = true;
@@ -98,15 +99,20 @@ impl TurnManager {
                     confidence,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
-                Ok(vec![DetectorAction::ResetEouState {
-                    stream_id,
-                    stream_session_id,
-                    adapter_id,
-                    mode: EouResetMode::Stream,
-                    source: "vad",
-                    reason: "vad_speech_start",
-                    decision_sample,
-                }])
+                if started_new_turn {
+                    Ok(vec![DetectorAction::ResetEouState {
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        mode: EouResetMode::Stream,
+                        anchor_sample: start_sample,
+                        source: "vad",
+                        reason: "vad_speech_start",
+                        decision_sample,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
             }
             DetectorSignal::VadSegmentEnd {
                 detector,
@@ -168,6 +174,7 @@ impl TurnManager {
                         stream_session_id,
                         adapter_id,
                         mode: EouResetMode::Decoder,
+                        anchor_sample: decision_sample,
                         source: "vad",
                         reason: "vad_speech_end",
                         decision_sample,
@@ -288,6 +295,7 @@ impl TurnManager {
                         stream_session_id,
                         adapter_id,
                         mode: EouResetMode::Decoder,
+                        anchor_sample: decision_sample,
                         source: "model",
                         reason: "eou_token_detected",
                         decision_sample,
