@@ -172,13 +172,24 @@ vad_frame              # only with --vad-emit-frames
 vad_session_end
 ```
 
-Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
+Parakeet realtime EOU currently consumes 160 ms / 2560-sample chunks and emits:
 
 ```text
 eou_session_start
 eou_chunk_processed
 eou_token_detected
 eou_session_end
+```
+
+Important latency reality: the vendored Parakeet EOU path waits for 1 second of audio before first inference and was observed on live laptop speech to emit some EOU tokens several seconds after Silero's speech_end. Its per-chunk CPU inference is roughly 70-110 ms; the bad part is model decision latency/state behavior, not websocket transport. Therefore the production default uses Silero VAD speech_end for fast turn closure, with Parakeet EOU retained as non-degraded model evidence when it arrives.
+
+Current installed default policy:
+
+```text
+SPEECH_CORE_VAD_HANGOVER_FRAMES=4      # 4 * 30ms = ~120ms decision delay after non-speech
+SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
+SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true
+SPEECH_CORE_EOU_CHUNK_MS=160           # model-native-ish; lowering this alone will not fix seconds-late EOU
 ```
 
 The turn manager consumes detector signals and emits:
@@ -193,11 +204,7 @@ turn_closed
 turn_session_end
 ```
 
-`turn_eou` with `source: "model"` and `degraded: false` is the intended product path. VAD close is available as explicit degraded fallback/comparison with:
-
-```bash
---turn-vad-close-enabled true
-```
+`turn_eou` with `source: "vad"` and `degraded: true` is the current fast interactive product path. `turn_eou` with `source: "model"` and `degraded: false` remains useful evidence, but is not currently fast enough to gate laptop voice-control turn closure.
 
 The Parakeet EOU integration vendors `parakeet-rs` under `vendor/parakeet-rs` and applies the Sherpa issue #2805/NeMo-style nested-symbol-loop fix: greedy RNNT decoding may emit up to 10 symbols per encoder frame, not one. This materially improves short/streaming output compared with the broken one-symbol-per-frame pattern discussed in sherpa-onnx.
 
