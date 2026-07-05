@@ -21,6 +21,8 @@ channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
 frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
 run_dir="${SPEECH_CORE_RUN_DIR:-/tmp/speech-core-session-$(date +%Y%m%d-%H%M%S)}"
+watch_mode="${SPEECH_CORE_WATCH_MODE:-transcript}"
+watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-1}"
 device_arg=()
 if [[ -n "${SPEECH_CORE_DEVICE:-}" ]]; then
   device_arg=(--device "$SPEECH_CORE_DEVICE")
@@ -44,11 +46,17 @@ adapter_pid=""
 watch_pid=""
 cleaned_up=0
 
-"$bin_dir/speech-core-watch" \
-  --url "$ws_url" \
-  --stream-id "$stream_id" \
-  --stream-session-id "$session_id" \
-  --mode transcript &
+watch_args=(
+  --url "$ws_url"
+  --stream-id "$stream_id"
+  --stream-session-id "$session_id"
+  --mode "$watch_mode"
+)
+if [[ "$watch_verbose" == "1" || "$watch_verbose" == "true" || "$watch_verbose" == "yes" ]]; then
+  watch_args+=(--verbose)
+fi
+
+"$bin_dir/speech-core-watch" "${watch_args[@]}" &
 watch_pid=$!
 
 cleanup() {
