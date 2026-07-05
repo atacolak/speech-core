@@ -70,7 +70,7 @@ struct Args {
     vad_onset_frames: usize,
 
     /// Consecutive 30ms non-speech frames required before speech_end.
-    #[arg(long, default_value_t = 15, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
+    #[arg(long, default_value_t = 8, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
     vad_hangover_frames: usize,
 
     /// Pre-roll 30ms frames included in reported VAD speech start sample.
@@ -86,7 +86,7 @@ struct Args {
     )]
     vad_emit_frames: bool,
 
-    /// Optional Parakeet realtime EOU ONNX directory. Enables model EOU events when set.
+    /// Optional Parakeet realtime EOU ONNX directory. Experimental/retired by default.
     #[arg(long, env = "SPEECH_CORE_EOU_MODEL_DIR")]
     eou_model_dir: Option<PathBuf>,
 
@@ -132,11 +132,19 @@ struct Args {
     /// Allow Parakeet EOU tokens to close turns as non-degraded model EOU.
     #[arg(
         long,
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set,
         env = "SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED"
     )]
     turn_model_eou_close_enabled: bool,
+
+    /// Minimum VAD segment duration before accepting VAD speech_end as a turn boundary.
+    #[arg(
+        long,
+        default_value_t = 700,
+        env = "SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS"
+    )]
+    turn_min_vad_speech_ms: u32,
 
     /// Minimum observed speech before accepting a model EOU token.
     #[arg(
@@ -207,6 +215,7 @@ async fn main() -> Result<()> {
         eou: args
             .eou_model_dir
             .clone()
+            .filter(|model_dir| !model_dir.as_os_str().is_empty())
             .map(|model_dir| ParakeetEouConfig {
                 model_dir,
                 chunk_ms: args.eou_chunk_ms,
@@ -216,6 +225,7 @@ async fn main() -> Result<()> {
         turn: TurnManagerConfig {
             model_eou_close_enabled: args.turn_model_eou_close_enabled,
             vad_close_enabled: args.turn_vad_close_enabled,
+            min_vad_speech_ms: args.turn_min_vad_speech_ms,
             min_model_eou_speech_ms: args.turn_min_model_eou_speech_ms,
             model_eou_refractory_ms: args.turn_model_eou_refractory_ms,
         },

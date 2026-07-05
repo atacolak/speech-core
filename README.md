@@ -150,16 +150,14 @@ model_error
 
 `transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
 
-## Optional VAD + Parakeet realtime EOU
+## VAD turn detection and retired Parakeet realtime EOU
 
-The daemon can also run modular detector workers beside the ASR worker:
+The current interactive turn boundary path is deliberately simple:
 
-```bash
-cargo run -p speech-core-daemon -- \
-  --bind 127.0.0.1:8765 \
-  --log-dir ./logs \
-  --vad-model-path /home/sf/workspace/handy-tailnet-api/src-tauri/resources/models/silero_vad_v4.onnx \
-  --eou-model-dir /home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx
+```text
+microphone audio -> Silero VAD -> turn_closed source=vad -> watcher prints <EOU>
+                     |
+                     +-> Nemotron ASR keeps streaming transcript text
 ```
 
 Silero VAD consumes 30 ms / 480-sample frames and emits:
@@ -172,7 +170,30 @@ vad_frame              # only with --vad-emit-frames
 vad_session_end
 ```
 
-Parakeet realtime EOU currently consumes 160 ms / 2560-sample chunks and emits:
+Current installed default policy:
+
+```text
+SPEECH_CORE_VAD_HANGOVER_FRAMES=8        # 8 * 30ms = ~240ms silence before speech_end
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=700   # suppress short mic clicks / noise bursts
+SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
+SPEECH_CORE_EOU_MODEL_DIR=               # empty: Parakeet realtime EOU worker disabled
+SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
+```
+
+Why Parakeet realtime EOU is retired for now:
+
+- live laptop tests showed many raw `<EOU>` tokens on silence/background state.
+- model EOU often arrived late relative to Silero speech_end.
+- recent ~59s live session produced one real spoken region in the transcript, but Parakeet emitted 51 EOU tokens, 50 of which were suppressed.
+- same session had short false VAD blips before speech; `TURN_MIN_VAD_SPEECH_MS=700` filters those, and a larger VAD hangover should merge tiny internal dips.
+
+The Parakeet EOU code remains in-tree for experiments, but it is not part of the default runtime. To re-enable it intentionally:
+
+```bash
+SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true ./scripts/install-sfub-daemon.sh
+```
+
+If enabled, Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
 
 ```text
 eou_session_start
@@ -181,71 +202,22 @@ eou_token_detected
 eou_session_end
 ```
 
-Important latency reality: the vendored Parakeet EOU path waits for 1 second of audio before first inference and was observed on live laptop speech to emit some EOU tokens several seconds after Silero's speech_end. Its per-chunk CPU inference is roughly 40-110 ms; the bad part is model decision latency/state behavior, not websocket transport. Therefore the production default uses Silero VAD speech_end for fast turn closure, with Parakeet EOU retained as non-degraded model evidence when it arrives.
+The daemon still uses modular detector plumbing: detectors emit evidence, and the turn manager is the only component that promotes evidence into `turn_eou` / `turn_closed`.
 
-Current installed default policy:
-
-```text
-SPEECH_CORE_VAD_HANGOVER_FRAMES=4      # 4 * 30ms = ~120ms decision delay after non-speech
-SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
-SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true
-SPEECH_CORE_EOU_CHUNK_MS=160           # model-native-ish; lowering this alone will not fix seconds-late EOU
-SPEECH_CORE_EOU_RESET_ON_TOKEN=false   # raw model EOU is evidence; accepted turn closure owns reset
-```
-
-EOU reset policy is deliberately split now:
+The default live watcher now prints transcript text as it appears and prints a clean boundary marker on accepted turn close:
 
 ```text
-raw eou token emitted by Parakeet        -> candidate only, no automatic reset
-suppressed model EOU                    -> no reset
-new VAD-started turn                    -> stream reset anchored to VAD start_sample, with recent-audio replay
-accepted VAD or model turn closure      -> decoder-state reset only
+hello this is a test
+<EOU>
 ```
-
-The reason to reset at all: Parakeet EOU is an RNNT-style streaming decoder with prediction-network state (`state_h`, `state_c`, `last_token`) and encoder cache. After an accepted turn boundary, decoder state should not carry the prior utterance into the next turn. The bug was resetting immediately on any raw `<EOU>` token, before the turn manager knew whether that EOU was valid. Startup/silence or in-speech EOU tokens could therefore reset/poison state even when later suppressed. The daemon now lets the turn manager arbitrate first.
-
-On VAD speech start, the daemon keeps a 4-second recent-audio ring buffer and replays from the VAD `start_sample` into the EOU stream reset. This avoids losing pre-roll/onset audio and avoids anchoring Parakeet warmup at the later VAD decision sample.
-
-The turn manager consumes detector signals and emits:
-
-```text
-turn_session_start
-turn_started
-turn_eou_candidate
-turn_eou_suppressed
-turn_eou
-turn_closed
-turn_session_end
-```
-
-`turn_eou` with `source: "vad"` and `degraded: true` is the current fast interactive product path. `turn_eou` with `source: "model"` and `degraded: false` remains useful evidence, but is not currently fast enough to gate laptop voice-control turn closure.
-
-The Parakeet EOU integration vendors `parakeet-rs` under `vendor/parakeet-rs` and applies the Sherpa issue #2805/NeMo-style nested-symbol-loop fix: greedy RNNT decoding may emit up to 10 symbols per encoder frame, not one. This materially improves short/streaming output compared with the broken one-symbol-per-frame pattern discussed in sherpa-onnx.
 
 Replay a wav through the daemon for repeatable detector testing:
 
 ```bash
-cargo run -p speech-core-file-adapter -- \
-  --url ws://127.0.0.1:8765/ws/audio-ingress \
-  --realtime \
-  --append-silence-ms 3000 \
-  --hold-open-ms 2500 \
-  /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
+cargo run -p speech-core-file-adapter --   --url ws://127.0.0.1:8765/ws/audio-ingress   --realtime   --append-silence-ms 3000   --hold-open-ms 2500   /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
 ```
 
 `--hold-open-ms` keeps the websocket open after replayed samples finish, which prevents session-end silence flushing from being mistaken for normal live-mic behavior during latency probes.
-
-Observed local file-replay smoke after the reset repair:
-
-```text
-fixture: stt-nemotron.../test_wavs/0.wav, realtime, +5000ms silence, hold-open=2500ms
-model-only closure: source=model decision=111840 samples
-vad speech_end:     end=98400, decision=100320 samples
-model lag:          ~840ms after true VAD end, ~720ms after VAD decision
-fast product mode:  source=vad closes at VAD decision, ~120ms after VAD end
-```
-
-JFK remains a messy multi-pause fixture and can still group rapid subsegments under model-only closure. That is expected; the product path should stay VAD-fast unless/until Parakeet EOU proves consistently better on real live utterances.
 
 ## Install and persistence
 

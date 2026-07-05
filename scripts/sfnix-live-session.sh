@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+env_file="${SPEECH_CORE_CONFIG_FILE:-$HOME/.config/speech-core/client.env}"
+if [[ -f "$env_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -x "$script_dir/speech-core-mic-adapter" && -x "$script_dir/speech-core-watch" ]]; then
   bin_dir="$script_dir"
@@ -22,7 +30,7 @@ format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
 frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
 run_dir="${SPEECH_CORE_RUN_DIR:-/tmp/speech-core-session-$(date +%Y%m%d-%H%M%S)}"
 watch_mode="${SPEECH_CORE_WATCH_MODE:-transcript}"
-watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-1}"
+watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
 device_arg=()
 if [[ -n "${SPEECH_CORE_DEVICE:-}" ]]; then
   device_arg=(--device "$SPEECH_CORE_DEVICE")

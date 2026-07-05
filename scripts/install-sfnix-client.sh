@@ -14,6 +14,7 @@ sample_rate_hz="${SPEECH_CORE_SAMPLE_RATE_HZ:-16000}"
 channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
 frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
+watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
 
 mkdir -p "$bin_dir" "$libexec_dir" "$state_dir" "$config_dir" "$systemd_user_dir"
 cd "$repo_root"
@@ -31,6 +32,7 @@ SPEECH_CORE_SAMPLE_RATE_HZ=$sample_rate_hz
 SPEECH_CORE_CHANNELS=$channels
 SPEECH_CORE_FORMAT=$format
 SPEECH_CORE_FRAME_MS=$frame_ms
+SPEECH_CORE_WATCH_VERBOSE=$watch_verbose
 SPEECH_CORE_RUN_DIR=$state_dir/session
 EOF_ENV
 

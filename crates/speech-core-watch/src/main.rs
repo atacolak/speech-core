@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use speech_core_protocol::ControlMessage;
+use std::io::{self, Write};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -58,6 +59,7 @@ async fn main() -> Result<()> {
 
     let mut last_text = String::new();
     let mut final_text = String::new();
+    let mut printed_transcript = false;
 
     while let Some(msg) = ws.next().await {
         match msg? {
@@ -89,10 +91,23 @@ async fn main() -> Result<()> {
                                 format!("{committed}{tentative}")
                             };
                             if display != last_text {
-                                last_text = display.clone();
                                 if !display.is_empty() {
-                                    println!("{display}");
+                                    if let Some(delta) = display.strip_prefix(&last_text) {
+                                        if !delta.is_empty() {
+                                            print!("{delta}");
+                                            io::stdout().flush()?;
+                                            printed_transcript = true;
+                                        }
+                                    } else {
+                                        if printed_transcript {
+                                            println!();
+                                        }
+                                        print!("{display}");
+                                        io::stdout().flush()?;
+                                        printed_transcript = true;
+                                    }
                                 }
+                                last_text = display;
                             }
                             final_text = committed.to_owned();
                         }
@@ -117,30 +132,43 @@ async fn main() -> Result<()> {
                                 "model chunk: input={input_ms}ms committed={committed_ms}ms buffered={buffered_ms}ms final={is_final}"
                             );
                         }
-                        "turn_eou" | "turn_closed" => {
+                        "turn_closed" => {
                             let source = value
                                 .get("source")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown");
-                            let degraded = value
-                                .get("degraded")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let end_sample = value
-                                .get("end_sample")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or_default();
-                            let decision_sample = value
-                                .get("decision_sample")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or_default();
-                            let detector = value
-                                .get("detector")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            eprintln!(
-                                "{event}: source={source} degraded={degraded} detector={detector} end_sample={end_sample} decision_sample={decision_sample}"
-                            );
+                            if matches!(source, "vad" | "model") {
+                                if printed_transcript {
+                                    println!();
+                                }
+                                println!("<EOU>");
+                                io::stdout().flush()?;
+                                printed_transcript = false;
+                            }
+                            if args.verbose {
+                                let degraded = value
+                                    .get("degraded")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let end_sample = value
+                                    .get("end_sample")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or_default();
+                                let decision_sample = value
+                                    .get("decision_sample")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or_default();
+                                let detector = value
+                                    .get("detector")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                eprintln!(
+                                    "{event}: source={source} degraded={degraded} detector={detector} end_sample={end_sample} decision_sample={decision_sample}"
+                                );
+                            }
+                        }
+                        "turn_eou" if args.verbose => {
+                            eprintln!("{event}: {value}");
                         }
                         "turn_eou_candidate" | "turn_eou_suppressed" if args.verbose => {
                             eprintln!("{event}: {value}");
@@ -161,7 +189,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if args.mode == Mode::Transcript && !final_text.is_empty() {
+    if args.mode == Mode::Transcript && args.verbose && !final_text.is_empty() {
         eprintln!("\nfinal transcript:\n{final_text}");
     }
 

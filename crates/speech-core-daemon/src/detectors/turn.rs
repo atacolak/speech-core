@@ -12,6 +12,8 @@ pub struct TurnManagerConfig {
     pub model_eou_close_enabled: bool,
     /// Promote VAD speech-end into degraded turn closure. Useful as fallback or comparison mode.
     pub vad_close_enabled: bool,
+    /// Ignore VAD speech-end for segments shorter than this. This filters laptop mic clicks/noise.
+    pub min_vad_speech_ms: u32,
     /// Ignore model EOU tokens before at least this much speech has been observed.
     pub min_model_eou_speech_ms: u32,
     /// Ignore repeated EOU tokens this close to the previous close.
@@ -21,8 +23,9 @@ pub struct TurnManagerConfig {
 impl Default for TurnManagerConfig {
     fn default() -> Self {
         Self {
-            model_eou_close_enabled: true,
+            model_eou_close_enabled: false,
             vad_close_enabled: false,
+            min_vad_speech_ms: 700,
             min_model_eou_speech_ms: 300,
             model_eou_refractory_ms: 700,
         }
@@ -58,6 +61,7 @@ impl TurnManager {
             adapter_id: hello.adapter_id.clone(),
             model_eou_close_enabled: self.config.model_eou_close_enabled,
             vad_close_enabled: self.config.vad_close_enabled,
+            min_vad_speech_ms: self.config.min_vad_speech_ms,
             min_model_eou_speech_ms: self.config.min_model_eou_speech_ms,
             model_eou_refractory_ms: self.config.model_eou_refractory_ms,
             daemon_mono_ns: now_mono_ns(),
@@ -125,6 +129,7 @@ impl TurnManager {
                 confidence,
             } => {
                 let vad_close_enabled = self.config.vad_close_enabled;
+                let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "vad", writer)?;
@@ -156,6 +161,31 @@ impl TurnManager {
                     vad_decision_to_model_eou_ms: None,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
+                let observed_speech_samples = end_sample.saturating_sub(start_sample);
+                if observed_speech_samples < min_vad_speech_samples {
+                    writer.write(&TurnEouSuppressedEvent {
+                        event: "turn_eou_suppressed",
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        source: "vad",
+                        detector,
+                        reason: "vad_too_short",
+                        end_sample,
+                        decision_sample,
+                        observed_speech_samples,
+                        min_required_samples: min_vad_speech_samples,
+                        daemon_mono_ns: now_mono_ns(),
+                    })?;
+                    if session
+                        .open_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.start_sample == start_sample)
+                    {
+                        session.open_turn.take();
+                    }
+                    return Ok(Vec::new());
+                }
                 let mut actions = Vec::new();
                 if vad_close_enabled {
                     session.close_turn(
@@ -530,6 +560,7 @@ struct TurnSessionStartEvent {
     adapter_id: String,
     model_eou_close_enabled: bool,
     vad_close_enabled: bool,
+    min_vad_speech_ms: u32,
     min_model_eou_speech_ms: u32,
     model_eou_refractory_ms: u32,
     daemon_mono_ns: u64,

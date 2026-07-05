@@ -14,16 +14,17 @@ model_queue_frames="${SPEECH_CORE_MODEL_QUEUE_FRAMES:-2048}"
 vad_model_path="${SPEECH_CORE_VAD_MODEL_PATH:-/home/sf/workspace/handy-tailnet-api/src-tauri/resources/models/silero_vad_v4.onnx}"
 vad_threshold="${SPEECH_CORE_VAD_THRESHOLD:-0.3}"
 vad_onset_frames="${SPEECH_CORE_VAD_ONSET_FRAMES:-2}"
-vad_hangover_frames="${SPEECH_CORE_VAD_HANGOVER_FRAMES:-4}"
+vad_hangover_frames="${SPEECH_CORE_VAD_HANGOVER_FRAMES:-8}"
 vad_pre_speech_frames="${SPEECH_CORE_VAD_PRE_SPEECH_FRAMES:-5}"
 vad_emit_frames="${SPEECH_CORE_VAD_EMIT_FRAMES:-false}"
-eou_model_dir="${SPEECH_CORE_EOU_MODEL_DIR:-/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx}"
+eou_model_dir="${SPEECH_CORE_EOU_MODEL_DIR:-}"
 eou_chunk_ms="${SPEECH_CORE_EOU_CHUNK_MS:-160}"
 eou_reset_on_token="${SPEECH_CORE_EOU_RESET_ON_TOKEN:-false}"
 eou_emit_transcript="${SPEECH_CORE_EOU_EMIT_TRANSCRIPT:-true}"
 detector_queue_frames="${SPEECH_CORE_DETECTOR_QUEUE_FRAMES:-2048}"
 turn_vad_close_enabled="${SPEECH_CORE_TURN_VAD_CLOSE_ENABLED:-true}"
-turn_model_eou_close_enabled="${SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED:-true}"
+turn_model_eou_close_enabled="${SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED:-false}"
+turn_min_vad_speech_ms="${SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS:-700}"
 turn_min_model_eou_speech_ms="${SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS:-300}"
 turn_model_eou_refractory_ms="${SPEECH_CORE_TURN_MODEL_EOU_REFRACTORY_MS:-700}"
 
@@ -55,6 +56,9 @@ SPEECH_CORE_EOU_EMIT_TRANSCRIPT=$eou_emit_transcript
 SPEECH_CORE_DETECTOR_QUEUE_FRAMES=$detector_queue_frames
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=$turn_vad_close_enabled
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=$turn_model_eou_close_enabled
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=$turn_min_vad_speech_ms
+# Parakeet realtime EOU is intentionally retired from default startup. To re-enable for experiments,
+# set SPEECH_CORE_EOU_MODEL_DIR and SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true before install.
 SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS=$turn_min_model_eou_speech_ms
 SPEECH_CORE_TURN_MODEL_EOU_REFRACTORY_MS=$turn_model_eou_refractory_ms
 RUST_LOG=speech_core_daemon=info

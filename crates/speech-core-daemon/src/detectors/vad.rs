@@ -28,7 +28,7 @@ impl Default for SileroVadConfig {
             model_path: PathBuf::new(),
             threshold: 0.3,
             onset_frames: 2,
-            hangover_frames: 15,
+            hangover_frames: 8,
             pre_speech_frames: 5,
             emit_frames: false,
         }
@@ -498,10 +498,10 @@ mod tests {
     }
 
     #[test]
-    fn default_hangover_is_450ms() {
+    fn default_hangover_is_240ms() {
         assert_eq!(
             SileroVadConfig::default().hangover_frames * FRAME_MS as usize,
-            450
+            240
         );
     }
 }
