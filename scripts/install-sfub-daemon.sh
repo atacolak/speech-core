@@ -49,7 +49,6 @@ SPEECH_CORE_VAD_ONSET_FRAMES=$vad_onset_frames
 SPEECH_CORE_VAD_HANGOVER_FRAMES=$vad_hangover_frames
 SPEECH_CORE_VAD_PRE_SPEECH_FRAMES=$vad_pre_speech_frames
 SPEECH_CORE_VAD_EMIT_FRAMES=$vad_emit_frames
-SPEECH_CORE_EOU_MODEL_DIR=$eou_model_dir
 SPEECH_CORE_EOU_CHUNK_MS=$eou_chunk_ms
 SPEECH_CORE_EOU_RESET_ON_TOKEN=$eou_reset_on_token
 SPEECH_CORE_EOU_EMIT_TRANSCRIPT=$eou_emit_transcript
@@ -63,6 +62,10 @@ SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS=$turn_min_model_eou_speech_ms
 SPEECH_CORE_TURN_MODEL_EOU_REFRACTORY_MS=$turn_model_eou_refractory_ms
 RUST_LOG=speech_core_daemon=info
 EOF_ENV
+
+if [[ -n "$eou_model_dir" ]]; then
+  echo "SPEECH_CORE_EOU_MODEL_DIR=$eou_model_dir" >>"$config_dir/daemon.env"
+fi
 
 cat >"$systemd_user_dir/speech-core-daemon.service" <<EOF_UNIT
 [Unit]

@@ -190,7 +190,9 @@ Why Parakeet realtime EOU is retired for now:
 The Parakeet EOU code remains in-tree for experiments, but it is not part of the default runtime. To re-enable it intentionally:
 
 ```bash
-SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true ./scripts/install-sfub-daemon.sh
+SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
+SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true \
+./scripts/install-sfub-daemon.sh
 ```
 
 If enabled, Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
@@ -214,7 +216,12 @@ hello this is a test
 Replay a wav through the daemon for repeatable detector testing:
 
 ```bash
-cargo run -p speech-core-file-adapter --   --url ws://127.0.0.1:8765/ws/audio-ingress   --realtime   --append-silence-ms 3000   --hold-open-ms 2500   /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
+cargo run -p speech-core-file-adapter -- \
+  --url ws://127.0.0.1:8765/ws/audio-ingress \
+  --realtime \
+  --append-silence-ms 3000 \
+  --hold-open-ms 2500 \
+  /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
 ```
 
 `--hold-open-ms` keeps the websocket open after replayed samples finish, which prevents session-end silence flushing from being mistaken for normal live-mic behavior during latency probes.

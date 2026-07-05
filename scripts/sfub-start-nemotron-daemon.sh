@@ -65,6 +65,16 @@ export SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS="$turn_min_vad_speech_ms"
 export SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS="$turn_min_model_eou_speech_ms"
 export SPEECH_CORE_TURN_MODEL_EOU_REFRACTORY_MS="$turn_model_eou_refractory_ms"
 
+eou_args=()
+if [[ -n "$eou_model_dir" ]]; then
+  eou_args=(
+    --eou-model-dir "$eou_model_dir"
+    --eou-chunk-ms "$eou_chunk_ms"
+    --eou-reset-on-token "$eou_reset_on_token"
+    --eou-emit-transcript "$eou_emit_transcript"
+  )
+fi
+
 exec target/debug/speech-core-daemon \
   --bind "$bind" \
   --log-dir "$log_dir" \
@@ -78,8 +88,5 @@ exec target/debug/speech-core-daemon \
   --vad-hangover-frames "$vad_hangover_frames" \
   --vad-pre-speech-frames "$vad_pre_speech_frames" \
   --vad-emit-frames "$vad_emit_frames" \
-  --eou-model-dir "$eou_model_dir" \
-  --eou-chunk-ms "$eou_chunk_ms" \
-  --eou-reset-on-token "$eou_reset_on_token" \
-  --eou-emit-transcript "$eou_emit_transcript" \
+  "${eou_args[@]}" \
   --detector-queue-frames "$detector_queue_frames"
