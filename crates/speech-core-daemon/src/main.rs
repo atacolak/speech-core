@@ -1,7 +1,12 @@
+mod detectors;
 mod model;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use detectors::parakeet_eou::ParakeetEouConfig;
+use detectors::turn::TurnManagerConfig;
+use detectors::vad::SileroVadConfig;
+use detectors::{DetectorConfig, DetectorIngress};
 use futures_util::{SinkExt, StreamExt};
 use model::{ModelConfig, ModelIngress};
 use serde::Serialize;
@@ -51,6 +56,82 @@ struct Args {
     /// Bounded model-worker input queue depth in audio frames.
     #[arg(long, default_value_t = 256, env = "SPEECH_CORE_MODEL_QUEUE_FRAMES")]
     model_queue_frames: usize,
+
+    /// Optional Silero VAD ONNX model path. Enables VAD events when set.
+    #[arg(long, env = "SPEECH_CORE_VAD_MODEL_PATH")]
+    vad_model_path: Option<PathBuf>,
+
+    /// Silero VAD speech probability threshold.
+    #[arg(long, default_value_t = 0.3, env = "SPEECH_CORE_VAD_THRESHOLD")]
+    vad_threshold: f32,
+
+    /// Consecutive 30ms speech frames required before speech_start.
+    #[arg(long, default_value_t = 2, env = "SPEECH_CORE_VAD_ONSET_FRAMES")]
+    vad_onset_frames: usize,
+
+    /// Consecutive 30ms non-speech frames required before speech_end.
+    #[arg(long, default_value_t = 15, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
+    vad_hangover_frames: usize,
+
+    /// Pre-roll 30ms frames included in reported VAD speech start sample.
+    #[arg(long, default_value_t = 5, env = "SPEECH_CORE_VAD_PRE_SPEECH_FRAMES")]
+    vad_pre_speech_frames: usize,
+
+    /// Emit every Silero VAD frame probability event. Verbose, useful for tuning.
+    #[arg(long, default_value_t = false, env = "SPEECH_CORE_VAD_EMIT_FRAMES")]
+    vad_emit_frames: bool,
+
+    /// Optional Parakeet realtime EOU ONNX directory. Enables model EOU events when set.
+    #[arg(long, env = "SPEECH_CORE_EOU_MODEL_DIR")]
+    eou_model_dir: Option<PathBuf>,
+
+    /// Parakeet EOU chunk size in milliseconds.
+    #[arg(long, default_value_t = 160, env = "SPEECH_CORE_EOU_CHUNK_MS")]
+    eou_chunk_ms: u32,
+
+    /// Reset Parakeet EOU decoder state when an EOU token is detected.
+    #[arg(long, default_value_t = true, env = "SPEECH_CORE_EOU_RESET_ON_TOKEN")]
+    eou_reset_on_token: bool,
+
+    /// Emit accumulated Parakeet EOU transcript text in eou_chunk_processed events.
+    #[arg(long, default_value_t = true, env = "SPEECH_CORE_EOU_EMIT_TRANSCRIPT")]
+    eou_emit_transcript: bool,
+
+    /// Bounded detector-worker input queue depth in audio frames.
+    #[arg(long, default_value_t = 512, env = "SPEECH_CORE_DETECTOR_QUEUE_FRAMES")]
+    detector_queue_frames: usize,
+
+    /// Allow VAD speech_end to close turns when model EOU is unavailable or for comparison.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SPEECH_CORE_TURN_VAD_CLOSE_ENABLED"
+    )]
+    turn_vad_close_enabled: bool,
+
+    /// Allow Parakeet EOU tokens to close turns as non-degraded model EOU.
+    #[arg(
+        long,
+        default_value_t = true,
+        env = "SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED"
+    )]
+    turn_model_eou_close_enabled: bool,
+
+    /// Minimum observed speech before accepting a model EOU token.
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS"
+    )]
+    turn_min_model_eou_speech_ms: u32,
+
+    /// Minimum gap after a turn close before accepting another model EOU token.
+    #[arg(
+        long,
+        default_value_t = 700,
+        env = "SPEECH_CORE_TURN_MODEL_EOU_REFRACTORY_MS"
+    )]
+    turn_model_eou_refractory_ms: u32,
 }
 
 #[tokio::main]
@@ -65,6 +146,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if args.stream_chunk_ms == 0 {
         bail!("--stream-chunk-ms must be greater than zero");
+    }
+    if args.eou_chunk_ms == 0 {
+        bail!("--eou-chunk-ms must be greater than zero");
+    }
+    if !(0.0..=1.0).contains(&args.vad_threshold) {
+        bail!("--vad-threshold must be between 0.0 and 1.0");
     }
     create_dir_all(&args.log_dir)
         .await
@@ -83,7 +170,39 @@ async fn main() -> Result<()> {
             logger.clone(),
         )
     });
-    let state = Arc::new(DaemonState::new(logger, model_ingress));
+    let detector_config = DetectorConfig {
+        queue_frames: args.detector_queue_frames,
+        vad: args
+            .vad_model_path
+            .clone()
+            .map(|model_path| SileroVadConfig {
+                model_path,
+                threshold: args.vad_threshold,
+                onset_frames: args.vad_onset_frames,
+                hangover_frames: args.vad_hangover_frames,
+                pre_speech_frames: args.vad_pre_speech_frames,
+                emit_frames: args.vad_emit_frames,
+            }),
+        eou: args
+            .eou_model_dir
+            .clone()
+            .map(|model_dir| ParakeetEouConfig {
+                model_dir,
+                chunk_ms: args.eou_chunk_ms,
+                reset_on_eou: args.eou_reset_on_token,
+                emit_transcript: args.eou_emit_transcript,
+            }),
+        turn: TurnManagerConfig {
+            model_eou_close_enabled: args.turn_model_eou_close_enabled,
+            vad_close_enabled: args.turn_vad_close_enabled,
+            min_model_eou_speech_ms: args.turn_min_model_eou_speech_ms,
+            model_eou_refractory_ms: args.turn_model_eou_refractory_ms,
+        },
+    };
+    let detector_ingress = detector_config
+        .enabled()
+        .then(|| DetectorIngress::start(detector_config, logger.clone()));
+    let state = Arc::new(DaemonState::new(logger, model_ingress, detector_ingress));
     let listener = TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("binding {}", args.bind))?;
@@ -141,14 +260,20 @@ struct DaemonState {
     sessions: Mutex<HashMap<String, StreamState>>,
     logger: JsonlLogger,
     model_ingress: Option<ModelIngress>,
+    detector_ingress: Option<DetectorIngress>,
 }
 
 impl DaemonState {
-    fn new(logger: JsonlLogger, model_ingress: Option<ModelIngress>) -> Self {
+    fn new(
+        logger: JsonlLogger,
+        model_ingress: Option<ModelIngress>,
+        detector_ingress: Option<DetectorIngress>,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             logger,
             model_ingress,
+            detector_ingress,
         }
     }
 
@@ -161,6 +286,9 @@ impl DaemonState {
         drop(sessions);
         if let Some(model) = &self.model_ingress {
             model.start_session(&hello, &self.logger).await?;
+        }
+        if let Some(detector) = &self.detector_ingress {
+            detector.start_session(&hello, &self.logger).await?;
         }
         Ok(ServerEvent::StreamStart(StreamStart {
             stream_id: hello.stream_id,
@@ -289,6 +417,11 @@ impl DaemonState {
 
         if let Some(model) = &self.model_ingress {
             model
+                .ingest_frame(&frame, &self.logger, ingress_receive_mono_ns)
+                .await?;
+        }
+        if let Some(detector) = &self.detector_ingress {
+            detector
                 .ingest_frame(&frame, &self.logger, ingress_receive_mono_ns)
                 .await?;
         }
@@ -553,6 +686,11 @@ async fn handle_connection(
             .end_session(hello_state, &state.logger, "websocket connection ended")
             .await?;
     }
+    if let (Some(detector), Some(hello_state)) = (&state.detector_ingress, hello.as_ref()) {
+        detector
+            .end_session(hello_state, &state.logger, "websocket connection ended")
+            .await?;
+    }
 
     Ok(())
 }
@@ -733,7 +871,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_reports_uncalibrated_latency_and_zero_queue_depth() {
         let dir = tempdir().unwrap();
-        let state = DaemonState::new(logger(&dir).await, None);
+        let state = DaemonState::new(logger(&dir).await, None, None);
         let hello = hello("session-a");
         state.start_session(hello.clone(), 1).await.unwrap();
 
@@ -754,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn session_reset_does_not_create_negative_gap() {
         let dir = tempdir().unwrap();
-        let state = DaemonState::new(logger(&dir).await, None);
+        let state = DaemonState::new(logger(&dir).await, None, None);
         let first = hello("session-a");
         let second = hello("session-b");
         state.start_session(first.clone(), 1).await.unwrap();
@@ -775,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn sample_clock_gap_is_reported() {
         let dir = tempdir().unwrap();
-        let state = DaemonState::new(logger(&dir).await, None);
+        let state = DaemonState::new(logger(&dir).await, None, None);
         let hello = hello("session-a");
         state.start_session(hello.clone(), 1).await.unwrap();
         state
@@ -819,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn same_clock_callback_receive_does_not_become_capture_latency() {
         let dir = tempdir().unwrap();
-        let state = DaemonState::new(logger(&dir).await, None);
+        let state = DaemonState::new(logger(&dir).await, None, None);
         let mut hello = hello("session-a");
         hello.timestamp_provenance.clock_comparability = ClockComparability::SameClock;
         let mut frame = frame("session-a", 0, 0);

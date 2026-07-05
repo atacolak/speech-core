@@ -117,6 +117,39 @@ async fn main() -> Result<()> {
                                 "model chunk: input={input_ms}ms committed={committed_ms}ms buffered={buffered_ms}ms final={is_final}"
                             );
                         }
+                        "turn_eou" | "turn_closed" => {
+                            let source = value
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let degraded = value
+                                .get("degraded")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let end_sample = value
+                                .get("end_sample")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or_default();
+                            let decision_sample = value
+                                .get("decision_sample")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or_default();
+                            let detector = value
+                                .get("detector")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            eprintln!(
+                                "{event}: source={source} degraded={degraded} detector={detector} end_sample={end_sample} decision_sample={decision_sample}"
+                            );
+                        }
+                        "turn_eou_candidate" | "turn_eou_suppressed" if args.verbose => {
+                            eprintln!("{event}: {value}");
+                        }
+                        "vad_speech_start" | "vad_speech_end" | "eou_token_detected"
+                            if args.verbose =>
+                        {
+                            eprintln!("{event}: {value}");
+                        }
                         "model_error" => eprintln!("model error: {value}"),
                         "audio_gap" | "audio_sample_gap" => eprintln!("gap: {value}"),
                         _ => {}

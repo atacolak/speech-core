@@ -6,8 +6,10 @@ Durable Rust scaffold for speech-core central inference-host ingress plus source
 
 ```text
 crates/speech-core-protocol      shared frame/control/event structs and binary frame envelope
-crates/speech-core-daemon        websocket audio ingress server and JSONL metrics logger
+crates/speech-core-daemon        websocket audio ingress server, model/detector workers, JSONL logger
 crates/speech-core-mic-adapter   cpal microphone adapter plus synthetic/dry-run generator
+crates/speech-core-file-adapter  wav replay adapter for repeatable detector/EOU probes
+crates/speech-core-watch         live transcript/jsonl event subscriber
 ```
 
 The protocol preserves timing provenance required by `docs/speech-core/10-adapter-transport-architecture.md`:
@@ -148,7 +150,66 @@ model_error
 
 `transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
 
+## Optional VAD + Parakeet realtime EOU
 
+The daemon can also run modular detector workers beside the ASR worker:
+
+```bash
+cargo run -p speech-core-daemon -- \
+  --bind 127.0.0.1:8765 \
+  --log-dir ./logs \
+  --vad-model-path /home/sf/workspace/handy-tailnet-api/src-tauri/resources/models/silero_vad_v4.onnx \
+  --eou-model-dir /home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx
+```
+
+Silero VAD consumes 30 ms / 480-sample frames and emits:
+
+```text
+vad_session_start
+vad_speech_start
+vad_speech_end
+vad_frame              # only with --vad-emit-frames
+vad_session_end
+```
+
+Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
+
+```text
+eou_session_start
+eou_chunk_processed
+eou_token_detected
+eou_session_end
+```
+
+The turn manager consumes detector signals and emits:
+
+```text
+turn_session_start
+turn_started
+turn_eou_candidate
+turn_eou_suppressed
+turn_eou
+turn_closed
+turn_session_end
+```
+
+`turn_eou` with `source: "model"` and `degraded: false` is the intended product path. VAD close is available as explicit degraded fallback/comparison with:
+
+```bash
+--turn-vad-close-enabled true
+```
+
+The Parakeet EOU integration vendors `parakeet-rs` under `vendor/parakeet-rs` and applies the Sherpa issue #2805/NeMo-style nested-symbol-loop fix: greedy RNNT decoding may emit up to 10 symbols per encoder frame, not one. This materially improves short/streaming output compared with the broken one-symbol-per-frame pattern discussed in sherpa-onnx.
+
+Replay a wav through the daemon for repeatable detector testing:
+
+```bash
+cargo run -p speech-core-file-adapter -- \
+  --url ws://127.0.0.1:8765/ws/audio-ingress \
+  --realtime \
+  --append-silence-ms 3000 \
+  /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
+```
 
 ## Install and persistence
 
@@ -164,6 +225,7 @@ This installs:
 ```text
 ~/.local/bin/speech-core-daemon
 ~/.local/bin/speech-core-watch
+~/.local/bin/speech-core-file-adapter
 ~/.config/speech-core/daemon.env
 ~/.config/systemd/user/speech-core-daemon.service
 ~/.local/state/speech-core/logs/events.jsonl
