@@ -230,7 +230,9 @@ impl DetectorWorker {
     }
 
     fn handle(&mut self, command: DetectorCommand) {
-        let mut writer = DetectorWriter::new(&self.logger, &self.runtime);
+        let logger = self.logger.clone();
+        let runtime = self.runtime.clone();
+        let mut writer = DetectorWriter::new(&logger, &runtime);
         let result = (|| -> Result<()> {
             match command {
                 DetectorCommand::StartSession { hello } => {
@@ -245,16 +247,17 @@ impl DetectorWorker {
                     ingress_receive_mono_ns,
                 } => {
                     let samples = decode_frame_to_f32(&frame)?;
-                    for detector in &mut self.detectors {
-                        let signals = detector.ingest_frame(
-                            &frame,
-                            &samples,
-                            ingress_receive_mono_ns,
-                            &mut writer,
-                        )?;
-                        for signal in signals {
-                            self.turn_manager.handle_signal(signal, &mut writer)?;
-                        }
+                    for detector_idx in 0..self.detectors.len() {
+                        let signals = {
+                            let detector = &mut self.detectors[detector_idx];
+                            detector.ingest_frame(
+                                &frame,
+                                &samples,
+                                ingress_receive_mono_ns,
+                                &mut writer,
+                            )?
+                        };
+                        self.handle_signals(signals, &mut writer)?;
                     }
                     Ok(())
                 }
@@ -263,8 +266,12 @@ impl DetectorWorker {
                     reason,
                     ..
                 } => {
-                    for detector in &mut self.detectors {
-                        detector.end_session(&stream_session_id, &reason, &mut writer)?;
+                    for detector_idx in 0..self.detectors.len() {
+                        let signals = {
+                            let detector = &mut self.detectors[detector_idx];
+                            detector.end_session(&stream_session_id, &reason, &mut writer)?
+                        };
+                        self.handle_signals(signals, &mut writer)?;
                     }
                     self.turn_manager
                         .end_session(&stream_session_id, &reason, &mut writer)
@@ -274,6 +281,22 @@ impl DetectorWorker {
         if let Err(err) = result {
             warn!(error = ?err, "detector worker command failed");
         }
+    }
+
+    fn handle_signals(
+        &mut self,
+        signals: Vec<DetectorSignal>,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        for signal in signals {
+            let actions = self.turn_manager.handle_signal(signal, writer)?;
+            for action in actions {
+                for detector in &mut self.detectors {
+                    detector.handle_action(&action, writer)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn finalize_all(&mut self, reason: &str) {
@@ -316,6 +339,43 @@ pub trait AudioDetector: Send {
         reason: &str,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorSignal>>;
+    fn handle_action(
+        &mut self,
+        _action: &DetectorAction,
+        _writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DetectorAction {
+    ResetEouState {
+        stream_id: String,
+        stream_session_id: String,
+        adapter_id: String,
+        mode: EouResetMode,
+        source: &'static str,
+        reason: &'static str,
+        decision_sample: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EouResetMode {
+    /// Reset encoder cache, decoder state, and detector-local queued audio.
+    Stream,
+    /// Reset only the RNNT prediction-network state; keep encoder/audio context flowing.
+    Decoder,
+}
+
+impl EouResetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EouResetMode::Stream => "stream",
+            EouResetMode::Decoder => "decoder",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

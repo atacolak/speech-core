@@ -226,17 +226,22 @@ impl ParakeetEOU {
                     break;
                 }
 
-                self.state_h = new_h;
-                self.state_c = new_c;
-                self.last_token.fill(max_idx);
-
                 if max_idx == self.eou_id {
+                    // Treat `<EOU>` as a boundary candidate, not as user text.  When the caller
+                    // wants automatic reset, reset immediately for backwards compatibility.  When
+                    // the caller wants external turn-manager arbitration, leave decoder state as it
+                    // was before this candidate so a suppressed EOU does not poison the next chunk
+                    // with `last_token = <EOU>`.
                     if reset_on_eou {
                         drop(model);
-                        self.reset_states();
+                        self.reset_decoder_state();
                     }
                     return Ok(text_output + " [EOU]");
                 }
+
+                self.state_h = new_h;
+                self.state_c = new_c;
+                self.last_token.fill(max_idx);
 
                 if let Ok(decoded) = self.tokenizer.decode(&[max_idx as u32], true) {
                     text_output.push_str(&decoded);
@@ -247,14 +252,27 @@ impl ParakeetEOU {
         Ok(text_output)
     }
 
-    fn reset_states(&mut self) {
-        // Soft reset: Only reset decoder states
-        // at this state, we need to keep encoder cache and audio buffer flowing for continuous context
-        // self.encoder_cache = EncoderCache::new();  // DON'T reset!!!
+    /// Reset only the RNNT prediction-network state.
+    ///
+    /// The encoder cache and rolling audio buffer intentionally keep flowing: this is the
+    /// low-latency boundary reset used after an accepted utterance boundary. Raw `<EOU>` token
+    /// emission is only a candidate in speech-core, so callers can choose not to reset on
+    /// suppressed candidates.
+    pub fn reset_decoder_state(&mut self) {
         self.state_h.fill(0.0);
         self.state_c.fill(0.0);
         self.last_token.fill(self.blank_id);
-        // self.audio_buffer.clear();  // DON'T clear!!
+    }
+
+    /// Reset the full streaming state for a new VAD-confirmed speech segment.
+    ///
+    /// This intentionally drops encoder cache and buffered pre-speech/session silence, because
+    /// the EOU model is being re-anchored to a new utterance rather than continuing arbitrary
+    /// adapter-session context.
+    pub fn reset_stream_state(&mut self) {
+        self.encoder_cache = EncoderCache::new();
+        self.reset_decoder_state();
+        self.audio_buffer.clear();
     }
 
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {

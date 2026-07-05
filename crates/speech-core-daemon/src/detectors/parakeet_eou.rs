@@ -5,7 +5,7 @@ use speech_core_protocol::{now_mono_ns, AudioFrame, PcmFormat};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{AudioDetector, DetectorSignal, DetectorWriter};
+use super::{AudioDetector, DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
 use crate::HelloState;
 
 const DETECTOR: &str = "parakeet_realtime_eou_120m_v1";
@@ -26,7 +26,7 @@ impl Default for ParakeetEouConfig {
         Self {
             model_dir: PathBuf::new(),
             chunk_ms: DEFAULT_CHUNK_MS,
-            reset_on_eou: true,
+            reset_on_eou: false,
             emit_transcript: true,
         }
     }
@@ -114,6 +114,11 @@ impl AudioDetector for ParakeetEouDetector {
             chunk_ms: self.config.chunk_ms,
             chunk_samples: chunk_samples as u32,
             reset_on_eou: self.config.reset_on_eou,
+            reset_policy: if self.config.reset_on_eou {
+                "raw_token"
+            } else {
+                "accepted_turn_action"
+            },
             emit_transcript: self.config.emit_transcript,
             open_start_mono_ns,
             open_end_mono_ns,
@@ -208,9 +213,60 @@ impl AudioDetector for ParakeetEouDetector {
             chunks_processed: session.chunks_processed,
             eou_tokens_detected: session.eou_tokens_detected,
             transcript_text: session.transcript,
+            decoder_resets: session.decoder_resets,
+            stream_resets: session.stream_resets,
             daemon_mono_ns: now_mono_ns(),
         })?;
         Ok(signals)
+    }
+
+    fn handle_action(
+        &mut self,
+        action: &DetectorAction,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        match action {
+            DetectorAction::ResetEouState {
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                mode,
+                source,
+                reason,
+                decision_sample,
+            } => {
+                let Some(session) = self.sessions.get_mut(stream_session_id) else {
+                    return Ok(());
+                };
+                match mode {
+                    EouResetMode::Stream => {
+                        session.model.reset_stream_state();
+                        session.buffer.clear();
+                        session.next_chunk_sample_start = *decision_sample;
+                        session.stream_resets = session.stream_resets.saturating_add(1);
+                    }
+                    EouResetMode::Decoder => {
+                        session.model.reset_decoder_state();
+                        session.decoder_resets = session.decoder_resets.saturating_add(1);
+                    }
+                }
+                let reset_index = session.decoder_resets.saturating_add(session.stream_resets);
+                writer.write(&EouStateResetEvent {
+                    event: "eou_state_reset",
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
+                    detector: DETECTOR,
+                    reset_index,
+                    mode: mode.as_str(),
+                    source,
+                    reason,
+                    decision_sample: *decision_sample,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -223,6 +279,8 @@ struct EouSession {
     transcript: String,
     chunks_processed: u64,
     eou_tokens_detected: u32,
+    decoder_resets: u32,
+    stream_resets: u32,
 }
 
 impl EouSession {
@@ -236,6 +294,8 @@ impl EouSession {
             transcript: String::new(),
             chunks_processed: 0,
             eou_tokens_detected: 0,
+            decoder_resets: 0,
+            stream_resets: 0,
         }
     }
 
@@ -256,6 +316,9 @@ impl EouSession {
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorSignal>> {
         let detector_start_mono_ns = now_mono_ns();
+        // `reset_on_eou` is intentionally normally false in speech-core.  A raw `<EOU>` token is
+        // only evidence; the turn manager decides whether that candidate is accepted.  Accepted
+        // turn closures send a ResetEouState action back to this detector.
         let raw_text = self
             .model
             .transcribe(chunk, reset_on_eou)
@@ -344,6 +407,7 @@ struct EouSessionStartEvent {
     chunk_ms: u32,
     chunk_samples: u32,
     reset_on_eou: bool,
+    reset_policy: &'static str,
     emit_transcript: bool,
     open_start_mono_ns: u64,
     open_end_mono_ns: u64,
@@ -402,6 +466,23 @@ struct EouSessionEndEvent {
     chunks_processed: u64,
     eou_tokens_detected: u32,
     transcript_text: String,
+    decoder_resets: u32,
+    stream_resets: u32,
+    daemon_mono_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EouStateResetEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    detector: &'static str,
+    reset_index: u32,
+    mode: &'static str,
+    source: &'static str,
+    reason: &'static str,
+    decision_sample: u64,
     daemon_mono_ns: u64,
 }
 

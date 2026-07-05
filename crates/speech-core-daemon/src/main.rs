@@ -89,8 +89,12 @@ struct Args {
     #[arg(long, default_value_t = 160, env = "SPEECH_CORE_EOU_CHUNK_MS")]
     eou_chunk_ms: u32,
 
-    /// Reset Parakeet EOU decoder state when an EOU token is detected.
-    #[arg(long, default_value_t = true, env = "SPEECH_CORE_EOU_RESET_ON_TOKEN")]
+    /// Reset Parakeet EOU decoder state immediately when a raw EOU token is detected.
+    ///
+    /// Default false: speech-core treats raw model EOU as evidence and resets only when the
+    /// turn manager accepts a boundary. This prevents suppressed startup/silence EOU candidates
+    /// from poisoning the decoder state.
+    #[arg(long, default_value_t = false, env = "SPEECH_CORE_EOU_RESET_ON_TOKEN")]
     eou_reset_on_token: bool,
 
     /// Emit accumulated Parakeet EOU transcript text in eou_chunk_processed events.

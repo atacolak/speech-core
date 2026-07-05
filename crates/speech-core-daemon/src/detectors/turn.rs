@@ -3,7 +3,7 @@ use serde::Serialize;
 use speech_core_protocol::now_mono_ns;
 use std::collections::HashMap;
 
-use super::{DetectorSignal, DetectorWriter};
+use super::{DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
 use crate::HelloState;
 
 #[derive(Debug, Clone)]
@@ -68,7 +68,7 @@ impl TurnManager {
         &mut self,
         signal: DetectorSignal,
         writer: &mut DetectorWriter<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<DetectorAction>> {
         match signal {
             DetectorSignal::VadSegmentStart {
                 detector,
@@ -88,16 +88,25 @@ impl TurnManager {
                 session.in_speech = true;
                 writer.write(&TurnSignalObservedEvent {
                     event: "turn_signal_observed",
-                    stream_id,
-                    stream_session_id,
-                    adapter_id,
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
                     detector,
                     signal: "vad_speech_start",
                     sample: start_sample,
                     decision_sample,
                     confidence,
                     daemon_mono_ns: now_mono_ns(),
-                })
+                })?;
+                Ok(vec![DetectorAction::ResetEouState {
+                    stream_id,
+                    stream_session_id,
+                    adapter_id,
+                    mode: EouResetMode::Stream,
+                    source: "vad",
+                    reason: "vad_speech_start",
+                    decision_sample,
+                }])
             }
             DetectorSignal::VadSegmentEnd {
                 detector,
@@ -138,6 +147,7 @@ impl TurnManager {
                     text_delta: None,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
+                let mut actions = Vec::new();
                 if vad_close_enabled {
                     session.close_turn(
                         turn_id,
@@ -150,8 +160,17 @@ impl TurnManager {
                         "vad_speech_end",
                         writer,
                     )?;
+                    actions.push(DetectorAction::ResetEouState {
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        mode: EouResetMode::Decoder,
+                        source: "vad",
+                        reason: "vad_speech_end",
+                        decision_sample,
+                    });
                 }
-                Ok(())
+                Ok(actions)
             }
             DetectorSignal::ModelEou {
                 detector,
@@ -208,7 +227,7 @@ impl TurnManager {
                         min_required_samples: min_model_eou_speech_samples,
                         daemon_mono_ns: now_mono_ns(),
                     })?;
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 if session.open_turn.is_none() {
                     session.start_turn(provisional_start, "model", writer)?;
@@ -238,6 +257,7 @@ impl TurnManager {
                     text_delta: Some(text_delta),
                     daemon_mono_ns: now_mono_ns(),
                 })?;
+                let mut actions = Vec::new();
                 if model_eou_close_enabled {
                     session.close_turn(
                         turn_id,
@@ -250,8 +270,17 @@ impl TurnManager {
                         "eou_token_detected",
                         writer,
                     )?;
+                    actions.push(DetectorAction::ResetEouState {
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        mode: EouResetMode::Decoder,
+                        source: "model",
+                        reason: "eou_token_detected",
+                        decision_sample,
+                    });
                 }
-                Ok(())
+                Ok(actions)
             }
         }
     }
