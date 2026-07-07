@@ -71,7 +71,7 @@ struct Args {
     vad_onset_frames: usize,
 
     /// Consecutive native Silero VAD non-speech windows required before speech_end.
-    #[arg(long, default_value_t = 6, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
+    #[arg(long, default_value_t = 3, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
     vad_hangover_frames: usize,
 
     /// Pre-roll native Silero VAD windows included in reported VAD speech start sample.
@@ -165,10 +165,12 @@ struct Args {
     smart_turn_recheck_max_attempts: u32,
 
     /// Comma-separated Smart Turn silence recheck offsets after the first incomplete decision.
-    /// Default gives three total probes: initial at VAD decision (~200ms after assumed end), then +800ms and +1600ms if still silent.
+    /// Default geometric probe schedule in milliseconds after the acoustic end sample.
+    /// With the default 3-frame VAD hangover, +96ms is the initial VAD decision point;
+    /// duplicate recheck samples at or before that point are ignored.
     #[arg(
         long,
-        default_value = "800,1600",
+        default_value = "96,192,384,768,1536",
         env = "SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS"
     )]
     smart_turn_recheck_offsets_ms: String,
@@ -246,6 +248,14 @@ struct Args {
         env = "SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS"
     )]
     turn_min_vad_speech_ms: u32,
+
+    /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
+    #[arg(
+        long,
+        default_value_t = 12000,
+        env = "SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS"
+    )]
+    turn_human_hold_silence_ms: u32,
 
     /// Minimum observed speech before accepting a model EOU token.
     #[arg(
@@ -371,6 +381,7 @@ async fn main() -> Result<()> {
             model_eou_refractory_ms: args.turn_model_eou_refractory_ms,
             model_progress: model_progress.clone(),
             model_alignment_timeout_ms: args.turn_model_alignment_timeout_ms,
+            human_hold_silence_ms: args.turn_human_hold_silence_ms,
             semantic_gate_enabled: args.turn_semantic_gate_enabled,
             semantic_gate_close_enabled: args.turn_semantic_gate_close_enabled,
         },

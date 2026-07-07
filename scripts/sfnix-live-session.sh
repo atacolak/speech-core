@@ -67,7 +67,7 @@ channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
 frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
 run_dir="${SPEECH_CORE_RUN_DIR:-/tmp/speech-core-session-$(date +%Y%m%d-%H%M%S)}"
-watch_mode="${SPEECH_CORE_WATCH_MODE:-tui}"
+watch_mode="${SPEECH_CORE_WATCH_MODE:-transcript}"
 watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
 watch_trace_asr="${SPEECH_CORE_WATCH_TRACE_ASR:-0}"
 watch_trace_vad="${SPEECH_CORE_WATCH_TRACE_VAD:-0}"
@@ -138,8 +138,8 @@ while [[ $# -gt 0 ]]; do
 usage: speech-core-live-session [--tui] [--debug-tui] [--verbose] [--trace-vad] [--trace-tokens] [--trace-asr] [--jsonl] [--record-audio|--no-record-audio] [--mode tui|debug|transcript|jsonl] [--device NAME]
 
 --record-audio is enabled by default and writes mic.wav in the run dir for replay/debug.
---tui is the default compact symbolic turn surface.
---debug-tui shows the symbolic surface plus recent seam explanations.
+transcript mode is the default operator surface: live text plus <EOU>.
+--tui and --debug-tui are diagnostic-only. do not use them for normal agent talking.
 --verbose switches to legacy transcript diagnostics.
 --trace-vad adds VAD frame diagnostics in transcript mode; requires daemon SPEECH_CORE_VAD_EMIT_FRAMES=true.
 --trace-tokens adds per-token ASR commit timing diagnostics in transcript mode.

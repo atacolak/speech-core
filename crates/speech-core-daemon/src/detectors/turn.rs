@@ -24,6 +24,8 @@ pub struct TurnManagerConfig {
     pub model_progress: Option<ModelProgressMap>,
     /// Max wait for the model to catch up before emitting a degraded VAD turn closure.
     pub model_alignment_timeout_ms: u32,
+    /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
+    pub human_hold_silence_ms: u32,
     /// Require Smart Turn semantic completeness before accepting VAD speech_end.
     pub semantic_gate_enabled: bool,
     /// If true, Smart Turn incomplete decisions suppress VAD closure; if false, decisions are logged only.
@@ -40,6 +42,7 @@ impl Default for TurnManagerConfig {
             model_eou_refractory_ms: 700,
             model_progress: None,
             model_alignment_timeout_ms: 3000,
+            human_hold_silence_ms: 12000,
             semantic_gate_enabled: false,
             semantic_gate_close_enabled: false,
         }
@@ -80,6 +83,7 @@ impl TurnManager {
             model_eou_refractory_ms: self.config.model_eou_refractory_ms,
             semantic_gate_enabled: self.config.semantic_gate_enabled,
             semantic_gate_close_enabled: self.config.semantic_gate_close_enabled,
+            human_hold_silence_ms: self.config.human_hold_silence_ms,
             daemon_mono_ns: now_mono_ns(),
         })
     }
@@ -148,6 +152,7 @@ impl TurnManager {
                 let semantic_gate_blocks_vad =
                     self.config.semantic_gate_enabled && self.config.semantic_gate_close_enabled;
                 let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
+                let human_hold_silence_samples = ms_to_samples(self.config.human_hold_silence_ms);
                 // Snapshot model alignment config before mutable session borrow.
                 let model_progress = self.config.model_progress.clone();
                 let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
@@ -234,9 +239,9 @@ impl TurnManager {
                         {
                             writer.write(&TurnEouSuppressedEvent {
                                 event: "turn_eou_suppressed",
-                                stream_id,
-                                stream_session_id,
-                                adapter_id,
+                                stream_id: stream_id.clone(),
+                                stream_session_id: stream_session_id.clone(),
+                                adapter_id: adapter_id.clone(),
                                 source: "semantic",
                                 detector: decision.detector,
                                 reason: "semantic_incomplete",
@@ -246,6 +251,42 @@ impl TurnManager {
                                 min_required_samples: min_vad_speech_samples,
                                 daemon_mono_ns: now_mono_ns(),
                             })?;
+                            if human_hold_silence_samples > 0 {
+                                let token_anchor = model_progress
+                                    .as_ref()
+                                    .and_then(|progress| {
+                                        progress.last_token_end_sample(&stream_session_id)
+                                    })
+                                    .or_else(|| {
+                                        session.open_turn.as_ref().map(|turn| turn.start_sample)
+                                    })
+                                    .unwrap_or(start_sample);
+                                let samples_without_tokens =
+                                    decision_sample.saturating_sub(token_anchor);
+                                if samples_without_tokens >= human_hold_silence_samples
+                                    && session.last_human_hold_token_anchor != Some(token_anchor)
+                                {
+                                    session.last_human_hold_token_anchor = Some(token_anchor);
+                                    writer.write(&TurnHumanHoldEvent {
+                                        event: "turn_human_hold",
+                                        stream_id,
+                                        stream_session_id,
+                                        adapter_id,
+                                        turn_id: turn_id.clone(),
+                                        detector: decision.detector,
+                                        reason: "speech_like_audio_without_tokens",
+                                        start_sample,
+                                        end_sample,
+                                        decision_sample,
+                                        last_token_end_sample: token_anchor,
+                                        samples_without_tokens,
+                                        ms_without_tokens: samples_to_ms(samples_without_tokens),
+                                        probability: decision.probability,
+                                        threshold: None,
+                                        daemon_mono_ns: now_mono_ns(),
+                                    })?;
+                                }
+                            }
                             return Ok(Vec::new());
                         }
                         _ => {
@@ -296,6 +337,57 @@ impl TurnManager {
                     });
                 }
                 Ok(actions)
+            }
+            DetectorSignal::VadSpeechPresence {
+                detector,
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                start_sample,
+                decision_sample,
+                confidence,
+            } => {
+                let human_hold_silence_samples = ms_to_samples(self.config.human_hold_silence_ms);
+                let model_progress = self.config.model_progress.clone();
+                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                if human_hold_silence_samples == 0 || session.open_turn.is_none() {
+                    return Ok(Vec::new());
+                }
+                let token_anchor = model_progress
+                    .as_ref()
+                    .and_then(|progress| progress.last_token_end_sample(&stream_session_id))
+                    .or_else(|| session.open_turn.as_ref().map(|turn| turn.start_sample))
+                    .unwrap_or(start_sample);
+                let samples_without_tokens = decision_sample.saturating_sub(token_anchor);
+                if samples_without_tokens >= human_hold_silence_samples
+                    && session.last_human_hold_token_anchor != Some(token_anchor)
+                {
+                    session.last_human_hold_token_anchor = Some(token_anchor);
+                    let turn_id = session
+                        .open_turn
+                        .as_ref()
+                        .map(|turn| turn.turn_id.clone())
+                        .unwrap_or_else(|| session.next_turn_id());
+                    writer.write(&TurnHumanHoldEvent {
+                        event: "turn_human_hold",
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        turn_id,
+                        detector,
+                        reason: "speech_like_audio_without_tokens",
+                        start_sample,
+                        end_sample: decision_sample,
+                        decision_sample,
+                        last_token_end_sample: token_anchor,
+                        samples_without_tokens,
+                        ms_without_tokens: samples_to_ms(samples_without_tokens),
+                        probability: confidence,
+                        threshold: None,
+                        daemon_mono_ns: now_mono_ns(),
+                    })?;
+                }
+                Ok(Vec::new())
             }
             DetectorSignal::ModelEou {
                 detector,
@@ -648,6 +740,7 @@ struct TurnSession {
     last_closed_end_sample: Option<u64>,
     last_closed_decision_sample: Option<u64>,
     last_semantic_decision: Option<SemanticDecisionState>,
+    last_human_hold_token_anchor: Option<u64>,
 }
 
 impl TurnSession {
@@ -666,6 +759,7 @@ impl TurnSession {
             last_closed_end_sample: None,
             last_closed_decision_sample: None,
             last_semantic_decision: None,
+            last_human_hold_token_anchor: None,
         }
     }
 
@@ -742,6 +836,7 @@ impl TurnSession {
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
         self.turns_closed = self.turns_closed.saturating_add(1);
+        self.last_human_hold_token_anchor = None;
         self.last_closed_end_sample = Some(end_sample);
         self.last_closed_decision_sample = Some(decision_sample);
         writer.write(&TurnEouEvent {
@@ -805,6 +900,7 @@ struct TurnSessionStartEvent {
     model_eou_refractory_ms: u32,
     semantic_gate_enabled: bool,
     semantic_gate_close_enabled: bool,
+    human_hold_silence_ms: u32,
     daemon_mono_ns: u64,
 }
 
@@ -888,6 +984,26 @@ struct TurnSemanticDecisionEvent {
     threshold: Option<f32>,
     reason: &'static str,
     duration_ms: Option<f64>,
+    daemon_mono_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnHumanHoldEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    turn_id: String,
+    detector: &'static str,
+    reason: &'static str,
+    start_sample: u64,
+    end_sample: u64,
+    decision_sample: u64,
+    last_token_end_sample: u64,
+    samples_without_tokens: u64,
+    ms_without_tokens: u64,
+    probability: Option<f32>,
+    threshold: Option<f32>,
     daemon_mono_ns: u64,
 }
 

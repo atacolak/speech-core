@@ -776,6 +776,15 @@ pub enum DetectorSignal {
         decision_sample: u64,
         confidence: Option<f32>,
     },
+    VadSpeechPresence {
+        detector: &'static str,
+        stream_id: String,
+        stream_session_id: String,
+        adapter_id: String,
+        start_sample: u64,
+        decision_sample: u64,
+        confidence: Option<f32>,
+    },
     ModelEou {
         detector: &'static str,
         stream_id: String,

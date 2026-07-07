@@ -1,245 +1,148 @@
 # turn detection and `<EOU>` policy
 
-this doc explains exactly when the current runtime prints `<EOU>`.
+this is the operational policy for speech-core turn-taking. keep the tui out of the normal loop; the operator surface should be transcript text plus `<EOU>`.
 
-## key point
+## invariant
 
-turn detection is now a two-stage path when smart turn is enabled:
+silero vad is an acoustic boundary sensor. smart-turn v3 is the semantic gate.
 
 ```text
-silero vad finds an acoustic speech_end candidate
-smart turn v3 decides whether the recent turn audio sounds complete
-turn manager emits or suppresses turn_closed
+audio transport frames may be 20ms
+silero inference windows are 512 samples at 16khz, about 32ms
 ```
 
-silero is still the clock. smart turn is the semantic gate.
+we previously tried 20ms / 320-sample silero inference frames. that was wrong for this silero v4 binding/model: it did not crash, but probabilities stayed near silence even for loud speech. use the native 512-sample window.
 
-## silero vad frame mechanics
-
-silero runs on 20ms frames:
+## current vad config
 
 ```text
-sample_rate = 16000 hz
-frame_samples = 320
-frame_ms = 20
-```
-
-current threshold:
-
-```text
+frame_samples = 512
+frame_ms ≈ 32
 SPEECH_CORE_VAD_THRESHOLD=0.5
+SPEECH_CORE_VAD_ONSET_FRAMES=2          # ~64ms
+SPEECH_CORE_VAD_HANGOVER_FRAMES=3       # ~96ms
+SPEECH_CORE_VAD_PRE_SPEECH_FRAMES=5     # ~160ms preroll
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-```
-
-## speech start trigger
-
-current start config:
-
-```text
-SPEECH_CORE_VAD_ONSET_FRAMES=3
-SPEECH_CORE_VAD_PRE_SPEECH_FRAMES=8
-```
-
-meaning:
-
-1. wait for 3 consecutive smoothed speech frames.
-2. emit `vad_speech_start`.
-3. report the start sample with up to 8 frames / 160ms of pre-roll.
-
-## speech end trigger
-
-current end config:
-
-```text
-SPEECH_CORE_VAD_HANGOVER_FRAMES=10
 SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=600
 ```
 
 meaning:
 
-1. once in speech, watch for consecutive frames where smoothed probability is below `SPEECH_CORE_VAD_STOP_THRESHOLD`.
-2. after 10 stopping frames, emit `vad_speech_end`.
-3. `end_sample` is the first stopping frame.
-4. `decision_sample` is 10 frames / ~200ms later.
-5. if smart-turn keeps holding, a separate acoustic fallback can close only after 3000ms of post-end silence with smoothed vad at or below `SPEECH_CORE_VAD_FALLBACK_THRESHOLD`.
+1. vad emits speech start after 2 consecutive smoothed speech frames.
+2. vad emits speech end after 3 consecutive smoothed low-probability frames.
+3. tiny vad islands under 600ms are not allowed to become semantic closure candidates.
+4. if smart-turn holds incomplete and speech never resumes, low acoustic probability for 3s can close as degraded fallback.
 
-math:
-
-```text
-10 frames * 20ms = 200ms
-```
-
-## smart turn semantic gate
-
-current smart-turn defaults:
+## smart-turn config
 
 ```text
 SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
 SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
+SPEECH_CORE_SMART_TURN_CPU_COUNT=1
+SPEECH_CORE_SMART_TURN_MAX_AUDIO_SECS=8
+SPEECH_CORE_SMART_TURN_PRE_SPEECH_MS=500
 SPEECH_CORE_SMART_TURN_RECHECK_INTERVAL_MS=0
 SPEECH_CORE_SMART_TURN_RECHECK_MAX_ATTEMPTS=0
-SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=800,1600
+SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
 SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
 ```
 
-when vad emits `vad_speech_end`, the detector worker runs smart turn on recent audio up to `decision_sample`. with 10 hangover frames this first probe is roughly 200ms after the assumed end of speech. if smart-turn remains below threshold and no new vad speech-start arrives, delayed silence rechecks run at +800ms and +1600ms after the assumed end sample. resumed speech cancels pending probes.
+when vad emits `vad_speech_end`, smart-turn runs on recent audio up to the decision sample. with the default 3-frame hangover, that initial decision is roughly +96ms after the acoustic end sample. if it says complete, the turn closes. if it says incomplete, immediate vad closure is suppressed; delayed semantic probes follow the geometric schedule at +192ms, +384ms, +768ms, and +1536ms unless speech resumes.
 
-smart turn sees:
+## close policy
 
-```text
-last up to 8 seconds of the current buffered audio
-16khz mono pcm
-whisper log-mel features [1,80,800]
-```
-
-then it emits:
+successful semantic close:
 
 ```text
-smart_turn_candidate
-smart_turn_decision  # or smart_turn_timeout
-turn_semantic_decision
-smart_turn_recheck_scheduled | smart_turn_recheck_cancelled | smart_turn_recheck_exhausted
-```
-
-## turn close trigger
-
-current turn config:
-
-```text
-SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=600
-SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
-SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
-```
-
-when `vad_speech_end` arrives, turn manager checks cumulative open-turn duration. if too short:
-
-```text
-turn_eou_suppressed reason=vad_too_short
-```
-
-if long enough and smart turn says complete:
-
-```text
-turn_eou source=smart_turn degraded=false reason=smart_turn_complete_after_vad_speech_end
+vad_speech_end
+smart_turn_decision complete=true
 turn_closed source=smart_turn degraded=false
 ```
 
-if smart turn says incomplete:
+semantic hold:
 
 ```text
-turn_eou_suppressed source=semantic reason=semantic_incomplete
+vad_speech_end
+smart_turn_decision complete=false
+turn_eou_suppressed reason=semantic_incomplete
 ```
 
-then the turn remains open while waiting for either resumed speech, the delayed smart-turn recheck, or the conservative acoustic fallback:
+conservative acoustic fallback:
 
 ```text
 vad_acoustic_fallback
-turn_closed source=vad_acoustic_fallback degraded=true reason=vad_acoustic_fallback_low_probability_silence
+turn_closed source=vad_acoustic_fallback degraded=true
 ```
 
-that fallback requires both long silence and smoothed vad <= `SPEECH_CORE_VAD_FALLBACK_THRESHOLD`.
-
-if smart turn is unavailable, errors, or exceeds `SPEECH_CORE_SMART_TURN_TIMEOUT_MS`, the system fails open to vad:
-
-```text
-turn_closed source=vad degraded=true reason=smart_turn_timeout_vad_fallback
-```
-
-or:
+smart-turn unavailable/error timeout fail-open:
 
 ```text
 turn_closed source=vad degraded=true reason=smart_turn_unavailable_vad_fallback
 ```
 
-## event ordering
-
-model and detector workers are separate threads. current code uses `ModelProgressMap` so turn manager waits for nemotron to catch up to the vad `end_sample` before emitting `turn_closed`.
-
-that preserves the important user-facing ordering:
+human filler / thinking-noise event:
 
 ```text
-final transcript update before <EOU>
+turn_human_hold reason=speech_like_audio_without_tokens
 ```
 
-## tuning knobs
+this fires when vad keeps seeing speech-like audio but nemotron has not committed any new token for `SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS`. it is intentionally non-closing; consumers can use it later for a tiny tts nudge like "you good?" or a listening-status indicator.
 
-### reduce premature eou
+## operator surface
 
-smart turn should already reduce mid-sentence pause closures. if it is still too eager:
-
-do not paper over this first by raising the smart-turn threshold. keep semantic threshold at `0.5` unless a reference-model comparison proves calibration drift. first raise vad hangover:
+normal use:
 
 ```bash
-SPEECH_CORE_VAD_HANGOVER_FRAMES=24 ./scripts/install-sfub-daemon.sh   # ~480ms
+speech-core-live-session --mode transcript
 ```
 
-### reduce end delay
-
-lower vad hangover:
+or just:
 
 ```bash
-SPEECH_CORE_VAD_HANGOVER_FRAMES=12 ./scripts/install-sfub-daemon.sh   # ~240ms
+speech-core-live-session
 ```
 
-or lower smart turn timeout:
+because transcript mode is the default now.
 
-```bash
-SPEECH_CORE_SMART_TURN_TIMEOUT_MS=100 ./scripts/install-sfub-daemon.sh
-```
+avoid the tui for normal agent conversation. it is diagnostic-only and has already wasted enough blood sugar.
 
-but be real: if smart turn often times out, lowering timeout only makes it behave like vad again.
+## diagnostics if it feels wrong
 
-### log-only smart turn
-
-run smart turn but do not let incomplete decisions suppress vad:
-
-```bash
-SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true \
-SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=false \
-./scripts/install-sfub-daemon.sh
-```
-
-## event names to inspect
+recording is on by default and writes `mic.wav` in the session run dir. inspect these events around a bad boundary:
 
 ```text
+vad_session_start
+vad_meter
 vad_speech_start
 vad_speech_end
 smart_turn_candidate
 smart_turn_decision
-smart_turn_timeout
-turn_semantic_decision
-turn_eou_candidate
+smart_turn_recheck_scheduled
+smart_turn_recheck_cancelled
+vad_acoustic_fallback
+turn_human_hold
 turn_eou_suppressed
-turn_eou
 turn_closed
 transcript_update
 ```
 
-quick log inspection:
+quick latest-session sketch:
 
 ```bash
-python3 - <<'PY'
-import json, pathlib, collections
-p = pathlib.Path.home() / '.local/state/speech-core/logs/events.jsonl'
-sessions = collections.OrderedDict()
-for line in p.open(errors='replace'):
-    try:
-        o = json.loads(line)
-    except Exception:
-        continue
-    sid = o.get('stream_session_id')
-    if sid and o.get('stream_id') == 'sfnix.live_mic':
-        sessions.setdefault(sid, []).append(o)
-if sessions:
-    sid, evs = next(reversed(sessions.items()))
-    print('session', sid)
-    for e in evs:
-        if e.get('event') in {'vad_speech_start','vad_speech_end','smart_turn_decision','smart_turn_timeout','turn_eou_suppressed','turn_closed'}:
-            print(e)
-PY
+python3 scripts/analyze-session-timeline.py --latest
 ```
+
+## tuning rules
+
+1. do not set silero inference back to 320 samples.
+2. do not tune by staring at the tui.
+3. do one live recording, inspect audio plus event timeline, then change one knob.
+4. if starts are missed, lower threshold slightly or reduce smoothing.
+5. if mid-sentence pauses close too early, increase hangover frames or fallback silence, not smart-turn threshold first.
+6. if closing is too slow, reduce recheck offsets or acoustic fallback silence after confirming smart-turn is actually holding incomplete.

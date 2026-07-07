@@ -15,9 +15,15 @@ use crate::{HelloState, JsonlLogger};
 
 /// Shared model progress tracker: stream_session_id → latest committed audio sample.
 /// The TurnManager reads this to ensure the model has caught up before emitting turn_closed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelProgressState {
+    pub audio_committed_samples: u64,
+    pub last_token_end_sample: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelProgressMap {
-    inner: Arc<Mutex<HashMap<String, u64>>>,
+    inner: Arc<Mutex<HashMap<String, ModelProgressState>>>,
 }
 
 impl ModelProgressMap {
@@ -29,15 +35,30 @@ impl ModelProgressMap {
 
     pub fn update(&self, session_id: &str, committed_samples: u64) {
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(session_id.to_owned(), committed_samples);
+            let state = map.entry(session_id.to_owned()).or_default();
+            state.audio_committed_samples = committed_samples;
+        }
+    }
+
+    pub fn record_token(&self, session_id: &str, token_end_sample: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            let state = map.entry(session_id.to_owned()).or_default();
+            state.last_token_end_sample = Some(token_end_sample);
         }
     }
 
     pub fn get(&self, session_id: &str) -> Option<u64> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|map| map.get(session_id).copied())
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id)
+                .map(|state| state.audio_committed_samples)
+        })
+    }
+
+    pub fn last_token_end_sample(&self, session_id: &str) -> Option<u64> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id)
+                .and_then(|state| state.last_token_end_sample)
+        })
     }
 
     pub fn remove(&self, session_id: &str) {
@@ -560,6 +581,14 @@ impl ModelWorker {
             let timestamps_valid = update.returned_timestamp_kind == TRANSCRIBE_TIMESTAMPS_TOKEN
                 && token.t1_ms >= token.t0_ms
                 && token.t0_ms >= 0;
+            if let Some(ref progress) = self.model_progress {
+                let token_end_sample = if timestamps_valid {
+                    ms_to_sample(token.t1_ms)
+                } else {
+                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                };
+                progress.record_token(&session.hello.stream_session_id, token_end_sample);
+            }
             self.write_blocking(&TranscriptTokenCommittedEvent {
                 event: "transcript_token_committed",
                 stream_id: session.hello.stream_id.clone(),

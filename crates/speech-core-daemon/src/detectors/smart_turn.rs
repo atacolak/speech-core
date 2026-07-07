@@ -51,7 +51,7 @@ impl Default for SmartTurnConfig {
             pre_speech_ms: 500,
             recheck_interval_ms: 0,
             recheck_max_attempts: 0,
-            recheck_offsets_ms: vec![800, 1600],
+            recheck_offsets_ms: vec![96, 192, 384, 768, 1536],
         }
     }
 }

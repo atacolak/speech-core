@@ -38,7 +38,7 @@ impl Default for SileroVadConfig {
             model_path: PathBuf::new(),
             threshold: 0.5,
             onset_frames: 2,
-            hangover_frames: 6,
+            hangover_frames: 3,
             pre_speech_frames: 5,
             emit_frames: false,
             smoothing_alpha: 0.1,
@@ -356,6 +356,17 @@ impl VadSession {
                 self.last_voice_sample_end = Some(frame_end_sample);
                 self.silence_counter = 0;
                 self.silence_start_sample = None;
+                signals.push(DetectorSignal::VadSpeechPresence {
+                    detector: DETECTOR,
+                    stream_id: self.hello.stream_id.clone(),
+                    stream_session_id: self.hello.stream_session_id.clone(),
+                    adapter_id: self.hello.adapter_id.clone(),
+                    start_sample: self
+                        .current_segment_start_sample
+                        .unwrap_or(frame_start_sample),
+                    decision_sample: frame_end_sample,
+                    confidence: Some(smoothed_probability),
+                });
             } else {
                 if self.silence_counter == 0 {
                     self.silence_start_sample = Some(frame_start_sample);
@@ -769,10 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn default_hangover_is_about_200ms() {
+    fn default_hangover_is_about_100ms() {
         assert_eq!(
             SileroVadConfig::default().hangover_frames * FRAME_MS as usize,
-            192
+            96
         );
     }
 }

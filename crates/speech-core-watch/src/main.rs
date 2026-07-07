@@ -35,8 +35,8 @@ struct Args {
     #[arg(long, env = "SPEECH_CORE_STREAM_SESSION_ID")]
     stream_session_id: Option<String>,
 
-    /// Print mode. tui is the compact symbolic turn surface; jsonl is raw trace.
-    #[arg(long, value_enum, default_value_t = Mode::Tui)]
+    /// Print mode. transcript is the normal operator surface; tui/debug are diagnostic-only.
+    #[arg(long, value_enum, default_value_t = Mode::Transcript)]
     mode: Mode,
 
     /// Replay events from a jsonl file instead of opening a websocket.
@@ -178,7 +178,6 @@ struct TuiModel {
     notes: VecDeque<String>,
     live_vad_bar: String,
     last_transcript_display: String,
-    saw_token_commits: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -256,14 +255,7 @@ impl TuiModel {
                 ));
                 self.note(format!("smart-turn ready: rechecks {offsets}"));
             }
-            "transcript_token_committed" => {
-                let token = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if !token.is_empty() {
-                    self.saw_token_commits = true;
-                    let idx = self.turn_for_text();
-                    self.turns[idx].text.push_str(token);
-                }
-            }
+            "transcript_token_committed" => {}
             "transcript_update" => {
                 let committed = value
                     .get("committed_text")
@@ -274,7 +266,7 @@ impl TuiModel {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let display = format!("{committed}{tentative}");
-                if !display.is_empty() && !self.saw_token_commits {
+                if !display.is_empty() {
                     let delta = display
                         .strip_prefix(&self.last_transcript_display)
                         .unwrap_or(&display);
@@ -460,6 +452,16 @@ impl TuiModel {
                 self.note(format!(
                     "acoustic fallback armed at {}; low smoothed vad",
                     sample_field_ms(value, "decision_sample")
+                ));
+            }
+            "turn_human_hold" => {
+                let ms_without_tokens = value
+                    .get("ms_without_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                self.note(format!(
+                    "human hold: speech-like audio for {} without new transcript tokens",
+                    format_ms(ms_without_tokens)
                 ));
             }
             _ => {}
@@ -1255,7 +1257,7 @@ mod tests {
         );
         apply(
             &mut model,
-            json!({"event":"transcript_token_committed","stream_session_id":"s","text":"hello there"}),
+            json!({"event":"transcript_update","stream_session_id":"s","committed_text":"hello there","tentative_text":""}),
         );
         apply(
             &mut model,
@@ -1294,7 +1296,7 @@ mod tests {
         );
         apply(
             &mut model,
-            json!({"event":"transcript_token_committed","stream_session_id":"s","text":"not done"}),
+            json!({"event":"transcript_update","stream_session_id":"s","committed_text":"not done","tentative_text":""}),
         );
         apply(
             &mut model,
@@ -1329,7 +1331,7 @@ mod tests {
         );
         apply(
             &mut model,
-            json!({"event":"transcript_token_committed","stream_session_id":"s","text":"maybe still going"}),
+            json!({"event":"transcript_update","stream_session_id":"s","committed_text":"maybe still going","tentative_text":""}),
         );
         apply(
             &mut model,

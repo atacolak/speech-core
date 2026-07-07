@@ -38,8 +38,8 @@ installed daemon defaults:
 SPEECH_CORE_STREAM_CHUNK_MS=160
 SPEECH_CORE_ATT_CONTEXT_RIGHT=1
 SPEECH_CORE_VAD_THRESHOLD=0.5
-SPEECH_CORE_VAD_ONSET_FRAMES=3
-SPEECH_CORE_VAD_HANGOVER_FRAMES=10
+SPEECH_CORE_VAD_ONSET_FRAMES=2
+SPEECH_CORE_VAD_HANGOVER_FRAMES=3
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
@@ -50,9 +50,10 @@ SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smar
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
 SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
 SPEECH_CORE_SMART_TURN_CPU_COUNT=1
-SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=800,1600
+SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
 SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
 SPEECH_CORE_EOU_MODEL_DIR=
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 ```
@@ -60,11 +61,12 @@ SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 important translation:
 
 - nemotron runs every ~160ms of audio with ~80ms right-context.
-- silero vad uses 20ms frames.
-- vad starts speech after 3 smoothed speech frames, roughly 60ms above threshold.
-- vad ends speech after 10 smoothed stopping frames, exactly 200ms below stop threshold.
+- silero vad uses its native 512-sample inference window at 16khz, about 32ms. transport frames may still be 20ms.
+- vad starts speech after 2 smoothed speech frames, roughly 64ms above threshold.
+- vad ends speech after 3 smoothed stopping frames, roughly 96ms below stop threshold.
 - turn manager ignores vad segments whose current vad segment duration is under 600ms.
-- smart turn runs after vad speech_end. if incomplete and no speech resumes, it rechecks at +800ms and +1600ms after the assumed end sample.
+- smart turn runs after vad speech_end. with the default 3-frame hangover the first probe is at about +96ms after the assumed end sample; if incomplete and no speech resumes, the geometric schedule preserves checks at +192ms, +384ms, +768ms, and +1536ms.
+- if speech-like vad islands continue for 12s after the last committed transcript token without new tokens, the daemon emits `turn_human_hold`; this does not close the turn.
 - smart turn timeout/unavailable/error fails open to vad close.
 - parakeet realtime eou is disabled by default.
 
