@@ -135,6 +135,7 @@ consumers:
 
 ```text
 SileroVadDetector
+SmartTurnDetector
 ParakeetEouDetector, disabled by default
 TurnManager
 ```
@@ -150,14 +151,23 @@ current default detectors:
 
 ```text
 silero vad: enabled
+smart turn v3: enabled when SPEECH_CORE_SMART_TURN_MODEL_PATH exists
 parakeet realtime eou: disabled
 ```
+
+smart turn detail:
+
+- it buffers recent audio in the detector worker.
+- it runs direct rust onnx inference on vad `speech_end` candidates.
+- it emits semantic evidence before the turn manager handles the vad end.
+- it does not run as a python sidecar and does not consume transcript text.
 
 files:
 
 ```text
 crates/speech-core-daemon/src/detectors/mod.rs
 crates/speech-core-daemon/src/detectors/vad.rs
+crates/speech-core-daemon/src/detectors/smart_turn.rs
 crates/speech-core-daemon/src/detectors/turn.rs
 crates/speech-core-daemon/src/detectors/parakeet_eou.rs
 ```
@@ -183,15 +193,23 @@ contract:
 - `turn_eou` means accepted boundary evidence.
 - `turn_closed` means the turn is closed for consumers.
 
-current accepted source:
+current accepted sources:
+
+```text
+source=smart_turn
+degraded=false
+reason=smart_turn_complete_after_vad_speech_end
+```
+
+or fallback:
 
 ```text
 source=vad
 degraded=true
-reason=vad_speech_end
+reason=smart_turn_timeout_vad_fallback | smart_turn_unavailable_vad_fallback | vad_speech_end
 ```
 
-why degraded? because vad is not language-aware eou. it is still the product path rn because it is fast and predictable.
+smart turn incomplete decisions suppress vad closure with `turn_eou_suppressed source=semantic reason=semantic_incomplete` and leave the turn open.
 
 ## 6. event subscription seam
 
@@ -204,8 +222,7 @@ JsonlLogger in speech-core-daemon
 consumer:
 
 ```text
-speech-core-watch
-future terminal ui
+speech-core-watch compact tui
 future apps/agents
 ```
 
@@ -218,9 +235,11 @@ contract:
 watch modes:
 
 ```text
+speech-core-watch --mode tui          # compact symbolic turn surface, default for live sessions
+speech-core-watch --mode debug        # tui plus recent seam explanations
 speech-core-watch --mode transcript   # clean transcript + <EOU>
 speech-core-watch --mode jsonl        # raw event stream
-speech-core-watch --verbose           # debug in transcript mode
+speech-core-watch --verbose           # legacy debug in transcript mode
 ```
 
 ## 7. install/runtime seam

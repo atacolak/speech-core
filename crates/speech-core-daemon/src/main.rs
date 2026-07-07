@@ -4,11 +4,12 @@ mod model;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use detectors::parakeet_eou::ParakeetEouConfig;
+use detectors::smart_turn::SmartTurnConfig;
 use detectors::turn::TurnManagerConfig;
 use detectors::vad::SileroVadConfig;
 use detectors::{DetectorConfig, DetectorIngress};
 use futures_util::{SinkExt, StreamExt};
-use model::{ModelConfig, ModelIngress};
+use model::{ModelConfig, ModelIngress, ModelProgressMap};
 use serde::Serialize;
 use speech_core_protocol::{
     adapter_send_to_ingress_latency, capture_to_ingress_latency, now_mono_ns, AudioFrame,
@@ -61,19 +62,19 @@ struct Args {
     #[arg(long, env = "SPEECH_CORE_VAD_MODEL_PATH")]
     vad_model_path: Option<PathBuf>,
 
-    /// Silero VAD speech probability threshold.
-    #[arg(long, default_value_t = 0.3, env = "SPEECH_CORE_VAD_THRESHOLD")]
+    /// Smoothed Silero VAD speech probability threshold for speech_start.
+    #[arg(long, default_value_t = 0.5, env = "SPEECH_CORE_VAD_THRESHOLD")]
     vad_threshold: f32,
 
-    /// Consecutive 30ms speech frames required before speech_start.
+    /// Consecutive native Silero VAD windows required before speech_start.
     #[arg(long, default_value_t = 2, env = "SPEECH_CORE_VAD_ONSET_FRAMES")]
     vad_onset_frames: usize,
 
-    /// Consecutive 30ms non-speech frames required before speech_end.
-    #[arg(long, default_value_t = 12, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
+    /// Consecutive native Silero VAD non-speech windows required before speech_end.
+    #[arg(long, default_value_t = 6, env = "SPEECH_CORE_VAD_HANGOVER_FRAMES")]
     vad_hangover_frames: usize,
 
-    /// Pre-roll 30ms frames included in reported VAD speech start sample.
+    /// Pre-roll native Silero VAD windows included in reported VAD speech start sample.
     #[arg(long, default_value_t = 5, env = "SPEECH_CORE_VAD_PRE_SPEECH_FRAMES")]
     vad_pre_speech_frames: usize,
 
@@ -86,9 +87,91 @@ struct Args {
     )]
     vad_emit_frames: bool,
 
+    /// Exponential smoothing alpha for Silero probabilities.
+    #[arg(long, default_value_t = 0.1, env = "SPEECH_CORE_VAD_SMOOTHING_ALPHA")]
+    vad_smoothing_alpha: f32,
+
+    /// Smoothed probability below this level counts as a stopping frame.
+    #[arg(long, default_value_t = 0.2, env = "SPEECH_CORE_VAD_STOP_THRESHOLD")]
+    vad_stop_threshold: f32,
+
+    /// Low-confidence smoothed VAD level required for acoustic fallback closure.
+    #[arg(
+        long,
+        default_value_t = 0.1,
+        env = "SPEECH_CORE_VAD_FALLBACK_THRESHOLD"
+    )]
+    vad_fallback_threshold: f32,
+
+    /// Stable low-probability silence required before acoustic fallback closure.
+    #[arg(
+        long,
+        default_value_t = 3000,
+        env = "SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS"
+    )]
+    vad_acoustic_fallback_silence_ms: u32,
+
     /// Optional Parakeet realtime EOU ONNX directory. Experimental/retired by default.
     #[arg(long, env = "SPEECH_CORE_EOU_MODEL_DIR")]
     eou_model_dir: Option<PathBuf>,
+
+    /// Optional pipecat Smart Turn v3 ONNX model path for semantic VAD endpoint gating.
+    #[arg(long, env = "SPEECH_CORE_SMART_TURN_MODEL_PATH")]
+    smart_turn_model_path: Option<PathBuf>,
+
+    /// Smart Turn v3 complete-turn probability threshold.
+    #[arg(long, default_value_t = 0.5, env = "SPEECH_CORE_SMART_TURN_THRESHOLD")]
+    smart_turn_threshold: f32,
+
+    /// Max acceptable Smart Turn v3 inference latency before fail-open VAD fallback (ms).
+    #[arg(long, default_value_t = 250, env = "SPEECH_CORE_SMART_TURN_TIMEOUT_MS")]
+    smart_turn_timeout_ms: u32,
+
+    /// Number of CPU threads for Smart Turn v3 ONNX intra-op inference.
+    #[arg(long, default_value_t = 1, env = "SPEECH_CORE_SMART_TURN_CPU_COUNT")]
+    smart_turn_cpu_count: usize,
+
+    /// Maximum recent audio window sent to Smart Turn v3; model supports up to 8 seconds.
+    #[arg(
+        long,
+        default_value_t = 8,
+        env = "SPEECH_CORE_SMART_TURN_MAX_AUDIO_SECS"
+    )]
+    smart_turn_max_audio_secs: u32,
+
+    /// Audio before VAD start/end context to retain for Smart Turn v3 predictions.
+    #[arg(
+        long,
+        default_value_t = 500,
+        env = "SPEECH_CORE_SMART_TURN_PRE_SPEECH_MS"
+    )]
+    smart_turn_pre_speech_ms: u32,
+
+    /// Legacy regular interval between Smart Turn silence rechecks after an incomplete decision.
+    /// Use --smart-turn-recheck-offsets-ms for non-uniform schedules.
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "SPEECH_CORE_SMART_TURN_RECHECK_INTERVAL_MS"
+    )]
+    smart_turn_recheck_interval_ms: u32,
+
+    /// Legacy max Smart Turn silence rechecks after an incomplete decision while no new speech arrives.
+    #[arg(
+        long,
+        default_value_t = 0,
+        env = "SPEECH_CORE_SMART_TURN_RECHECK_MAX_ATTEMPTS"
+    )]
+    smart_turn_recheck_max_attempts: u32,
+
+    /// Comma-separated Smart Turn silence recheck offsets after the first incomplete decision.
+    /// Default gives three total probes: initial at VAD decision (~200ms after assumed end), then +800ms and +1600ms if still silent.
+    #[arg(
+        long,
+        default_value = "800,1600",
+        env = "SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS"
+    )]
+    smart_turn_recheck_offsets_ms: String,
 
     /// Parakeet EOU chunk size in milliseconds.
     #[arg(long, default_value_t = 160, env = "SPEECH_CORE_EOU_CHUNK_MS")]
@@ -129,6 +212,24 @@ struct Args {
     )]
     turn_vad_close_enabled: bool,
 
+    /// Enable semantic Smart Turn decisions over VAD speech_end candidates.
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED"
+    )]
+    turn_semantic_gate_enabled: bool,
+
+    /// Let semantic incomplete decisions suppress VAD turn closure. Timeouts/unavailable fail open.
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        env = "SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED"
+    )]
+    turn_semantic_gate_close_enabled: bool,
+
     /// Allow Parakeet EOU tokens to close turns as non-degraded model EOU.
     #[arg(
         long,
@@ -141,7 +242,7 @@ struct Args {
     /// Minimum VAD segment duration before accepting VAD speech_end as a turn boundary.
     #[arg(
         long,
-        default_value_t = 700,
+        default_value_t = 600,
         env = "SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS"
     )]
     turn_min_vad_speech_ms: u32,
@@ -153,6 +254,14 @@ struct Args {
         env = "SPEECH_CORE_TURN_MIN_MODEL_EOU_SPEECH_MS"
     )]
     turn_min_model_eou_speech_ms: u32,
+
+    /// Max wait for model transcript to catch up before a VAD turn close (ms).
+    #[arg(
+        long,
+        default_value_t = 3000,
+        env = "SPEECH_CORE_TURN_MODEL_ALIGNMENT_TIMEOUT_MS"
+    )]
+    turn_model_alignment_timeout_ms: u32,
 
     /// Minimum gap after a turn close before accepting another model EOU token.
     #[arg(
@@ -182,12 +291,23 @@ async fn main() -> Result<()> {
     if !(0.0..=1.0).contains(&args.vad_threshold) {
         bail!("--vad-threshold must be between 0.0 and 1.0");
     }
+    if !(0.0..=1.0).contains(&args.smart_turn_threshold) {
+        bail!("--smart-turn-threshold must be between 0.0 and 1.0");
+    }
+    if args.smart_turn_timeout_ms == 0 {
+        bail!("--smart-turn-timeout-ms must be greater than zero");
+    }
+    if args.smart_turn_cpu_count == 0 {
+        bail!("--smart-turn-cpu-count must be greater than zero");
+    }
     create_dir_all(&args.log_dir)
         .await
         .with_context(|| format!("creating log directory {}", args.log_dir.display()))?;
 
     let (event_tx, _) = broadcast::channel(1024);
     let logger = JsonlLogger::open(args.log_dir, event_tx.clone()).await?;
+    let model_progress: Option<ModelProgressMap> =
+        args.model_path.as_ref().map(|_| ModelProgressMap::new());
     let model_ingress = args.model_path.clone().map(|model_path| {
         ModelIngress::start(
             ModelConfig {
@@ -195,6 +315,7 @@ async fn main() -> Result<()> {
                 stream_chunk_ms: args.stream_chunk_ms,
                 att_context_right: args.att_context_right,
                 queue_frames: args.model_queue_frames,
+                model_progress: model_progress.clone(),
             },
             logger.clone(),
         )
@@ -211,6 +332,10 @@ async fn main() -> Result<()> {
                 hangover_frames: args.vad_hangover_frames,
                 pre_speech_frames: args.vad_pre_speech_frames,
                 emit_frames: args.vad_emit_frames,
+                smoothing_alpha: args.vad_smoothing_alpha,
+                stop_threshold: args.vad_stop_threshold,
+                fallback_threshold: args.vad_fallback_threshold,
+                acoustic_fallback_silence_ms: args.vad_acoustic_fallback_silence_ms,
             }),
         eou: args
             .eou_model_dir
@@ -222,12 +347,32 @@ async fn main() -> Result<()> {
                 reset_on_eou: args.eou_reset_on_token,
                 emit_transcript: args.eou_emit_transcript,
             }),
+        smart_turn: args
+            .turn_semantic_gate_enabled
+            .then(|| args.smart_turn_model_path.clone())
+            .flatten()
+            .filter(|model_path| !model_path.as_os_str().is_empty())
+            .map(|model_path| SmartTurnConfig {
+                model_path,
+                threshold: args.smart_turn_threshold,
+                timeout_ms: args.smart_turn_timeout_ms,
+                cpu_count: args.smart_turn_cpu_count,
+                max_audio_secs: args.smart_turn_max_audio_secs,
+                pre_speech_ms: args.smart_turn_pre_speech_ms,
+                recheck_interval_ms: args.smart_turn_recheck_interval_ms,
+                recheck_max_attempts: args.smart_turn_recheck_max_attempts,
+                recheck_offsets_ms: parse_recheck_offsets_ms(&args.smart_turn_recheck_offsets_ms),
+            }),
         turn: TurnManagerConfig {
             model_eou_close_enabled: args.turn_model_eou_close_enabled,
             vad_close_enabled: args.turn_vad_close_enabled,
             min_vad_speech_ms: args.turn_min_vad_speech_ms,
             min_model_eou_speech_ms: args.turn_min_model_eou_speech_ms,
             model_eou_refractory_ms: args.turn_model_eou_refractory_ms,
+            model_progress: model_progress.clone(),
+            model_alignment_timeout_ms: args.turn_model_alignment_timeout_ms,
+            semantic_gate_enabled: args.turn_semantic_gate_enabled,
+            semantic_gate_close_enabled: args.turn_semantic_gate_close_enabled,
         },
     };
     let detector_ingress = detector_config
@@ -755,6 +900,21 @@ async fn stream_events_to_subscriber(
         }
     }
     Ok(())
+}
+
+fn parse_recheck_offsets_ms(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u32>().ok()
+            }
+        })
+        .filter(|offset| *offset > 0)
+        .collect()
 }
 
 fn event_matches(

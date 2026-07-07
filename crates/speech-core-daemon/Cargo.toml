@@ -8,7 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+hound.workspace = true
+ort.workspace = true
 parakeet-rs.workspace = true
+rustfft.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 speech-core-protocol = { path = "../speech-core-protocol" }

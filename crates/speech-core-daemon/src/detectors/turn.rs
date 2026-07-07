@@ -2,8 +2,10 @@ use anyhow::Result;
 use serde::Serialize;
 use speech_core_protocol::now_mono_ns;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use super::{DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
+use crate::model::ModelProgressMap;
 use crate::HelloState;
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,14 @@ pub struct TurnManagerConfig {
     pub min_model_eou_speech_ms: u32,
     /// Ignore repeated EOU tokens this close to the previous close.
     pub model_eou_refractory_ms: u32,
+    /// Shared model progress tracker so we can wait for model catch-up before closing a VAD turn.
+    pub model_progress: Option<ModelProgressMap>,
+    /// Max wait for the model to catch up before emitting a degraded VAD turn closure.
+    pub model_alignment_timeout_ms: u32,
+    /// Require Smart Turn semantic completeness before accepting VAD speech_end.
+    pub semantic_gate_enabled: bool,
+    /// If true, Smart Turn incomplete decisions suppress VAD closure; if false, decisions are logged only.
+    pub semantic_gate_close_enabled: bool,
 }
 
 impl Default for TurnManagerConfig {
@@ -25,9 +35,13 @@ impl Default for TurnManagerConfig {
         Self {
             model_eou_close_enabled: false,
             vad_close_enabled: false,
-            min_vad_speech_ms: 700,
+            min_vad_speech_ms: 300,
             min_model_eou_speech_ms: 300,
             model_eou_refractory_ms: 700,
+            model_progress: None,
+            model_alignment_timeout_ms: 3000,
+            semantic_gate_enabled: false,
+            semantic_gate_close_enabled: false,
         }
     }
 }
@@ -64,6 +78,8 @@ impl TurnManager {
             min_vad_speech_ms: self.config.min_vad_speech_ms,
             min_model_eou_speech_ms: self.config.min_model_eou_speech_ms,
             model_eou_refractory_ms: self.config.model_eou_refractory_ms,
+            semantic_gate_enabled: self.config.semantic_gate_enabled,
+            semantic_gate_close_enabled: self.config.semantic_gate_close_enabled,
             daemon_mono_ns: now_mono_ns(),
         })
     }
@@ -129,7 +145,12 @@ impl TurnManager {
                 confidence,
             } => {
                 let vad_close_enabled = self.config.vad_close_enabled;
+                let semantic_gate_blocks_vad =
+                    self.config.semantic_gate_enabled && self.config.semantic_gate_close_enabled;
                 let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
+                // Snapshot model alignment config before mutable session borrow.
+                let model_progress = self.config.model_progress.clone();
+                let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "vad", writer)?;
@@ -187,16 +208,80 @@ impl TurnManager {
                     return Ok(Vec::new());
                 }
                 let mut actions = Vec::new();
+                let mut close_source = "vad";
+                let mut close_detector = detector;
+                let mut close_confidence = confidence;
+                let mut close_degraded = true;
+                let mut close_reason = "vad_speech_end";
+                if semantic_gate_blocks_vad {
+                    match session.last_semantic_decision.as_ref() {
+                        Some(decision)
+                            if decision.end_sample == end_sample
+                                && decision.decision_sample == decision_sample
+                                && decision.available
+                                && decision.complete =>
+                        {
+                            close_source = "smart_turn";
+                            close_detector = decision.detector;
+                            close_confidence = decision.probability;
+                            close_degraded = false;
+                            close_reason = "smart_turn_complete_after_vad_speech_end";
+                        }
+                        Some(decision)
+                            if decision.end_sample == end_sample
+                                && decision.decision_sample == decision_sample
+                                && decision.available =>
+                        {
+                            writer.write(&TurnEouSuppressedEvent {
+                                event: "turn_eou_suppressed",
+                                stream_id,
+                                stream_session_id,
+                                adapter_id,
+                                source: "semantic",
+                                detector: decision.detector,
+                                reason: "semantic_incomplete",
+                                end_sample,
+                                decision_sample,
+                                observed_speech_samples,
+                                min_required_samples: min_vad_speech_samples,
+                                daemon_mono_ns: now_mono_ns(),
+                            })?;
+                            return Ok(Vec::new());
+                        }
+                        _ => {
+                            // Fail open: if Smart Turn is unavailable or did not produce a decision
+                            // for this VAD boundary, preserve the current VAD behavior.
+                            close_reason = "smart_turn_unavailable_vad_fallback";
+                        }
+                    }
+                }
                 if vad_close_enabled {
+                    // Wait for the model to catch up to end_sample before closing.
+                    // This fixes the event-ordering race where turn_closed lands before
+                    // the model's final transcript updates for the same audio.
+                    if let Some(ref model_progress) = model_progress {
+                        let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
+                        let deadline = Instant::now() + timeout;
+                        loop {
+                            let committed = model_progress.get(&stream_session_id).unwrap_or(0);
+                            if committed >= end_sample {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                     session.close_turn(
                         turn_id,
-                        "vad",
-                        true,
-                        detector,
-                        confidence,
+                        close_source,
+                        close_degraded,
+                        close_detector,
+                        close_confidence,
                         end_sample,
                         decision_sample,
-                        "vad_speech_end",
+                        close_reason,
                         writer,
                     )?;
                     actions.push(DetectorAction::ResetEouState {
@@ -205,8 +290,8 @@ impl TurnManager {
                         adapter_id,
                         mode: EouResetMode::Decoder,
                         anchor_sample: decision_sample,
-                        source: "vad",
-                        reason: "vad_speech_end",
+                        source: close_source,
+                        reason: close_reason,
                         decision_sample,
                     });
                 }
@@ -333,6 +418,149 @@ impl TurnManager {
                 }
                 Ok(actions)
             }
+            DetectorSignal::SemanticTurnDecision {
+                detector,
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                end_sample,
+                decision_sample,
+                complete,
+                probability,
+                threshold,
+                timed_out,
+                available,
+                reason,
+                duration_ms,
+            } => {
+                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                session.last_semantic_decision = Some(SemanticDecisionState {
+                    detector,
+                    end_sample,
+                    decision_sample,
+                    complete,
+                    available,
+                    probability,
+                });
+                writer.write(&TurnSemanticDecisionEvent {
+                    event: "turn_semantic_decision",
+                    stream_id,
+                    stream_session_id,
+                    adapter_id,
+                    detector,
+                    end_sample,
+                    decision_sample,
+                    complete,
+                    available,
+                    timed_out,
+                    probability,
+                    threshold,
+                    reason,
+                    duration_ms,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
+                Ok(Vec::new())
+            }
+            DetectorSignal::VadAcousticFallback {
+                detector,
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                start_sample,
+                end_sample,
+                decision_sample,
+                silence_samples,
+                confidence,
+            } => {
+                let vad_close_enabled = self.config.vad_close_enabled;
+                let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
+                let model_progress = self.config.model_progress.clone();
+                let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
+                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                let observed_speech_samples = end_sample.saturating_sub(start_sample);
+                if session.open_turn.is_none() {
+                    return Ok(Vec::new());
+                }
+                let turn_id = session
+                    .open_turn
+                    .as_ref()
+                    .map(|turn| turn.turn_id.clone())
+                    .unwrap_or_else(|| session.next_turn_id());
+                if observed_speech_samples < min_vad_speech_samples {
+                    writer.write(&TurnEouSuppressedEvent {
+                        event: "turn_eou_suppressed",
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        source: "vad",
+                        detector,
+                        reason: "acoustic_fallback_vad_too_short",
+                        end_sample,
+                        decision_sample,
+                        observed_speech_samples,
+                        min_required_samples: min_vad_speech_samples,
+                        daemon_mono_ns: now_mono_ns(),
+                    })?;
+                    return Ok(Vec::new());
+                }
+                writer.write(&TurnEouCandidateEvent {
+                    event: "turn_eou_candidate",
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
+                    turn_id: turn_id.clone(),
+                    source: "vad_acoustic_fallback",
+                    degraded: true,
+                    detector,
+                    confidence,
+                    start_sample: Some(start_sample),
+                    end_sample,
+                    decision_sample,
+                    text_delta: None,
+                    vad_end_to_model_eou_ms: Some(samples_to_ms(silence_samples)),
+                    vad_decision_to_model_eou_ms: None,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
+                if vad_close_enabled {
+                    if let Some(ref model_progress) = model_progress {
+                        let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
+                        let deadline = Instant::now() + timeout;
+                        loop {
+                            let committed = model_progress.get(&stream_session_id).unwrap_or(0);
+                            if committed >= end_sample {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    session.close_turn(
+                        turn_id,
+                        "vad_acoustic_fallback",
+                        true,
+                        detector,
+                        confidence,
+                        end_sample,
+                        decision_sample,
+                        "vad_acoustic_fallback_low_probability_silence",
+                        writer,
+                    )?;
+                    Ok(vec![DetectorAction::ResetEouState {
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        mode: EouResetMode::Decoder,
+                        anchor_sample: decision_sample,
+                        source: "vad_acoustic_fallback",
+                        reason: "vad_acoustic_fallback_low_probability_silence",
+                        decision_sample,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
         }
     }
 
@@ -419,6 +647,7 @@ struct TurnSession {
     last_vad_end_decision_sample: Option<u64>,
     last_closed_end_sample: Option<u64>,
     last_closed_decision_sample: Option<u64>,
+    last_semantic_decision: Option<SemanticDecisionState>,
 }
 
 impl TurnSession {
@@ -436,6 +665,7 @@ impl TurnSession {
             last_vad_end_decision_sample: None,
             last_closed_end_sample: None,
             last_closed_decision_sample: None,
+            last_semantic_decision: None,
         }
     }
 
@@ -552,6 +782,16 @@ struct OpenTurn {
     start_sample: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SemanticDecisionState {
+    detector: &'static str,
+    end_sample: u64,
+    decision_sample: u64,
+    complete: bool,
+    available: bool,
+    probability: Option<f32>,
+}
+
 #[derive(Debug, Serialize)]
 struct TurnSessionStartEvent {
     event: &'static str,
@@ -563,6 +803,8 @@ struct TurnSessionStartEvent {
     min_vad_speech_ms: u32,
     min_model_eou_speech_ms: u32,
     model_eou_refractory_ms: u32,
+    semantic_gate_enabled: bool,
+    semantic_gate_close_enabled: bool,
     daemon_mono_ns: u64,
 }
 
@@ -627,6 +869,25 @@ struct TurnEouSuppressedEvent {
     decision_sample: u64,
     observed_speech_samples: u64,
     min_required_samples: u64,
+    daemon_mono_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnSemanticDecisionEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    detector: &'static str,
+    end_sample: u64,
+    decision_sample: u64,
+    complete: bool,
+    available: bool,
+    timed_out: bool,
+    probability: Option<f32>,
+    threshold: Option<f32>,
+    reason: &'static str,
+    duration_ms: Option<f64>,
     daemon_mono_ns: u64,
 }
 

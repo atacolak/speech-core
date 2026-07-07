@@ -1,10 +1,10 @@
 # speech-core current state
 
-this is the reality as of the current committed runtime. if another doc disagrees, trust this file and the repo code first.
+this is the reality as of the current working tree. if another doc disagrees, trust this file and the repo code first.
 
 ## one-line summary
 
-`speech-core` is a rust speech runtime: laptop mic audio streams to the sfub daemon, nemotron produces low-latency transcript text, and silero vad marks turn boundaries.
+`speech-core` is a rust speech runtime: laptop mic audio streams to the sfub daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, and smart turn v3 can semantically gate turn closure.
 
 ## current live path
 
@@ -20,7 +20,9 @@ sfub
     writes jsonl event log
     feeds nemotron streaming asr
     feeds silero vad
-    turn manager promotes vad speech_end into turn_closed
+    buffers recent audio for smart turn v3
+    on vad speech_end, runs smart turn v3 once on recent turn audio
+    turn manager promotes accepted boundaries into turn_closed
       ↓
 sfnix or sfub
   speech-core-watch / speech-core-live-session
@@ -35,11 +37,22 @@ installed daemon defaults:
 ```text
 SPEECH_CORE_STREAM_CHUNK_MS=160
 SPEECH_CORE_ATT_CONTEXT_RIGHT=1
-SPEECH_CORE_VAD_THRESHOLD=0.3
-SPEECH_CORE_VAD_ONSET_FRAMES=2
-SPEECH_CORE_VAD_HANGOVER_FRAMES=12
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=700
+SPEECH_CORE_VAD_THRESHOLD=0.5
+SPEECH_CORE_VAD_ONSET_FRAMES=3
+SPEECH_CORE_VAD_HANGOVER_FRAMES=10
+SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
+SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
+SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=600
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
+SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
+SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
+SPEECH_CORE_SMART_TURN_CPU_COUNT=1
+SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=800,1600
+SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
+SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
 SPEECH_CORE_EOU_MODEL_DIR=
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 ```
@@ -47,89 +60,72 @@ SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 important translation:
 
 - nemotron runs every ~160ms of audio with ~80ms right-context.
-- silero vad uses 30ms frames.
-- vad starts speech after 2 speech frames, so roughly 60ms of above-threshold speech.
-- vad ends speech after 12 non-speech frames, so roughly 360ms of below-threshold audio.
-- turn manager ignores vad segments whose total speech duration is under 700ms.
+- silero vad uses 20ms frames.
+- vad starts speech after 3 smoothed speech frames, roughly 60ms above threshold.
+- vad ends speech after 10 smoothed stopping frames, exactly 200ms below stop threshold.
+- turn manager ignores vad segments whose current vad segment duration is under 600ms.
+- smart turn runs after vad speech_end. if incomplete and no speech resumes, it rechecks at +800ms and +1600ms after the assumed end sample.
+- smart turn timeout/unavailable/error fails open to vad close.
 - parakeet realtime eou is disabled by default.
 
 ## what `<EOU>` means right now
 
-`<EOU>` in the watcher is not a token from the speech model.
+`<EOU>` in the watcher means `turn_closed`.
 
-it means:
+with smart turn enabled, a normal successful semantic close is:
 
 ```text
 silero vad emitted vad_speech_end
-and the detected speech segment lasted at least 700ms
-and turn manager emitted turn_closed source=vad
+smart turn v3 classified the recent turn audio as complete
+turn manager emitted turn_closed source=smart_turn degraded=false
 ```
 
-so if you pause mid-sentence for about 360ms or more after a segment that has already lasted at least 700ms, the watcher may print `<EOU>` even though you intended to continue. this is expected under the current simple vad-only policy. it is tunable, not magic.
-
-## what “short vad segments under 700ms are suppressed” means
-
-this is not about pause length. it is about the length of the whole speech segment.
-
-example that gets suppressed:
+fallback close is still possible:
 
 ```text
-noise/click/short syllable starts vad
-vad segment lasts 270ms
-vad says speech ended
-turn manager says: too short, do not close a turn
-watcher prints no <EOU>
+silero vad emitted vad_speech_end
+smart turn timed out / was unavailable / failed
+turn manager emitted turn_closed source=vad degraded=true
 ```
 
-example that still closes:
+incomplete semantic decisions suppress immediate vad close. if the delayed recheck still holds and speech does not resume, acoustic fallback can close only after 3000ms of low-probability silence:
 
 ```text
-you speak for 2 seconds
-then pause for 360ms
-vad says speech ended
-the segment was longer than 700ms
-turn manager closes the turn
-watcher prints <EOU>
+vad_acoustic_fallback
+turn_closed source=vad_acoustic_fallback degraded=true
 ```
 
-so the 700ms gate filters tiny false starts; it does not prevent eou after short pauses inside longer speech.
+## why smart turn v3 is different from parakeet realtime eou
 
-## why parakeet realtime eou is retired
+parakeet realtime eou emitted raw rnnt tokens during streaming and was noisy in live laptop use.
 
-recent live evidence was poor:
+smart turn v3 is audio-native endpoint classification:
 
-- one ~59s laptop session had one meaningful spoken region in the transcript.
-- parakeet realtime eou emitted 51 raw eou tokens.
-- 50 were suppressed by the turn manager.
-- model eou often arrived later than silero speech_end.
-- using it for turn closure made the system worse, not smarter.
+- input: last 8 seconds of 16khz mono audio as whisper log-mel features `[1,80,800]`.
+- output: one completion probability.
+- invoked only on vad speech_end candidates.
+- no tokenizer, no transcript sidecar, no python process.
 
-it remains in-tree for experiments only. to re-enable intentionally:
-
-```bash
-SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
-SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true \
-./scripts/install-sfub-daemon.sh
-```
+this is less magical and less chatty. good.
 
 ## what works
 
 - websocket audio transport from sfnix to sfub.
 - native nixos build/install path for the laptop client.
 - sfub systemd user service for the daemon.
-- nemotron streaming transcript, fast enough for interactive use.
-- silero vad turn boundaries.
+- nemotron streaming transcript.
+- silero vad acoustic pauses.
+- smart turn v3 direct rust onnx semantic endpoint gate.
+- transcript-before-`<EOU>` event ordering via `ModelProgressMap` wait.
 - clean live watcher output: transcript plus `<EOU>`.
 - jsonl event log for debugging.
 
 ## what is still rough
 
-- vad-only eou is acoustics-only. it does not know syntax or intent.
-- mid-sentence pauses can close a turn.
-- no parakeet unified gguf artifact is currently local.
-- parakeet unified has not been benchmarked as a delayed correction/finalizer.
+- smart turn v3 needs live laptop validation across actual conversational pauses.
+- smart turn preprocessing is implemented directly in rust; parity against python is smoke-tested through the real model, not numerically golden-tested against transformers.
 - cross-host capture latency is preserved but not calibrated.
-- docs under `/home/sf/workspace/docs/speech-core` contain older planning/spec history; they are useful archaeology but not the current runtime source of truth.
+- docs under `/home/sf/workspace/docs/speech-core` contain older planning/spec history; useful archaeology, not current runtime source of truth.
 
 ## useful commands
 
@@ -154,6 +150,8 @@ repo:
 
 ```bash
 cargo test --workspace
+SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
+  cargo test -p speech-core-daemon real_model_smoke_when_env_set -- --nocapture
 ./scripts/install-sfub-daemon.sh
 ./scripts/sfnix-sync-build-adapter.sh
 ```

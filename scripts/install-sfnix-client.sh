@@ -19,10 +19,13 @@ watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
 mkdir -p "$bin_dir" "$libexec_dir" "$state_dir" "$config_dir" "$systemd_user_dir"
 cd "$repo_root"
 
+rm -rf target/debug
 nix-shell --run 'cargo build -p speech-core-mic-adapter -p speech-core-watch' >/dev/null
 install -m 0755 target/debug/speech-core-mic-adapter "$libexec_dir/speech-core-mic-adapter"
 install -m 0755 target/debug/speech-core-watch "$libexec_dir/speech-core-watch"
 install -m 0755 scripts/sfnix-live-session.sh "$bin_dir/speech-core-live-session"
+install -m 0755 scripts/speech-core-dictation-run.sh "$bin_dir/speech-core-dictation-run"
+install -m 0755 scripts/speech-core-dictation-toggle.sh "$bin_dir/speech-core-dictation-toggle"
 
 cat >"$config_dir/client.env" <<EOF_ENV
 SPEECH_CORE_WS_URL=$ws_url
@@ -87,6 +90,7 @@ installed sfnix speech-core client
   watcher wrapper: $bin_dir/speech-core-watch
   real binaries:   $libexec_dir
   live session:    $bin_dir/speech-core-live-session
+  dictation:       $bin_dir/speech-core-dictation-toggle
   env:             $config_dir/client.env
   service:         $systemd_user_dir/speech-core-mic-adapter.service
 

@@ -6,11 +6,46 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_float, c_int};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{HelloState, JsonlLogger};
+
+/// Shared model progress tracker: stream_session_id → latest committed audio sample.
+/// The TurnManager reads this to ensure the model has caught up before emitting turn_closed.
+#[derive(Debug, Clone, Default)]
+pub struct ModelProgressMap {
+    inner: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl ModelProgressMap {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn update(&self, session_id: &str, committed_samples: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(session_id.to_owned(), committed_samples);
+        }
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(session_id).copied())
+    }
+
+    pub fn remove(&self, session_id: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(session_id);
+        }
+    }
+}
 
 const TRANSCRIBE_OK: i32 = 0;
 const TRANSCRIBE_TIMESTAMPS_TOKEN: i32 = 4;
@@ -21,6 +56,8 @@ pub struct ModelConfig {
     pub stream_chunk_ms: u32,
     pub att_context_right: i32,
     pub queue_frames: usize,
+    /// Shared progress tracker so the TurnManager can wait for model catch-up.
+    pub model_progress: Option<ModelProgressMap>,
 }
 
 #[derive(Clone)]
@@ -182,18 +219,21 @@ struct ModelWorker {
     logger: JsonlLogger,
     runtime: tokio::runtime::Handle,
     sessions: HashMap<String, ModelSession>,
+    model_progress: Option<ModelProgressMap>,
 }
 
 impl ModelWorker {
     fn new(config: ModelConfig, logger: JsonlLogger, runtime: tokio::runtime::Handle) -> Self {
         let model_path_c = CString::new(config.model_path.to_string_lossy().as_bytes())
             .expect("model path contains interior NUL");
+        let model_progress = config.model_progress.clone();
         Self {
             config,
             model_path_c,
             logger,
             runtime,
             sessions: HashMap::new(),
+            model_progress,
         }
     }
 
@@ -363,6 +403,9 @@ impl ModelWorker {
             true,
             Some(reason),
         )?;
+        if let Some(ref progress) = self.model_progress {
+            progress.remove(stream_session_id);
+        }
         drop(session);
         Ok(())
     }
@@ -487,6 +530,12 @@ impl ModelWorker {
                 buffered_ms: update.buffered_ms,
                 model_feed_end_mono_ns,
             })?;
+        }
+
+        // Update shared progress so TurnManager can wait for model catch-up.
+        if let Some(ref progress) = self.model_progress {
+            let committed_samples = (update.audio_committed_ms.max(0) as u64).saturating_mul(16);
+            progress.update(&session.hello.stream_session_id, committed_samples);
         }
 
         let committed = update.committed_tokens.max(0) as i32;

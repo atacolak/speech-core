@@ -9,9 +9,11 @@ use speech_core_protocol::{
     TimestampQuality,
 };
 use std::f32::consts::TAU;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -96,6 +98,10 @@ struct Args {
     /// Number of frames to send before exiting. Unlimited by default.
     #[arg(long)]
     frames: Option<u64>,
+
+    /// Also write captured 16 kHz mono audio to this wav file while streaming.
+    #[arg(long, env = "SPEECH_CORE_RECORD_WAV")]
+    record_wav: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -199,6 +205,11 @@ async fn send_synthetic_frames(
     clock_id: String,
     mut ws: Option<&mut WebSocketStream<MaybeTlsStream<TcpStream>>>,
 ) -> Result<()> {
+    let recorder = args
+        .record_wav
+        .as_ref()
+        .map(|path| WavRecorder::create(path, args.sample_rate_hz, args.channels))
+        .transpose()?;
     let sample_count = frame_duration_samples(args.sample_rate_hz, args.frame_ms);
     let frame_period = Duration::from_millis(args.frame_ms as u64);
     let mut ticker = interval(frame_period);
@@ -220,6 +231,7 @@ async fn send_synthetic_frames(
             args.channels,
             args.tone_hz,
         );
+        record_samples(&recorder, &samples);
         let payload = encode_payload(&samples, args.format.into());
         let frame = build_frame(
             &args.stream_id,
@@ -251,6 +263,7 @@ async fn send_synthetic_frames(
         seq = seq.saturating_add(1);
         source_sample_start = source_sample_start.saturating_add(u64::from(sample_count));
     }
+    drop(recorder);
     Ok(())
 }
 
@@ -260,12 +273,18 @@ async fn run_cpal(
     stream_session_id: String,
     clock_id: String,
 ) -> Result<()> {
+    let recorder = args
+        .record_wav
+        .as_ref()
+        .map(|path| WavRecorder::create(path, args.sample_rate_hz, args.channels))
+        .transpose()?;
     let (sender, receiver) = mpsc::sync_channel::<CapturedBuffer>(128);
     let capture = start_capture_thread(
         args.device.clone(),
         args.sample_rate_hz,
         args.channels,
         sender,
+        recorder.clone(),
     )?;
 
     let mut ws = connect_ws(&args.url).await?;
@@ -345,6 +364,7 @@ async fn run_cpal(
     }
 
     drop(capture);
+    drop(recorder);
     Ok(())
 }
 
@@ -490,6 +510,132 @@ struct CaptureHandle {
     _thread: thread::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct WavRecorder {
+    state: Arc<Mutex<Option<WavRecorderState>>>,
+}
+
+struct WavRecorderState {
+    file: std::fs::File,
+    sample_rate_hz: u32,
+    channels: u16,
+    data_bytes: u32,
+}
+
+impl WavRecorder {
+    fn create(path: &PathBuf, sample_rate_hz: u32, channels: u16) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating recorder directory {}", parent.display()))?;
+        }
+        let mut file = std::fs::File::create(path)
+            .with_context(|| format!("creating recorder wav {}", path.display()))?;
+        write_wav_header(&mut file, channels, sample_rate_hz, 0)?;
+        eprintln!("recording captured audio to {}", path.display());
+        Ok(Self {
+            state: Arc::new(Mutex::new(Some(WavRecorderState {
+                file,
+                sample_rate_hz,
+                channels,
+                data_bytes: 0,
+            }))),
+        })
+    }
+
+    fn write_samples(&self, samples: &[f32]) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            payload.extend_from_slice(&scaled.to_le_bytes());
+        }
+        if let Err(err) = state.file.seek(SeekFrom::End(0)) {
+            eprintln!("recording wav seek failed: {err}");
+            return;
+        }
+        if let Err(err) = state.file.write_all(&payload) {
+            eprintln!("recording wav sample failed: {err}");
+            return;
+        }
+        state.data_bytes = state
+            .data_bytes
+            .saturating_add(payload.len().min(u32::MAX as usize) as u32);
+        if let Err(err) = refresh_wav_header(state) {
+            eprintln!("recording wav header refresh failed: {err}");
+        }
+    }
+}
+
+impl Drop for WavRecorder {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.state) != 1 {
+            return;
+        }
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        if let Some(mut state) = guard.take() {
+            if let Err(err) = refresh_wav_header(&mut state) {
+                eprintln!("recording wav finalize failed: {err}");
+            }
+            if let Err(err) = state.file.flush() {
+                eprintln!("recording wav flush failed: {err}");
+            }
+        }
+    }
+}
+
+fn refresh_wav_header(state: &mut WavRecorderState) -> Result<()> {
+    let pos = state.file.stream_position()?;
+    state.file.seek(SeekFrom::Start(0))?;
+    write_wav_header(
+        &mut state.file,
+        state.channels,
+        state.sample_rate_hz,
+        state.data_bytes,
+    )?;
+    state.file.seek(SeekFrom::Start(pos))?;
+    state.file.flush()?;
+    Ok(())
+}
+
+fn write_wav_header(
+    file: &mut std::fs::File,
+    channels: u16,
+    sample_rate_hz: u32,
+    data_bytes: u32,
+) -> Result<()> {
+    let bits_per_sample = 16_u16;
+    let block_align = channels.saturating_mul(bits_per_sample / 8);
+    let byte_rate = sample_rate_hz.saturating_mul(u32::from(block_align));
+    let riff_size = 36_u32.saturating_add(data_bytes);
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16_u32.to_le_bytes())?;
+    file.write_all(&1_u16.to_le_bytes())?;
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&sample_rate_hz.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_bytes.to_le_bytes())?;
+    Ok(())
+}
+
+fn record_samples(recorder: &Option<WavRecorder>, samples: &[f32]) {
+    if let Some(recorder) = recorder {
+        recorder.write_samples(samples);
+    }
+}
+
 struct CapturedBuffer {
     samples: Vec<f32>,
     first_sample_capture_mono_ns: u64,
@@ -509,6 +655,7 @@ fn start_capture_thread(
     sample_rate_hz: u32,
     channels: u16,
     sender: SyncSender<CapturedBuffer>,
+    recorder: Option<WavRecorder>,
 ) -> Result<CaptureHandle> {
     let host = cpal::default_host();
     let device = find_input_device(&host, device_filter.as_deref())?;
@@ -546,10 +693,12 @@ fn start_capture_thread(
     let stream = match sample_format {
         SampleFormat::F32 => {
             let counters = Arc::clone(&drop_counters);
+            let recorder = recorder.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], info| {
                     let samples = data.to_vec();
+                    record_samples(&recorder, &samples);
                     send_captured(samples, info, channels, &sender, &counters)
                 },
                 err_fn,
@@ -558,11 +707,13 @@ fn start_capture_thread(
         }
         SampleFormat::I16 => {
             let counters = Arc::clone(&drop_counters);
+            let recorder = recorder.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], info| {
                     let samples: Vec<f32> =
                         data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
+                    record_samples(&recorder, &samples);
                     send_captured(samples, info, channels, &sender, &counters)
                 },
                 err_fn,
@@ -571,6 +722,7 @@ fn start_capture_thread(
         }
         SampleFormat::U16 => {
             let counters = Arc::clone(&drop_counters);
+            let recorder = recorder.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], info| {
@@ -578,6 +730,7 @@ fn start_capture_thread(
                         .iter()
                         .map(|s| (*s as f32 - 32768.0) / 32768.0)
                         .collect();
+                    record_samples(&recorder, &samples);
                     send_captured(samples, info, channels, &sender, &counters)
                 },
                 err_fn,
