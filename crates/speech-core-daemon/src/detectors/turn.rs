@@ -239,7 +239,8 @@ impl TurnManager {
                         Some(decision)
                             if decision.end_sample == end_sample
                                 && decision.decision_sample == decision_sample
-                                && decision.available =>
+                                && decision.available
+                                && !decision.timed_out =>
                         {
                             writer.write(&TurnEouSuppressedEvent {
                                 event: "turn_eou_suppressed",
@@ -292,6 +293,16 @@ impl TurnManager {
                                 }
                             }
                             return Ok(Vec::new());
+                        }
+                        Some(decision)
+                            if decision.end_sample == end_sample
+                                && decision.decision_sample == decision_sample
+                                && decision.available
+                                && decision.timed_out =>
+                        {
+                            // Fail open: Smart Turn timed out before reaching a complete decision,
+                            // so preserve the current VAD behavior rather than suppressing closure.
+                            close_reason = "smart_turn_timeout_vad_fallback";
                         }
                         _ => {
                             // Fail open: if Smart Turn is unavailable or did not produce a decision
@@ -577,7 +588,7 @@ impl TurnManager {
                         stream_id,
                         stream_session_id,
                         adapter_id,
-                        source: "model",
+                        source: "model_eou",
                         detector,
                         reason: if too_early {
                             "too_early"
@@ -622,7 +633,7 @@ impl TurnManager {
                     stream_session_id: stream_session_id.clone(),
                     adapter_id: adapter_id.clone(),
                     turn_id: turn_id.clone(),
-                    source: "model",
+                    source: "model_eou",
                     degraded: false,
                     detector,
                     confidence,
@@ -638,7 +649,7 @@ impl TurnManager {
                 if model_eou_close_enabled {
                     session.close_turn(
                         turn_id,
-                        "model",
+                        "model_eou",
                         false,
                         detector,
                         confidence,
@@ -653,7 +664,7 @@ impl TurnManager {
                         adapter_id,
                         mode: EouResetMode::Decoder,
                         anchor_sample: decision_sample,
-                        source: "model",
+                        source: "model_eou",
                         reason: "eou_token_detected",
                         decision_sample,
                     });
@@ -682,6 +693,7 @@ impl TurnManager {
                     decision_sample,
                     complete,
                     available,
+                    timed_out,
                     probability,
                 });
                 writer.write(&TurnSemanticDecisionEvent {
@@ -1034,6 +1046,7 @@ struct SemanticDecisionState {
     decision_sample: u64,
     complete: bool,
     available: bool,
+    timed_out: bool,
     probability: Option<f32>,
 }
 
@@ -1219,10 +1232,583 @@ fn ms_to_samples(ms: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use tempfile::{tempdir, TempDir};
+    use tokio::runtime::Runtime;
+    use tokio::sync::broadcast;
+
+    const STREAM_ID: &str = "test.stream";
+    const SESSION_ID: &str = "test.session";
+    const ADAPTER_ID: &str = "test.adapter";
+    const VAD: &str = "silero_vad";
+    const SMART_TURN: &str = "pipecat_smart_turn_v3";
+    const MODEL_EOU: &str = "parakeet_realtime_eou_120m_v1";
+
+    struct TurnHarness {
+        manager: TurnManager,
+        logger: crate::JsonlLogger,
+        runtime: Runtime,
+        events: broadcast::Receiver<String>,
+        _dir: TempDir,
+    }
+
+    impl TurnHarness {
+        fn new(config: TurnManagerConfig) -> Self {
+            let runtime = Runtime::new().expect("test runtime should start");
+            let dir = tempdir().expect("temp log dir should be created");
+            let (event_tx, events) = broadcast::channel(256);
+            let logger = runtime
+                .block_on(crate::JsonlLogger::open(dir.path().to_path_buf(), event_tx))
+                .expect("test logger should open");
+            let mut harness = Self {
+                manager: TurnManager::new(config),
+                logger,
+                runtime,
+                events,
+                _dir: dir,
+            };
+            let hello = test_hello();
+            {
+                let mut writer = DetectorWriter::new(&harness.logger, harness.runtime.handle());
+                harness
+                    .manager
+                    .start_session(&hello, &mut writer)
+                    .expect("turn session should start");
+            }
+            harness.drain_events();
+            harness
+        }
+
+        fn send(&mut self, signal: DetectorSignal) -> Vec<DetectorAction> {
+            let mut writer = DetectorWriter::new(&self.logger, self.runtime.handle());
+            self.manager
+                .handle_signal(signal, &mut writer)
+                .expect("turn manager should handle test signal")
+        }
+
+        fn drain_events(&mut self) -> Vec<Value> {
+            let mut events = Vec::new();
+            loop {
+                match self.events.try_recv() {
+                    Ok(line) => {
+                        events.push(serde_json::from_str(&line).unwrap_or_else(|err| {
+                            panic!("event should be valid json: {err}; {line}")
+                        }))
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        panic!("test event receiver lagged by {skipped} events")
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => break,
+                }
+            }
+            events
+        }
+    }
+
+    fn test_hello() -> HelloState {
+        HelloState {
+            adapter_id: ADAPTER_ID.to_owned(),
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            source_kind: speech_core_protocol::SourceKind::Synthetic,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            format: speech_core_protocol::PcmFormat::PcmF32Le,
+            timestamp_provenance: speech_core_protocol::TimestampProvenance::uncalibrated(
+                "test-clock",
+                speech_core_protocol::ClockDomain::HostMonotonic,
+                speech_core_protocol::TimestampQuality::SyntheticScheduled,
+            ),
+        }
+    }
+
+    fn vad_start(start_sample: u64, decision_sample: u64) -> DetectorSignal {
+        DetectorSignal::VadSegmentStart {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample,
+            decision_sample,
+            confidence: Some(0.9),
+        }
+    }
+
+    fn vad_end(start_sample: u64, end_sample: u64, decision_sample: u64) -> DetectorSignal {
+        DetectorSignal::VadSegmentEnd {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample,
+            end_sample,
+            decision_sample,
+            confidence: Some(0.1),
+        }
+    }
+
+    fn semantic_decision(
+        end_sample: u64,
+        decision_sample: u64,
+        complete: bool,
+        available: bool,
+        timed_out: bool,
+    ) -> DetectorSignal {
+        DetectorSignal::SemanticTurnDecision {
+            detector: SMART_TURN,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            end_sample,
+            decision_sample,
+            complete,
+            probability: Some(if complete { 0.88 } else { 0.2 }),
+            threshold: Some(0.5),
+            timed_out,
+            available,
+            reason: if !available {
+                "smart_turn_unavailable"
+            } else if timed_out {
+                "smart_turn_timeout"
+            } else if complete {
+                "smart_turn_complete"
+            } else {
+                "smart_turn_incomplete"
+            },
+            duration_ms: Some(if timed_out { 100.0 } else { 10.0 }),
+        }
+    }
+
+    fn model_eou(end_sample: u64, decision_sample: u64) -> DetectorSignal {
+        DetectorSignal::ModelEou {
+            detector: MODEL_EOU,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            end_sample,
+            decision_sample,
+            text_delta: String::new(),
+            confidence: Some(0.7),
+        }
+    }
+
+    fn transcript_token(
+        start_sample: u64,
+        end_sample: u64,
+        decision_sample: u64,
+    ) -> DetectorSignal {
+        DetectorSignal::TranscriptTokenCommitted {
+            detector: "nemotron_ctc",
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            token_index: 0,
+            text: "hello".to_owned(),
+            start_sample,
+            end_sample,
+            decision_sample,
+            confidence: Some(0.95),
+        }
+    }
+
+    fn low_silence(
+        start_sample: u64,
+        decision_sample: u64,
+        silence_samples: u64,
+    ) -> DetectorSignal {
+        DetectorSignal::VadLowSilence {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample,
+            decision_sample,
+            silence_samples,
+            confidence: Some(0.01),
+        }
+    }
+
+    fn assert_reset_action(
+        actions: &[DetectorAction],
+        expected_source: &'static str,
+        expected_reason: &'static str,
+        expected_anchor: u64,
+    ) {
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                DetectorAction::ResetEouState {
+                    mode: EouResetMode::Decoder,
+                    source,
+                    reason,
+                    anchor_sample,
+                    ..
+                } if *source == expected_source
+                    && *reason == expected_reason
+                    && *anchor_sample == expected_anchor
+            )),
+            "expected a decoder reset action with source={expected_source:?}, reason={expected_reason:?}, \
+             anchor_sample={expected_anchor}; got actions: {actions:#?}"
+        );
+    }
+
+    fn event_field<'a>(event: &'a Value, field: &str) -> &'a str {
+        event
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("event should contain string field {field}: {event}"))
+    }
+
+    fn find_event<'a>(events: &'a [Value], event_name: &str) -> Option<&'a Value> {
+        events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some(event_name))
+    }
+
+    fn assert_no_event(events: &[Value], event_name: &str) {
+        assert!(
+            find_event(events, event_name).is_none(),
+            "did not expect {event_name} event; got events: {events:#?}"
+        );
+    }
+
+    fn assert_turn_closed(
+        events: &[Value],
+        expected_source: &'static str,
+        expected_degraded: bool,
+        expected_reason: &'static str,
+    ) {
+        let closed = find_event(events, "turn_closed")
+            .unwrap_or_else(|| panic!("expected turn_closed event; got events: {events:#?}"));
+        assert_eq!(
+            event_field(closed, "source"),
+            expected_source,
+            "turn_closed should use the expected close source; event: {closed}"
+        );
+        assert_eq!(
+            closed.get("degraded").and_then(Value::as_bool),
+            Some(expected_degraded),
+            "turn_closed should mark degraded={expected_degraded}; event: {closed}"
+        );
+        assert_eq!(
+            event_field(closed, "reason"),
+            expected_reason,
+            "turn_closed should use the expected reason; event: {closed}"
+        );
+    }
+
+    fn assert_suppressed(
+        events: &[Value],
+        expected_source: &'static str,
+        expected_reason: &'static str,
+    ) {
+        assert!(
+            events.iter().any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("turn_eou_suppressed")
+                    && event.get("source").and_then(Value::as_str) == Some(expected_source)
+                    && event.get("reason").and_then(Value::as_str) == Some(expected_reason)
+            }),
+            "expected turn_eou_suppressed source={expected_source:?} reason={expected_reason:?}; \
+             got events: {events:#?}"
+        );
+    }
 
     #[test]
     fn sample_time_is_16khz() {
         assert_eq!(samples_to_ms(16_000), 1_000);
         assert_eq!(samples_to_ms(480), 30);
+    }
+
+    #[test]
+    fn smart_turn_timeout_fails_open_but_non_timeout_incomplete_suppresses() {
+        let mut timed_out = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            ..Default::default()
+        });
+        timed_out.send(vad_start(0, 3_200));
+        timed_out.send(semantic_decision(16_000, 17_920, false, true, true));
+        timed_out.drain_events();
+
+        let actions = timed_out.send(vad_end(0, 16_000, 17_920));
+        let events = timed_out.drain_events();
+
+        assert_reset_action(&actions, "vad", "smart_turn_timeout_vad_fallback", 17_920);
+        assert_turn_closed(&events, "vad", true, "smart_turn_timeout_vad_fallback");
+        assert!(
+            !events.iter().any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("turn_eou_suppressed")
+                    && event.get("reason").and_then(Value::as_str)
+                        == Some("semantic_incomplete")
+            }),
+            "a timed-out Smart Turn incomplete decision must fail open to VAD, not suppress closure; \
+             got events: {events:#?}"
+        );
+
+        let mut incomplete = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            ..Default::default()
+        });
+        incomplete.send(vad_start(0, 3_200));
+        incomplete.send(semantic_decision(16_000, 17_920, false, true, false));
+        incomplete.drain_events();
+
+        let actions = incomplete.send(vad_end(0, 16_000, 17_920));
+        let events = incomplete.drain_events();
+
+        assert!(
+            actions.is_empty(),
+            "non-timed-out Smart Turn incomplete decisions should suppress VAD close and emit no reset; got actions: {actions:#?}"
+        );
+        assert_suppressed(&events, "semantic", "semantic_incomplete");
+        assert_no_event(&events, "turn_closed");
+    }
+
+    #[test]
+    fn smart_turn_complete_closes_non_degraded_turn() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.send(semantic_decision(16_000, 17_920, true, true, false));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "smart_turn",
+            "smart_turn_complete_after_vad_speech_end",
+            17_920,
+        );
+        assert_turn_closed(
+            &events,
+            "smart_turn",
+            false,
+            "smart_turn_complete_after_vad_speech_end",
+        );
+    }
+
+    #[test]
+    fn smart_turn_unavailable_fails_open_to_vad_fallback() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.send(semantic_decision(16_000, 17_920, false, false, false));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "vad",
+            "smart_turn_unavailable_vad_fallback",
+            17_920,
+        );
+        assert_turn_closed(&events, "vad", true, "smart_turn_unavailable_vad_fallback");
+        assert_no_event(&events, "turn_eou_suppressed");
+    }
+
+    #[test]
+    fn vad_close_with_model_alignment_timeout_returns_without_hanging() {
+        // Today VAD close waits synchronously for ASR model progress to reach the VAD decision
+        // sample. This characterization keeps the current blocking wait bounded. A future
+        // deferred-close implementation should replace this with an immediate non-blocking action.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let progress = ModelProgressMap::new();
+            progress.update(SESSION_ID, 17_919);
+            let mut harness = TurnHarness::new(TurnManagerConfig {
+                vad_close_enabled: true,
+                model_progress: Some(progress),
+                model_alignment_timeout_ms: 100,
+                ..Default::default()
+            });
+            harness.send(vad_start(0, 3_200));
+            harness.drain_events();
+
+            let started = Instant::now();
+            let actions = harness.send(vad_end(0, 16_000, 17_920));
+            let elapsed = started.elapsed();
+            let events = harness.drain_events();
+            done_tx
+                .send((elapsed, actions, events))
+                .expect("test result receiver should still exist");
+        });
+
+        let (elapsed, actions, events) = done_rx.recv_timeout(Duration::from_millis(750)).expect(
+            "VAD close should not hang indefinitely while model progress is behind decision_sample",
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "blocking model-alignment wait should be bounded by model_alignment_timeout_ms; elapsed={elapsed:?}"
+        );
+        assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
+        assert_turn_closed(&events, "vad", true, "vad_speech_end");
+    }
+
+    #[test]
+    fn vad_close_with_model_caught_up_closes_immediately() {
+        let progress = ModelProgressMap::new();
+        progress.update(SESSION_ID, 17_920);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress),
+            model_alignment_timeout_ms: 100,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let started = Instant::now();
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let elapsed = started.elapsed();
+        let events = harness.drain_events();
+
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "when model_progress has already reached decision_sample, VAD close should not wait; elapsed={elapsed:?}"
+        );
+        assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
+        assert_turn_closed(&events, "vad", true, "vad_speech_end");
+    }
+
+    #[test]
+    fn min_vad_speech_ms_filters_short_utterances() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            min_vad_speech_ms: 300,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 320));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 1_600, 1_920));
+        let events = harness.drain_events();
+
+        assert!(
+            actions.is_empty(),
+            "a 100ms VAD segment is shorter than min_vad_speech_ms=300 and should not close; got actions: {actions:#?}"
+        );
+        assert_suppressed(&events, "vad", "vad_too_short");
+        assert_no_event(&events, "turn_closed");
+    }
+
+    #[test]
+    fn human_hold_emits_after_long_speech_without_tokens_when_semantic_gate_suppresses() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            human_hold_silence_ms: 1_000,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.send(semantic_decision(16_000, 16_000, false, true, false));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 16_000, 16_000));
+        let events = harness.drain_events();
+
+        assert!(
+            actions.is_empty(),
+            "semantic incomplete should suppress VAD closure even when human-hold is emitted; got actions: {actions:#?}"
+        );
+        assert_suppressed(&events, "semantic", "semantic_incomplete");
+        assert!(
+            events.iter().any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("turn_human_hold")
+                    && event.get("reason").and_then(Value::as_str)
+                        == Some("speech_like_audio_without_tokens")
+                    && event
+                        .get("samples_without_tokens")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|samples| samples >= 16_000)
+            }),
+            "after >= human_hold_silence_ms of speech-like audio without tokens, TurnHumanHoldEvent should be emitted; got events: {events:#?}"
+        );
+        assert_no_event(&events, "turn_closed");
+    }
+
+    #[test]
+    fn model_eou_closes_turn_with_model_eou_source() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            model_eou_close_enabled: true,
+            min_model_eou_speech_ms: 300,
+            ..Default::default()
+        });
+
+        let actions = harness.send(model_eou(16_000, 16_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(&actions, "model_eou", "eou_token_detected", 16_000);
+        assert_turn_closed(&events, "model_eou", false, "eou_token_detected");
+    }
+
+    #[test]
+    fn model_eou_refractory_suppresses_second_eou() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            model_eou_close_enabled: true,
+            min_model_eou_speech_ms: 300,
+            model_eou_refractory_ms: 700,
+            ..Default::default()
+        });
+        let first_actions = harness.send(model_eou(10_000, 16_000));
+        let first_events = harness.drain_events();
+        assert_reset_action(&first_actions, "model_eou", "eou_token_detected", 16_000);
+        assert_turn_closed(&first_events, "model_eou", false, "eou_token_detected");
+
+        let second_actions = harness.send(model_eou(18_000, 20_000));
+        let second_events = harness.drain_events();
+
+        assert!(
+            second_actions.is_empty(),
+            "a second ModelEou inside model_eou_refractory_ms should be suppressed and emit no reset; got actions: {second_actions:#?}"
+        );
+        assert_suppressed(&second_events, "model_eou", "refractory");
+        assert_no_event(&second_events, "turn_closed");
+    }
+
+    #[test]
+    fn transcript_silence_closes_transcript_backed_turn() {
+        let progress = ModelProgressMap::new();
+        progress.update(SESSION_ID, 3_200);
+        progress.record_token(SESSION_ID, 3_200);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            model_progress: Some(progress),
+            transcript_silence_close_ms: 700,
+            ..Default::default()
+        });
+        harness.send(transcript_token(0, 3_200, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(low_silence(3_200, 15_200, 12_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "transcript_silence",
+            "transcript_backed_turn_low_vad_silence",
+            15_200,
+        );
+        assert_turn_closed(
+            &events,
+            "transcript_silence",
+            true,
+            "transcript_backed_turn_low_vad_silence",
+        );
     }
 }
