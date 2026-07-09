@@ -290,9 +290,6 @@ impl TurnManager {
                                     .and_then(|progress| {
                                         progress.last_token_end_sample(&stream_session_id)
                                     })
-                                    .or_else(|| {
-                                        session.open_turn.as_ref().map(|turn| turn.start_sample)
-                                    })
                                     .unwrap_or(start_sample);
                                 let samples_without_tokens =
                                     decision_sample.saturating_sub(token_anchor);
@@ -433,7 +430,6 @@ impl TurnManager {
                 let token_anchor = model_progress
                     .as_ref()
                     .and_then(|progress| progress.last_token_end_sample(&stream_session_id))
-                    .or_else(|| session.open_turn.as_ref().map(|turn| turn.start_sample))
                     .unwrap_or(start_sample);
                 let samples_without_tokens = decision_sample.saturating_sub(token_anchor);
                 if samples_without_tokens >= human_hold_silence_samples
@@ -733,21 +729,26 @@ impl TurnManager {
                 reason,
                 duration_ms,
             } => {
-                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
-                session.last_semantic_decision = Some(SemanticDecisionState {
-                    detector,
-                    end_sample,
-                    decision_sample,
-                    complete,
-                    available,
-                    timed_out,
-                    probability,
-                });
+                // Only record the decision if we're not going to close.
+                let record_only = !complete || !self.config.semantic_gate_close_enabled;
+                {
+                    let session =
+                        self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                    session.last_semantic_decision = Some(SemanticDecisionState {
+                        detector,
+                        end_sample,
+                        decision_sample,
+                        complete,
+                        available,
+                        timed_out,
+                        probability,
+                    });
+                }
                 writer.write(&TurnSemanticDecisionEvent {
                     event: "turn_semantic_decision",
-                    stream_id,
-                    stream_session_id,
-                    adapter_id,
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
                     detector,
                     end_sample,
                     decision_sample,
@@ -760,7 +761,23 @@ impl TurnManager {
                     duration_ms,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
-                Ok(Vec::new())
+                if record_only {
+                    return Ok(Vec::new());
+                }
+                // Smart turn says complete and semantic gate close is enabled.
+                // Close the turn directly without waiting for VAD to emit
+                // VadSegmentEnd. This handles noisy environments where VAD stays
+                // in speech and never fires speech_end.
+                self.close_turn_from_semantic(
+                    &stream_id,
+                    &stream_session_id,
+                    &adapter_id,
+                    detector,
+                    end_sample,
+                    decision_sample,
+                    probability,
+                    writer,
+                )
             }
             DetectorSignal::VadAcousticFallback {
                 detector,
@@ -900,6 +917,119 @@ impl TurnManager {
             self.end_session(&id, reason, writer)?;
         }
         Ok(())
+    }
+
+    /// Direct turn close triggered by a complete semantic (smart-turn) decision.
+    /// This bypasses the VAD-segment-end path so that turns close even when VAD
+    /// stays in speech (noisy environments). Mirrors the drain + wait + close
+    /// logic in VadSegmentEnd.
+    fn close_turn_from_semantic(
+        &mut self,
+        stream_id: &str,
+        stream_session_id: &str,
+        adapter_id: &str,
+        detector: &'static str,
+        end_sample: u64,
+        decision_sample: u64,
+        confidence: Option<f32>,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<Vec<DetectorAction>> {
+        let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
+        let model_progress = self.config.model_progress.clone();
+        let model_drain = self.config.model_drain.clone();
+        let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
+        let session = self.session_mut(stream_id, stream_session_id, adapter_id);
+        if session.open_turn.is_none() {
+            return Ok(Vec::new());
+        }
+        let turn_id = session
+            .open_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_else(|| session.next_turn_id());
+        // Gate: don't close on non-speech audio (noise, breaths, hums).
+        let has_any_tokens = model_progress
+            .as_ref()
+            .and_then(|mp| mp.last_token_end_sample(stream_session_id))
+            .is_some();
+        if !has_any_tokens {
+            writer.write(&TurnEouSuppressedEvent {
+                event: "turn_eou_suppressed",
+                stream_id: stream_id.to_owned(),
+                stream_session_id: stream_session_id.to_owned(),
+                adapter_id: adapter_id.to_owned(),
+                source: "semantic",
+                detector,
+                reason: "semantic_complete_no_tokens",
+                end_sample,
+                decision_sample,
+                observed_speech_samples: end_sample,
+                min_required_samples: min_vad_speech_samples,
+                daemon_mono_ns: now_mono_ns(),
+            })?;
+            return Ok(Vec::new());
+        }
+        let mut effective_end_sample = end_sample;
+        let mut effective_decision_sample = decision_sample;
+        let alignment_deadline = model_alignment_deadline(model_alignment_timeout_ms);
+        // Drain model worker partial chunk.
+        if let Some(ref model_drain) = model_drain {
+            let _ = model_drain.drain_session(ModelDrainRequest {
+                stream_id: stream_id.to_owned(),
+                stream_session_id: stream_session_id.to_owned(),
+                adapter_id: adapter_id.to_owned(),
+                target_sample: decision_sample,
+                reason: "smart_turn_complete",
+                timeout_ms: remaining_timeout_ms(alignment_deadline),
+            });
+        }
+        if let Some(ref model_progress) = model_progress {
+            wait_for_model_progress_until(
+                model_progress,
+                stream_session_id,
+                decision_sample,
+                alignment_deadline,
+            );
+            // Wait for pending Nemotron tokens to arrive.
+            loop {
+                let token_caught_up = model_progress
+                    .last_token_end_sample(stream_session_id)
+                    .map(|token_end| token_end >= effective_decision_sample)
+                    .unwrap_or(true);
+                if token_caught_up || Instant::now() >= alignment_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            apply_trailing_token_extension(
+                model_progress,
+                stream_session_id,
+                decision_sample,
+                &mut effective_end_sample,
+                &mut effective_decision_sample,
+            );
+        }
+        session.close_turn(
+            turn_id,
+            "smart_turn",
+            false,
+            detector,
+            confidence,
+            effective_end_sample,
+            effective_decision_sample,
+            "smart_turn_complete_direct",
+            writer,
+        )?;
+        Ok(vec![DetectorAction::ResetEouState {
+            stream_id: stream_id.to_owned(),
+            stream_session_id: stream_session_id.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            mode: EouResetMode::Decoder,
+            anchor_sample: effective_decision_sample,
+            source: "smart_turn",
+            reason: "smart_turn_complete_direct",
+            decision_sample: effective_decision_sample,
+        }])
     }
 
     fn session_mut(

@@ -110,7 +110,7 @@ struct Args {
     /// Disabled by default so VAD closure uses the hangover-derived speech_end timeout.
     #[arg(
         long,
-        default_value_t = u32::MAX,
+        default_value_t = 3500,
         env = "SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS"
     )]
     vad_acoustic_fallback_silence_ms: u32,
