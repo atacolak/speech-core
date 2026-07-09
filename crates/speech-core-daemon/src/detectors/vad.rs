@@ -16,7 +16,6 @@ const SAMPLE_RATE: u32 = 16_000;
 // the model's native size.
 const FRAME_SAMPLES: usize = 512;
 const FRAME_MS: u32 = (FRAME_SAMPLES as u32 * 1_000) / SAMPLE_RATE;
-const VAD_METER_EVERY_FRAMES: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct SileroVadConfig {
@@ -576,35 +575,6 @@ impl VadSession {
         if self.config.emit_frames {
             writer.write(&VadFrameEvent {
                 event: "vad_frame",
-                stream_id: self.hello.stream_id.clone(),
-                stream_session_id: self.hello.stream_session_id.clone(),
-                adapter_id: self.hello.adapter_id.clone(),
-                detector: DETECTOR,
-                frame_index: self.frames_processed.saturating_sub(1),
-                sample_start: frame_start_sample,
-                sample_count: FRAME_SAMPLES as u32,
-                sample_time_ms: samples_to_ms(frame_start_sample),
-                probability,
-                smoothed_probability,
-                threshold: self.config.threshold,
-                stop_threshold,
-                fallback_threshold: self.config.fallback_threshold,
-                raw_is_speech,
-                smoothed_in_speech: self.in_speech,
-                ingress_receive_mono_ns,
-                detector_start_mono_ns: model_start_mono_ns,
-                detector_end_mono_ns: model_end_mono_ns,
-                detector_duration_ms: ns_to_ms(
-                    model_end_mono_ns.saturating_sub(model_start_mono_ns),
-                ),
-            })?;
-        } else if self
-            .frames_processed
-            .saturating_sub(1)
-            .is_multiple_of(VAD_METER_EVERY_FRAMES)
-        {
-            writer.write(&VadFrameEvent {
-                event: "vad_meter",
                 stream_id: self.hello.stream_id.clone(),
                 stream_session_id: self.hello.stream_session_id.clone(),
                 adapter_id: self.hello.adapter_id.clone(),

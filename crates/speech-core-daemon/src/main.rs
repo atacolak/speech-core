@@ -765,11 +765,7 @@ async fn handle_connection(
                                     .await?;
                             }
 
-                            debug!(stream_id = %outcome.event.stream_id, session_id = %outcome.event.stream_session_id, seq = outcome.event.seq, "frame ingested");
-                            let event = ServerEvent::AudioFrameIngested(outcome.event);
-                            state.logger.write(&event).await?;
-                            sink.send(Message::Text(serde_json::to_string(&event)?))
-                                .await?;
+                            let _ = outcome.event;
                         }
                         Err(err) => {
                             warn!(peer = %peer, error = ?err, "invalid audio frame metadata");
@@ -1031,6 +1027,8 @@ mod tests {
         ClockComparability, ClockDomain, PcmFormat, SourceKind, SourceSampleGap, TimestampQuality,
     };
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
     fn provenance() -> TimestampProvenance {
         TimestampProvenance::uncalibrated(
@@ -1123,6 +1121,83 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.event.sequence_gap, None);
         assert!(outcome.seq_gap.is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_ingests_audio_without_frame_ack_by_default() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(DaemonState::new(logger(&dir).await, None, None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer, server_state).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}");
+        let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
+        let control = ControlMessage::Hello {
+            adapter_id: "test.adapter".into(),
+            stream_id: "test.stream".into(),
+            stream_session_id: "session-a".into(),
+            source_kind: SourceKind::Synthetic,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            format: PcmFormat::PcmS16Le,
+            timestamp_provenance: provenance(),
+            adapter_hello_send_mono_ns: 1,
+        };
+        ws.send(ClientMessage::Text(
+            serde_json::to_string(&control).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        for expected in ["stream_start", "hello_ack"] {
+            let msg = ws.next().await.unwrap().unwrap();
+            let ClientMessage::Text(text) = msg else {
+                panic!("expected {expected} text event, got {msg:?}");
+            };
+            let event: ServerEvent = serde_json::from_str(&text).unwrap();
+            assert_eq!(event_type(&event), expected);
+        }
+
+        ws.send(ClientMessage::Binary(
+            frame("session-a", 0, 0).encode().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let next_message =
+            tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await;
+        assert!(
+            next_message.is_err(),
+            "audio frame ingest should be silent by default, got {next_message:?}"
+        );
+
+        ws.close(None).await.unwrap();
+        server.await.unwrap();
+
+        let jsonl = tokio::fs::read_to_string(dir.path().join("events.jsonl"))
+            .await
+            .unwrap();
+        assert!(
+            !jsonl.contains("audio_frame_ingested"),
+            "default jsonl log should not contain per-frame ingest events: {jsonl}"
+        );
+    }
+
+    fn event_type(event: &ServerEvent) -> &'static str {
+        match event {
+            ServerEvent::StreamStart(_) => "stream_start",
+            ServerEvent::HelloAck(_) => "hello_ack",
+            ServerEvent::AudioFrameIngested(_) => "audio_frame_ingested",
+            ServerEvent::AudioGap(_) => "audio_gap",
+            ServerEvent::AudioSampleGap(_) => "audio_sample_gap",
+            ServerEvent::AudioDrop { .. } => "audio_drop",
+            ServerEvent::Error { .. } => "error",
+        }
     }
 
     #[tokio::test]
