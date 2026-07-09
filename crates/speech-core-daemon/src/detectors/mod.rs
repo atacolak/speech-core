@@ -1008,6 +1008,7 @@ pub(crate) fn decode_frame_to_f32(frame: &AudioFrame) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelProgressMap;
     use anyhow::Result;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -1335,11 +1336,14 @@ mod tests {
 
     #[test]
     fn semantic_complete_closes_with_smart_turn_source() {
+        let progress = ModelProgressMap::new();
+        progress.record_token("test.session", 3_200);
         with_worker(
             TurnManagerConfig {
                 vad_close_enabled: true,
                 semantic_gate_enabled: true,
                 semantic_gate_close_enabled: true,
+                model_progress: Some(progress),
                 ..Default::default()
             },
             |worker, runtime, actions, _signal_batches| {

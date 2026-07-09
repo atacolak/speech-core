@@ -234,6 +234,30 @@ impl TurnManager {
                                 && decision.available
                                 && decision.complete =>
                         {
+                            // Don't close on smart-turn-complete if no transcript tokens
+                            // exist. Smart turn can produce high confidence on
+                            // non-speech audio (noise, breaths, hums).
+                            let has_any_tokens = model_progress
+                                .as_ref()
+                                .and_then(|mp| mp.last_token_end_sample(&stream_session_id))
+                                .is_some();
+                            if !has_any_tokens {
+                                writer.write(&TurnEouSuppressedEvent {
+                                    event: "turn_eou_suppressed",
+                                    stream_id: stream_id.clone(),
+                                    stream_session_id: stream_session_id.clone(),
+                                    adapter_id: adapter_id.clone(),
+                                    source: "semantic",
+                                    detector: decision.detector,
+                                    reason: "semantic_complete_no_tokens",
+                                    end_sample,
+                                    decision_sample,
+                                    observed_speech_samples,
+                                    min_required_samples: min_vad_speech_samples,
+                                    daemon_mono_ns: now_mono_ns(),
+                                })?;
+                                return Ok(Vec::new());
+                            }
                             close_source = "smart_turn";
                             close_detector = decision.detector;
                             close_confidence = decision.probability;
@@ -1645,10 +1669,13 @@ mod tests {
 
     #[test]
     fn smart_turn_complete_closes_non_degraded_turn() {
+        let progress = ModelProgressMap::new();
+        progress.record_token(SESSION_ID, 3_200);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
             semantic_gate_close_enabled: true,
+            model_progress: Some(progress),
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
