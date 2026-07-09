@@ -165,6 +165,15 @@ impl TurnManager {
                 let model_drain = self.config.model_drain.clone();
                 let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                // If semantic gate already closed a turn at or past this VAD
+                // boundary, don't resurrect a dead turn from the old segment.
+                if session.open_turn.is_none()
+                    && session
+                        .last_closed_decision_sample
+                        .is_some_and(|closed| closed >= decision_sample)
+                {
+                    return Ok(Vec::new());
+                }
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "vad", writer)?;
                 }
@@ -1809,23 +1818,23 @@ mod tests {
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
-        harness.send(semantic_decision(16_000, 17_920, true, true, false));
         harness.drain_events();
 
-        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        // SemanticTurnDecision with complete=true now closes directly.
+        let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
         let events = harness.drain_events();
 
         assert_reset_action(
             &actions,
             "smart_turn",
-            "smart_turn_complete_after_vad_speech_end",
+            "smart_turn_complete_direct",
             17_920,
         );
         assert_turn_closed(
             &events,
             "smart_turn",
             false,
-            "smart_turn_complete_after_vad_speech_end",
+            "smart_turn_complete_direct",
         );
     }
 

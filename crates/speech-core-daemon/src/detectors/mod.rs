@@ -1391,9 +1391,8 @@ mod tests {
                     action,
                     DetectorAction::ResetEouState {
                         source: "smart_turn",
-                        reason: "smart_turn_complete_after_vad_speech_end",
+                        reason: "smart_turn_complete_direct",
                         mode: EouResetMode::Decoder,
-                        anchor_sample: 17_920,
                         ..
                     }
                 )));
