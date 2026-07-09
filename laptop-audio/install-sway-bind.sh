@@ -24,4 +24,4 @@ if [[ -z "${SWAYSOCK:-}" || ! -S "${SWAYSOCK:-}" ]]; then
   exit 1
 fi
 
-swaymsg -s "$SWAYSOCK" 'bindsym --no-repeat Mod4+F9 exec --no-startup-id /home/sf/.local/bin/speech-core-aec-toggle'
+swaymsg -s "$SWAYSOCK" 'bindsym --no-repeat Mod4+F9 exec --no-startup-id ${SPEECH_CORE_INSTALL_BIN_DIR:-$HOME/.local/bin}/speech-core-aec-toggle'

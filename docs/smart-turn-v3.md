@@ -9,7 +9,7 @@ plainly: silero still finds acoustic silence quickly. smart turn then looks at t
 current default path used by the sfub scripts:
 
 ```text
-/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 ```
 
 source:
@@ -71,7 +71,7 @@ when semantic gate close is enabled:
 ## config
 
 ```bash
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
 SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
 SPEECH_CORE_SMART_TURN_CPU_COUNT=1
@@ -124,6 +124,6 @@ cargo test --workspace
 real onnx smoke:
 
 ```bash
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
   cargo test -p speech-core-daemon real_model_smoke_when_env_set -- --nocapture
 ```

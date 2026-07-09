@@ -46,7 +46,7 @@ SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
 SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=1700
 SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
 SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
 SPEECH_CORE_SMART_TURN_CPU_COUNT=1
@@ -128,7 +128,7 @@ this is less magical and less chatty. good.
 - smart turn v3 needs live laptop validation across actual conversational pauses.
 - smart turn preprocessing is implemented directly in rust; parity against python is smoke-tested through the real model, not numerically golden-tested against transformers.
 - cross-host capture latency is preserved but not calibrated.
-- docs under `/home/sf/workspace/docs/speech-core` contain older planning/spec history; useful archaeology, not current runtime source of truth.
+- docs under `~/workspace/docs/speech-core` contain older planning/spec history; useful archaeology, not current runtime source of truth.
 
 ## useful commands
 
@@ -153,7 +153,7 @@ repo:
 
 ```bash
 cargo test --workspace
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
   cargo test -p speech-core-daemon real_model_smoke_when_env_set -- --nocapture
 ./scripts/install-sfub-daemon.sh
 ./scripts/sfnix-sync-build-adapter.sh

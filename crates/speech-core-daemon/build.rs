@@ -3,7 +3,10 @@ use std::path::PathBuf;
 fn main() {
     let external = std::env::var("TRANSCRIBE_CPP_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/sf/workspace/external/transcribe.cpp"));
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
+            PathBuf::from(home).join("workspace/external/transcribe.cpp")
+        });
     let include_dir = external.join("include");
     let build_dir = external.join("build");
 

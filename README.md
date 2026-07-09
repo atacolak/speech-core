@@ -114,7 +114,7 @@ JSON control messages are sent as WebSocket text messages. `hello` is required f
 
 ## Run on sfUB with synthetic adapter
 
-From `/home/sf/workspace/speech-core`:
+From the repo root:
 
 ```bash
 cargo run -p speech-core-daemon -- --bind 127.0.0.1:8765 --log-dir ./logs
@@ -157,7 +157,7 @@ The daemon can opt into the external transcribe.cpp backend with `--model-path`.
 cargo run -p speech-core-daemon -- \
   --bind 127.0.0.1:8765 \
   --log-dir ./logs \
-  --model-path /home/sf/workspace/external/transcribe.cpp/models/nemotron-speech-streaming-en-0.6b-Q4_K_M.gguf \
+  --model-path ~/workspace/external/transcribe.cpp/models/nemotron-speech-streaming-en-0.6b-Q4_K_M.gguf \
   --stream-chunk-ms 160 \
   --att-context-right 1
 ```
@@ -270,7 +270,7 @@ this is not an end-of-utterance. it is a side-channel signal. later, speech-out 
 Parakeet realtime EOU is retired for now. live laptop tests showed many raw `<EOU>` tokens on silence/background state, and model EOU often arrived late relative to silero speech_end. the code remains in-tree for experiments, but it is not part of the default runtime. to re-enable it intentionally:
 
 ```bash
-SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
+SPEECH_CORE_EOU_MODEL_DIR=~/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true \
 ./scripts/install-sfub-daemon.sh
 ```
@@ -301,7 +301,7 @@ cargo run -p speech-core-file-adapter -- \
   --realtime \
   --append-silence-ms 3000 \
   --hold-open-ms 2500 \
-  /home/sf/workspace/external/transcribe.cpp/samples/jfk.wav
+  ~/workspace/external/transcribe.cpp/samples/jfk.wav
 ```
 
 `--hold-open-ms` keeps the websocket open after replayed samples finish, which prevents session-end silence flushing from being mistaken for normal live-mic behavior during latency probes.
@@ -311,7 +311,7 @@ cargo run -p speech-core-file-adapter -- \
 Install the sfUB daemon as a user systemd service:
 
 ```bash
-cd /home/sf/workspace/speech-core
+cd speech-core
 ./scripts/install-sfub-daemon.sh
 ```
 
@@ -369,7 +369,7 @@ systemctl --user status speech-core-mic-adapter.service
 Start the daemon on sfUB with the Nemotron model:
 
 ```bash
-cd /home/sf/workspace/speech-core
+cd speech-core
 ./scripts/sfub-start-nemotron-daemon.sh
 ```
 

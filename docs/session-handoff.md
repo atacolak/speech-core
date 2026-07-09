@@ -5,7 +5,7 @@ use this file when starting a fresh assistant session.
 ## current repo
 
 ```text
-/home/sf/workspace/speech-core
+~/workspace/speech-core
 ```
 
 this repo is git-tracked. current runtime source of truth is this repo, especially:
@@ -21,7 +21,7 @@ docs/seams.md
 older planning docs live at:
 
 ```text
-/home/sf/workspace/docs/speech-core
+~/workspace/docs/speech-core
 ```
 
 they contain useful history, but some sections are stale because implementation moved to rust and parakeet realtime eou was retired.
@@ -37,7 +37,7 @@ parakeet realtime eou is disabled by default.
 smart turn v3 is direct rust onnx, no python sidecar. default artifact:
 
 ```text
-/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 ```
 
 ## recent decisions to know
@@ -84,7 +84,7 @@ PY
 ```bash
 cargo check -p speech-core-daemon
 cargo test --workspace
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
   cargo test -p speech-core-daemon real_model_smoke_when_env_set -- --nocapture
 ```
 

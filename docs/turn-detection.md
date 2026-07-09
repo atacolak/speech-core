@@ -39,7 +39,7 @@ meaning:
 ## smart-turn config
 
 ```text
-SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
+SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
 SPEECH_CORE_SMART_TURN_TIMEOUT_MS=250
 SPEECH_CORE_SMART_TURN_CPU_COUNT=1
