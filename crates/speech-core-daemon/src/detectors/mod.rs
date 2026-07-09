@@ -348,9 +348,13 @@ impl DetectorWorker {
                         frame_end_sample,
                         &mut writer,
                     )?;
+                    let actions = self.turn_manager.poll_deferred(&mut writer)?;
+                    self.dispatch_actions(actions, &mut writer)?;
                     Ok(())
                 }
                 DetectorCommand::TranscriptTokenCommitted { token } => {
+                    let actions = self.turn_manager.poll_deferred(&mut writer)?;
+                    self.dispatch_actions(actions, &mut writer)?;
                     let signals = vec![DetectorSignal::TranscriptTokenCommitted {
                         detector: "nemotron_transcript",
                         stream_id: token.stream_id,
@@ -592,6 +596,31 @@ impl DetectorWorker {
         Ok(())
     }
 
+    fn dispatch_actions(
+        &mut self,
+        actions: Vec<DetectorAction>,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        for action in actions {
+            let DetectorAction::ResetEouState {
+                stream_session_id,
+                reason,
+                ..
+            } = &action;
+            if *reason != "vad_speech_start" {
+                self.semantic_rechecks
+                    .retain(|state| state.stream_session_id != *stream_session_id);
+            }
+            if let Some(smart_turn) = &mut self.smart_turn {
+                smart_turn.handle_action(&action, writer)?;
+            }
+            for detector in &mut self.detectors {
+                detector.handle_action(&action, writer)?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_signals(
         &mut self,
         signals: Vec<DetectorSignal>,
@@ -708,23 +737,7 @@ impl DetectorWorker {
                 }
             }
             let actions = self.turn_manager.handle_signal(signal, writer)?;
-            for action in actions {
-                let DetectorAction::ResetEouState {
-                    stream_session_id,
-                    reason,
-                    ..
-                } = &action;
-                if *reason != "vad_speech_start" {
-                    self.semantic_rechecks
-                        .retain(|state| state.stream_session_id != *stream_session_id);
-                }
-                if let Some(smart_turn) = &mut self.smart_turn {
-                    smart_turn.handle_action(&action, writer)?;
-                }
-                for detector in &mut self.detectors {
-                    detector.handle_action(&action, writer)?;
-                }
-            }
+            self.dispatch_actions(actions, writer)?;
         }
         Ok(())
     }

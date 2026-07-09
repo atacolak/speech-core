@@ -20,9 +20,9 @@ pub struct TurnManagerConfig {
     pub min_model_eou_speech_ms: u32,
     /// Ignore repeated EOU tokens this close to the previous close.
     pub model_eou_refractory_ms: u32,
-    /// Shared model progress tracker so we can wait for model catch-up before closing a VAD turn.
+    /// Shared model progress tracker so VAD fallback closes can defer until model catch-up.
     pub model_progress: Option<ModelProgressMap>,
-    /// Max wait for the model to catch up before emitting a degraded VAD turn closure.
+    /// Max deferral for the model to catch up before emitting a degraded VAD turn closure.
     pub model_alignment_timeout_ms: u32,
     /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
     pub human_hold_silence_ms: u32,
@@ -65,6 +65,13 @@ impl TurnManager {
         }
     }
 
+    pub fn poll_deferred(
+        &mut self,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<Vec<DetectorAction>> {
+        self.process_deferred_closes(writer)
+    }
+
     pub fn start_session(
         &mut self,
         hello: &HelloState,
@@ -97,7 +104,8 @@ impl TurnManager {
         signal: DetectorSignal,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorAction>> {
-        match signal {
+        let mut actions = self.process_deferred_closes(writer)?;
+        let signal_actions_result: Result<Vec<DetectorAction>> = match signal {
             DetectorSignal::VadSegmentStart {
                 detector,
                 stream_id,
@@ -222,6 +230,7 @@ impl TurnManager {
                 let mut close_confidence = confidence;
                 let mut close_degraded = true;
                 let mut close_reason = "vad_speech_end";
+                let mut model_alignment_required = true;
                 if semantic_gate_blocks_vad {
                     match session.last_semantic_decision.as_ref() {
                         Some(decision)
@@ -235,6 +244,7 @@ impl TurnManager {
                             close_confidence = decision.probability;
                             close_degraded = false;
                             close_reason = "smart_turn_complete_after_vad_speech_end";
+                            model_alignment_required = false;
                         }
                         Some(decision)
                             if decision.end_sample == end_sample
@@ -312,60 +322,27 @@ impl TurnManager {
                     }
                 }
                 if vad_close_enabled {
-                    // Wait for ASR to catch up to the VAD decision sample, not just the
-                    // acoustic end sample. With a 96ms VAD hangover, the acoustic end can
-                    // land before a trailing short word has been committed by Nemotron.
-                    // If a committed token extends slightly past the VAD end while we are
-                    // waiting, include that token in this same turn and make queued token
-                    // signals late-for-closed-turn instead of starting a split transcript turn.
-                    let mut effective_end_sample = end_sample;
-                    let mut effective_decision_sample = decision_sample;
-                    if let Some(ref model_progress) = model_progress {
-                        let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
-                        let deadline = Instant::now() + timeout;
-                        loop {
-                            let committed = model_progress.get(&stream_session_id).unwrap_or(0);
-                            if committed >= decision_sample {
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        if let Some(token_end) =
-                            model_progress.last_token_end_sample(&stream_session_id)
-                        {
-                            let max_tail_sample =
-                                decision_sample.saturating_add(ms_to_samples(320));
-                            if token_end > effective_end_sample && token_end <= max_tail_sample {
-                                effective_end_sample = token_end;
-                                effective_decision_sample =
-                                    effective_decision_sample.max(token_end);
-                            }
-                        }
-                    }
-                    session.close_turn(
+                    let close = PendingTurnClose::new(
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
                         turn_id,
                         close_source,
                         close_degraded,
                         close_detector,
                         close_confidence,
-                        effective_end_sample,
-                        effective_decision_sample,
+                        end_sample,
+                        decision_sample,
                         close_reason,
-                        writer,
-                    )?;
-                    actions.push(DetectorAction::ResetEouState {
-                        stream_id,
-                        stream_session_id,
-                        adapter_id,
-                        mode: EouResetMode::Decoder,
-                        anchor_sample: effective_decision_sample,
-                        source: close_source,
-                        reason: close_reason,
-                        decision_sample: effective_decision_sample,
-                    });
+                        model_alignment_required.then_some(decision_sample),
+                        model_alignment_timeout_ms,
+                    );
+                    if close.is_deferred(&model_progress) {
+                        session.pending_close = Some(close);
+                        return Ok(actions);
+                    }
+                    let action = close.emit(session, model_progress.as_ref(), writer)?;
+                    actions.push(action);
                 }
                 Ok(actions)
             }
@@ -517,18 +494,10 @@ impl TurnManager {
                     vad_decision_to_model_eou_ms: None,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
-                if let Some(ref model_progress) = model_progress {
-                    let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
-                    let deadline = Instant::now() + timeout;
-                    loop {
-                        let committed = model_progress.get(&stream_session_id).unwrap_or(0);
-                        if committed >= end_sample || Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
-                session.close_turn(
+                let close = PendingTurnClose::new(
+                    stream_id,
+                    stream_session_id,
+                    adapter_id,
                     turn_id,
                     "transcript_silence",
                     true,
@@ -537,18 +506,18 @@ impl TurnManager {
                     end_sample,
                     decision_sample,
                     "transcript_backed_turn_low_vad_silence",
+                    Some(end_sample),
+                    model_alignment_timeout_ms,
+                );
+                if close.is_deferred(&model_progress) {
+                    session.pending_close = Some(close);
+                    return Ok(Vec::new());
+                }
+                Ok(vec![close.emit(
+                    session,
+                    model_progress.as_ref(),
                     writer,
-                )?;
-                Ok(vec![DetectorAction::ResetEouState {
-                    stream_id,
-                    stream_session_id,
-                    adapter_id,
-                    mode: EouResetMode::Decoder,
-                    anchor_sample: decision_sample,
-                    source: "transcript_silence",
-                    reason: "transcript_backed_turn_low_vad_silence",
-                    decision_sample,
-                }])
+                )?])
             }
             DetectorSignal::ModelEou {
                 detector,
@@ -776,21 +745,10 @@ impl TurnManager {
                     daemon_mono_ns: now_mono_ns(),
                 })?;
                 if vad_close_enabled {
-                    if let Some(ref model_progress) = model_progress {
-                        let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
-                        let deadline = Instant::now() + timeout;
-                        loop {
-                            let committed = model_progress.get(&stream_session_id).unwrap_or(0);
-                            if committed >= end_sample {
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                    session.close_turn(
+                    let close = PendingTurnClose::new(
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
                         turn_id,
                         "vad_acoustic_fallback",
                         true,
@@ -799,23 +757,26 @@ impl TurnManager {
                         end_sample,
                         decision_sample,
                         "vad_acoustic_fallback_low_probability_silence",
+                        Some(end_sample),
+                        model_alignment_timeout_ms,
+                    );
+                    if close.is_deferred(&model_progress) {
+                        session.pending_close = Some(close);
+                        return Ok(Vec::new());
+                    }
+                    Ok(vec![close.emit(
+                        session,
+                        model_progress.as_ref(),
                         writer,
-                    )?;
-                    Ok(vec![DetectorAction::ResetEouState {
-                        stream_id,
-                        stream_session_id,
-                        adapter_id,
-                        mode: EouResetMode::Decoder,
-                        anchor_sample: decision_sample,
-                        source: "vad_acoustic_fallback",
-                        reason: "vad_acoustic_fallback_low_probability_silence",
-                        decision_sample,
-                    }])
+                    )?])
                 } else {
                     Ok(Vec::new())
                 }
             }
-        }
+        };
+        let mut signal_actions = signal_actions_result?;
+        actions.append(&mut signal_actions);
+        Ok(actions)
     }
 
     pub fn end_session(
@@ -824,6 +785,7 @@ impl TurnManager {
         reason: &str,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
+        let _ = self.process_deferred_closes(writer)?;
         if let Some(mut session) = self.sessions.remove(stream_session_id) {
             if let Some(turn) = session.open_turn.take() {
                 let end_sample = session.last_vad_end_sample.unwrap_or(turn.start_sample);
@@ -861,6 +823,26 @@ impl TurnManager {
         Ok(())
     }
 
+    fn process_deferred_closes(
+        &mut self,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<Vec<DetectorAction>> {
+        let model_progress = self.config.model_progress.clone();
+        let mut actions = Vec::new();
+        for session in self.sessions.values_mut() {
+            let should_emit = session
+                .pending_close
+                .as_ref()
+                .is_some_and(|close| !close.is_deferred(&model_progress));
+            if should_emit {
+                if let Some(close) = session.pending_close.take() {
+                    actions.push(close.emit(session, model_progress.as_ref(), writer)?);
+                }
+            }
+        }
+        Ok(actions)
+    }
+
     fn session_mut(
         &mut self,
         stream_id: &str,
@@ -891,6 +873,7 @@ impl TurnManager {
 struct TurnSession {
     hello: HelloState,
     open_turn: Option<OpenTurn>,
+    pending_close: Option<PendingTurnClose>,
     next_turn_index: u64,
     turns_started: u64,
     turns_closed: u64,
@@ -910,6 +893,7 @@ impl TurnSession {
         Self {
             hello,
             open_turn: None,
+            pending_close: None,
             next_turn_index: 0,
             turns_started: 0,
             turns_closed: 0,
@@ -941,6 +925,7 @@ impl TurnSession {
         let turn_id = self.next_turn_id();
         self.next_turn_index = self.next_turn_index.saturating_add(1);
         self.turns_started = self.turns_started.saturating_add(1);
+        self.pending_close = None;
         self.open_turn = Some(OpenTurn {
             turn_id: turn_id.clone(),
             start_sample,
@@ -971,6 +956,7 @@ impl TurnSession {
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
         self.open_turn.take();
+        self.pending_close = None;
         self.close_specific_turn(
             turn_id,
             source,
@@ -1037,6 +1023,117 @@ impl TurnSession {
 struct OpenTurn {
     turn_id: String,
     start_sample: u64,
+}
+
+struct PendingTurnClose {
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    turn_id: String,
+    source: &'static str,
+    degraded: bool,
+    detector: &'static str,
+    confidence: Option<f32>,
+    end_sample: u64,
+    decision_sample: u64,
+    reason: &'static str,
+    model_alignment_sample: Option<u64>,
+    model_alignment_deadline: Instant,
+}
+
+impl PendingTurnClose {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stream_id: String,
+        stream_session_id: String,
+        adapter_id: String,
+        turn_id: String,
+        source: &'static str,
+        degraded: bool,
+        detector: &'static str,
+        confidence: Option<f32>,
+        end_sample: u64,
+        decision_sample: u64,
+        reason: &'static str,
+        model_alignment_sample: Option<u64>,
+        model_alignment_timeout_ms: u32,
+    ) -> Self {
+        Self {
+            stream_id,
+            stream_session_id,
+            adapter_id,
+            turn_id,
+            source,
+            degraded,
+            detector,
+            confidence,
+            end_sample,
+            decision_sample,
+            reason,
+            model_alignment_sample,
+            model_alignment_deadline: Instant::now()
+                + Duration::from_millis(model_alignment_timeout_ms as u64),
+        }
+    }
+
+    fn is_deferred(&self, model_progress: &Option<ModelProgressMap>) -> bool {
+        let Some(alignment_sample) = self.model_alignment_sample else {
+            return false;
+        };
+        let Some(model_progress) = model_progress else {
+            return false;
+        };
+        let committed = model_progress.get(&self.stream_session_id).unwrap_or(0);
+        committed < alignment_sample && Instant::now() < self.model_alignment_deadline
+    }
+
+    fn effective_samples(&self, model_progress: Option<&ModelProgressMap>) -> (u64, u64) {
+        // When ASR has caught up before timeout, include a trailing token that extends slightly
+        // past the VAD end in this same turn instead of splitting it into a transcript turn.
+        let mut effective_end_sample = self.end_sample;
+        let mut effective_decision_sample = self.decision_sample;
+        if let Some(model_progress) = model_progress {
+            if let Some(token_end) = model_progress.last_token_end_sample(&self.stream_session_id) {
+                let max_tail_sample = self.decision_sample.saturating_add(ms_to_samples(320));
+                if token_end > effective_end_sample && token_end <= max_tail_sample {
+                    effective_end_sample = token_end;
+                    effective_decision_sample = effective_decision_sample.max(token_end);
+                }
+            }
+        }
+        (effective_end_sample, effective_decision_sample)
+    }
+
+    fn emit(
+        self,
+        session: &mut TurnSession,
+        model_progress: Option<&ModelProgressMap>,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<DetectorAction> {
+        let (effective_end_sample, effective_decision_sample) =
+            self.effective_samples(model_progress);
+        session.close_turn(
+            self.turn_id,
+            self.source,
+            self.degraded,
+            self.detector,
+            self.confidence,
+            effective_end_sample,
+            effective_decision_sample,
+            self.reason,
+            writer,
+        )?;
+        Ok(DetectorAction::ResetEouState {
+            stream_id: self.stream_id,
+            stream_session_id: self.stream_session_id,
+            adapter_id: self.adapter_id,
+            mode: EouResetMode::Decoder,
+            anchor_sample: effective_decision_sample,
+            source: self.source,
+            reason: self.reason,
+            decision_sample: effective_decision_sample,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1623,39 +1720,43 @@ mod tests {
     }
 
     #[test]
-    fn vad_close_with_model_alignment_timeout_returns_without_hanging() {
-        // Today VAD close waits synchronously for ASR model progress to reach the VAD decision
-        // sample. This characterization keeps the current blocking wait bounded. A future
-        // deferred-close implementation should replace this with an immediate non-blocking action.
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let progress = ModelProgressMap::new();
-            progress.update(SESSION_ID, 17_919);
-            let mut harness = TurnHarness::new(TurnManagerConfig {
-                vad_close_enabled: true,
-                model_progress: Some(progress),
-                model_alignment_timeout_ms: 100,
-                ..Default::default()
-            });
-            harness.send(vad_start(0, 3_200));
-            harness.drain_events();
-
-            let started = Instant::now();
-            let actions = harness.send(vad_end(0, 16_000, 17_920));
-            let elapsed = started.elapsed();
-            let events = harness.drain_events();
-            done_tx
-                .send((elapsed, actions, events))
-                .expect("test result receiver should still exist");
+    fn vad_close_with_model_alignment_timeout_defers_without_blocking() {
+        let progress = ModelProgressMap::new();
+        progress.update(SESSION_ID, 17_919);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress),
+            model_alignment_timeout_ms: 50,
+            ..Default::default()
         });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
 
-        let (elapsed, actions, events) = done_rx.recv_timeout(Duration::from_millis(750)).expect(
-            "VAD close should not hang indefinitely while model progress is behind decision_sample",
+        let started = Instant::now();
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let elapsed = started.elapsed();
+        let events = harness.drain_events();
+
+        assert!(
+            elapsed < Duration::from_millis(25),
+            "lagging model alignment should defer without blocking the detector thread; elapsed={elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_millis(500),
-            "blocking model-alignment wait should be bounded by model_alignment_timeout_ms; elapsed={elapsed:?}"
+            actions.is_empty(),
+            "lagging model alignment should not dispatch a reset until catch-up or timeout; got actions: {actions:#?}"
         );
+        assert_no_event(&events, "turn_closed");
+
+        std::thread::park_timeout(Duration::from_millis(60));
+        let actions = harness
+            .manager
+            .poll_deferred(&mut DetectorWriter::new(
+                &harness.logger,
+                harness.runtime.handle(),
+            ))
+            .expect("deferred VAD close should poll after timeout");
+        let events = harness.drain_events();
+
         assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
         assert_turn_closed(&events, "vad", true, "vad_speech_end");
     }
