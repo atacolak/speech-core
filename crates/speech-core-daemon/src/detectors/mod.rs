@@ -133,6 +133,7 @@ pub struct TranscriptTokenSignal {
     pub end_sample: u64,
     pub decision_sample: u64,
     pub probability: Option<f32>,
+    pub drain_handle: crate::model::ModelDrainHandle,
 }
 
 #[derive(Debug)]
@@ -366,6 +367,7 @@ impl DetectorWorker {
                         end_sample: token.end_sample,
                         decision_sample: token.decision_sample,
                         confidence: token.probability,
+                        drain_handle: token.drain_handle,
                     }];
                     self.handle_signals(signals, &mut writer)
                 }
@@ -863,6 +865,7 @@ pub enum DetectorSignal {
         end_sample: u64,
         decision_sample: u64,
         confidence: Option<f32>,
+        drain_handle: crate::model::ModelDrainHandle,
     },
     VadLowSilence {
         detector: &'static str,

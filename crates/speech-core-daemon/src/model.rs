@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -25,6 +26,94 @@ pub struct ModelProgressState {
 #[derive(Debug, Clone, Default)]
 pub struct ModelProgressMap {
     inner: Arc<Mutex<HashMap<String, ModelProgressState>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDrainRequest {
+    pub stream_id: String,
+    pub stream_session_id: String,
+    pub adapter_id: String,
+    pub target_sample: u64,
+    pub reason: &'static str,
+    pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelDrainResult {
+    pub session_found: bool,
+    pub chunk_processed: bool,
+    pub drained_until_sample: u64,
+}
+
+#[derive(Clone)]
+pub struct ModelDrainHandle {
+    inner: ModelDrainHandleInner,
+}
+
+impl std::fmt::Debug for ModelDrainHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelDrainHandle").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+enum ModelDrainHandleInner {
+    Worker(mpsc::Sender<ModelCommand>),
+    #[cfg(test)]
+    Pending,
+    #[cfg(test)]
+    Callback(Arc<dyn Fn(ModelDrainRequest) -> Result<ModelDrainResult> + Send + Sync>),
+}
+
+impl ModelDrainHandle {
+    fn new(sender: mpsc::Sender<ModelCommand>) -> Self {
+        Self {
+            inner: ModelDrainHandleInner::Worker(sender),
+        }
+    }
+
+    pub fn drain_session(&self, request: ModelDrainRequest) -> Result<ModelDrainResult> {
+        match &self.inner {
+            ModelDrainHandleInner::Worker(sender) => {
+                let timeout = Duration::from_millis(request.timeout_ms as u64);
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                sender
+                    .try_send(ModelCommand::DrainSession {
+                        request,
+                        reply: reply_tx,
+                    })
+                    .map_err(|err| {
+                        anyhow::anyhow!("model worker queue rejected drain request: {err}")
+                    })?;
+                reply_rx
+                    .recv_timeout(timeout)
+                    .map_err(|err| anyhow::anyhow!("model drain timed out or failed: {err}"))?
+            }
+            #[cfg(test)]
+            ModelDrainHandleInner::Pending => {
+                std::thread::sleep(Duration::from_millis(request.timeout_ms as u64));
+                anyhow::bail!("test model drain timed out")
+            }
+            #[cfg(test)]
+            ModelDrainHandleInner::Callback(callback) => callback(request),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn callback_for_test(
+        callback: impl Fn(ModelDrainRequest) -> Result<ModelDrainResult> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: ModelDrainHandleInner::Callback(Arc::new(callback)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test() -> Self {
+        Self {
+            inner: ModelDrainHandleInner::Pending,
+        }
+    }
 }
 
 impl ModelProgressMap {
@@ -92,16 +181,26 @@ pub struct ModelIngress {
 impl ModelIngress {
     pub fn start(config: ModelConfig, logger: JsonlLogger) -> Self {
         let (sender, mut receiver) = mpsc::channel(config.queue_frames.max(1));
+        let worker_sender = sender.clone();
         let runtime = tokio::runtime::Handle::current();
         thread::spawn(move || {
             info!(model_path = %config.model_path.display(), stream_chunk_ms = config.stream_chunk_ms, att_context_right = config.att_context_right, "starting nemotron model worker");
-            let mut worker = ModelWorker::new(config, logger, runtime);
+            let mut worker = ModelWorker::new(
+                config,
+                logger,
+                runtime,
+                ModelDrainHandle::new(worker_sender),
+            );
             while let Some(command) = receiver.blocking_recv() {
                 worker.handle(command);
             }
             worker.finalize_all("model worker channel closed");
         });
         Self { sender }
+    }
+
+    pub fn drain_handle(&self) -> ModelDrainHandle {
+        ModelDrainHandle::new(self.sender.clone())
     }
 
     pub async fn start_session(&self, hello: &HelloState, logger: &JsonlLogger) -> Result<()> {
@@ -150,6 +249,14 @@ impl ModelIngress {
         }
     }
 
+    pub fn set_transcript_sink(&self, sink: Option<DetectorIngress>) -> Result<()> {
+        self.sender
+            .try_send(ModelCommand::SetTranscriptSink { sink })
+            .map_err(|err| {
+                anyhow::anyhow!("model worker queue rejected transcript sink update: {err}")
+            })
+    }
+
     pub async fn end_session(
         &self,
         hello: &HelloState,
@@ -193,7 +300,6 @@ async fn log_model_enqueue_error(
         .await
 }
 
-#[derive(Debug)]
 enum ModelCommand {
     StartSession {
         hello: HelloState,
@@ -207,6 +313,13 @@ enum ModelCommand {
         stream_session_id: String,
         adapter_id: String,
         reason: String,
+    },
+    SetTranscriptSink {
+        sink: Option<DetectorIngress>,
+    },
+    DrainSession {
+        request: ModelDrainRequest,
+        reply: std::sync::mpsc::Sender<Result<ModelDrainResult>>,
     },
 }
 
@@ -233,6 +346,12 @@ impl ModelCommand {
                 stream_session_id.clone(),
                 adapter_id.clone(),
             ),
+            ModelCommand::SetTranscriptSink { .. } => (String::new(), String::new(), String::new()),
+            ModelCommand::DrainSession { request, .. } => (
+                request.stream_id.clone(),
+                request.stream_session_id.clone(),
+                request.adapter_id.clone(),
+            ),
         }
     }
 }
@@ -244,10 +363,16 @@ struct ModelWorker {
     runtime: tokio::runtime::Handle,
     sessions: HashMap<String, ModelSession>,
     model_progress: Option<ModelProgressMap>,
+    drain_handle: ModelDrainHandle,
 }
 
 impl ModelWorker {
-    fn new(config: ModelConfig, logger: JsonlLogger, runtime: tokio::runtime::Handle) -> Self {
+    fn new(
+        config: ModelConfig,
+        logger: JsonlLogger,
+        runtime: tokio::runtime::Handle,
+        drain_handle: ModelDrainHandle,
+    ) -> Self {
         let model_path_c = CString::new(config.model_path.to_string_lossy().as_bytes())
             .expect("model path contains interior NUL");
         let model_progress = config.model_progress.clone();
@@ -258,6 +383,7 @@ impl ModelWorker {
             runtime,
             sessions: HashMap::new(),
             model_progress,
+            drain_handle,
         }
     }
 
@@ -273,6 +399,15 @@ impl ModelWorker {
                 reason,
                 ..
             } => self.end_session(&stream_session_id, &reason),
+            ModelCommand::SetTranscriptSink { sink } => {
+                self.config.transcript_sink = sink;
+                Ok(())
+            }
+            ModelCommand::DrainSession { request, reply } => {
+                let result = self.drain_session(&request);
+                let _ = reply.send(result);
+                Ok(())
+            }
         };
         if let Err(err) = result {
             warn!(error = ?err, "model worker command failed");
@@ -352,7 +487,12 @@ impl ModelWorker {
 
         self.sessions.insert(
             hello.stream_session_id.clone(),
-            ModelSession::new(raw, hello, self.config.stream_chunk_ms),
+            ModelSession::new(
+                raw,
+                hello,
+                self.config.stream_chunk_ms,
+                self.drain_handle.clone(),
+            ),
         );
         Ok(())
     }
@@ -398,6 +538,9 @@ impl ModelWorker {
         if !session.buffer.is_empty() {
             let chunk = std::mem::take(&mut session.buffer);
             let chunk_source_sample_start = session.next_chunk_sample_start;
+            session.next_chunk_sample_start = session
+                .next_chunk_sample_start
+                .saturating_add(chunk.len() as u64);
             self.sessions.insert(stream_session_id.to_owned(), session);
             self.feed_chunk(
                 stream_session_id,
@@ -441,6 +584,48 @@ impl ModelWorker {
                 warn!(stream_session_id = %id, error = ?err, "failed to finalize model session");
             }
         }
+    }
+
+    fn drain_session(&mut self, request: &ModelDrainRequest) -> Result<ModelDrainResult> {
+        let Some(session) = self.sessions.get_mut(&request.stream_session_id) else {
+            return Ok(ModelDrainResult::default());
+        };
+        if session.buffer.is_empty() {
+            let drained_until_sample = self
+                .model_progress
+                .as_ref()
+                .and_then(|progress| progress.get(&request.stream_session_id))
+                .unwrap_or(session.next_chunk_sample_start);
+            return Ok(ModelDrainResult {
+                session_found: true,
+                chunk_processed: false,
+                drained_until_sample,
+            });
+        }
+
+        let chunk = std::mem::take(&mut session.buffer);
+        let chunk_source_sample_start = session.next_chunk_sample_start;
+        let chunk_len = chunk.len() as u64;
+        let drained_until_sample = chunk_source_sample_start.saturating_add(chunk_len);
+        session.next_chunk_sample_start = drained_until_sample;
+        self.feed_chunk(
+            &request.stream_session_id,
+            chunk,
+            chunk_source_sample_start,
+            now_mono_ns(),
+            false,
+        )?;
+        if let Some(ref progress) = self.model_progress {
+            let committed = progress.get(&request.stream_session_id).unwrap_or(0);
+            if committed < drained_until_sample {
+                progress.update(&request.stream_session_id, drained_until_sample);
+            }
+        }
+        Ok(ModelDrainResult {
+            session_found: true,
+            chunk_processed: true,
+            drained_until_sample,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -646,6 +831,7 @@ impl ModelWorker {
                     end_sample,
                     decision_sample: end_sample,
                     probability,
+                    drain_handle: session.drain_handle.clone(),
                 }) {
                     self.write_blocking(&ModelErrorEvent {
                         event: "model_error",
@@ -681,10 +867,16 @@ struct ModelSession {
     chunk_samples: usize,
     next_chunk_sample_start: u64,
     next_committed_token: i32,
+    drain_handle: ModelDrainHandle,
 }
 
 impl ModelSession {
-    fn new(raw: *mut ScTranscribeSession, hello: HelloState, stream_chunk_ms: u32) -> Self {
+    fn new(
+        raw: *mut ScTranscribeSession,
+        hello: HelloState,
+        stream_chunk_ms: u32,
+        drain_handle: ModelDrainHandle,
+    ) -> Self {
         let chunk_samples =
             (u64::from(stream_chunk_ms).saturating_mul(16_000) / 1_000).max(1) as usize;
         Self {
@@ -694,6 +886,7 @@ impl ModelSession {
             chunk_samples,
             next_chunk_sample_start: 0,
             next_committed_token: 0,
+            drain_handle,
         }
     }
 

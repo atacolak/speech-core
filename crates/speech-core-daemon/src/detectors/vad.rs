@@ -31,6 +31,12 @@ pub struct SileroVadConfig {
     pub acoustic_fallback_silence_ms: u32,
 }
 
+impl SileroVadConfig {
+    pub fn speech_end_silence_ms(&self) -> u32 {
+        self.hangover_frames.max(1) as u32 * FRAME_MS
+    }
+}
+
 impl Default for SileroVadConfig {
     fn default() -> Self {
         Self {
@@ -43,7 +49,7 @@ impl Default for SileroVadConfig {
             smoothing_alpha: 0.1,
             stop_threshold: 0.2,
             fallback_threshold: 0.1,
-            acoustic_fallback_silence_ms: 3000,
+            acoustic_fallback_silence_ms: u32::MAX,
         }
     }
 }
@@ -131,6 +137,7 @@ impl AudioDetector for SileroVadDetector {
             onset_frames: self.config.onset_frames as u32,
             hangover_frames: self.config.hangover_frames as u32,
             pre_speech_frames: self.config.pre_speech_frames as u32,
+            speech_end_silence_ms: self.config.speech_end_silence_ms(),
             emit_frames: self.config.emit_frames,
             smoothing_alpha: self.config.smoothing_alpha,
             stop_threshold: self.config.stop_threshold,
@@ -617,6 +624,7 @@ struct VadSessionStartEvent {
     onset_frames: u32,
     hangover_frames: u32,
     pre_speech_frames: u32,
+    speech_end_silence_ms: u32,
     emit_frames: bool,
     smoothing_alpha: f32,
     stop_threshold: f32,
@@ -787,6 +795,21 @@ mod tests {
         assert_eq!(
             SileroVadConfig::default().hangover_frames * FRAME_MS as usize,
             96
+        );
+    }
+
+    #[test]
+    fn vad_close_gap_timeout_uses_configured_hangover_duration() {
+        let config = SileroVadConfig {
+            hangover_frames: 5,
+            acoustic_fallback_silence_ms: 250,
+            ..Default::default()
+        };
+        assert_eq!(config.speech_end_silence_ms(), 160);
+        assert_eq!(
+            SileroVadConfig::default().acoustic_fallback_silence_ms,
+            u32::MAX,
+            "the separate acoustic fallback timer is disabled by default so speech_end hangover is the close-gap source of truth"
         );
     }
 }

@@ -107,9 +107,10 @@ struct Args {
     vad_fallback_threshold: f32,
 
     /// Stable low-probability silence required before acoustic fallback closure.
+    /// Disabled by default so VAD closure uses the hangover-derived speech_end timeout.
     #[arg(
         long,
-        default_value_t = 1700,
+        default_value_t = u32::MAX,
         env = "SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS"
     )]
     vad_acoustic_fallback_silence_ms: u32,
@@ -329,7 +330,7 @@ async fn main() -> Result<()> {
     let logger = JsonlLogger::open(args.log_dir, event_tx.clone()).await?;
     let model_progress: Option<ModelProgressMap> =
         args.model_path.as_ref().map(|_| ModelProgressMap::new());
-    let detector_config = DetectorConfig {
+    let mut detector_config = DetectorConfig {
         queue_frames: args.detector_queue_frames,
         vad: args
             .vad_model_path
@@ -379,6 +380,7 @@ async fn main() -> Result<()> {
             min_model_eou_speech_ms: args.turn_min_model_eou_speech_ms,
             model_eou_refractory_ms: args.turn_model_eou_refractory_ms,
             model_progress: model_progress.clone(),
+            model_drain: None,
             model_alignment_timeout_ms: args.turn_model_alignment_timeout_ms,
             human_hold_silence_ms: args.turn_human_hold_silence_ms,
             transcript_silence_close_ms: args.turn_transcript_silence_close_ms,
@@ -386,9 +388,6 @@ async fn main() -> Result<()> {
             semantic_gate_close_enabled: args.turn_semantic_gate_close_enabled,
         },
     };
-    let detector_ingress = detector_config
-        .enabled()
-        .then(|| DetectorIngress::start(detector_config, logger.clone()));
     let model_ingress = args.model_path.clone().map(|model_path| {
         ModelIngress::start(
             ModelConfig {
@@ -397,11 +396,20 @@ async fn main() -> Result<()> {
                 att_context_right: args.att_context_right,
                 queue_frames: args.model_queue_frames,
                 model_progress: model_progress.clone(),
-                transcript_sink: detector_ingress.clone(),
+                transcript_sink: None,
             },
             logger.clone(),
         )
     });
+    if let Some(model) = &model_ingress {
+        detector_config.turn.model_drain = Some(model.drain_handle());
+    }
+    let detector_ingress = detector_config
+        .enabled()
+        .then(|| DetectorIngress::start(detector_config, logger.clone()));
+    if let Some(model) = &model_ingress {
+        model.set_transcript_sink(detector_ingress.clone())?;
+    }
     let state = Arc::new(DaemonState::new(logger, model_ingress, detector_ingress));
     let listener = TcpListener::bind(args.bind)
         .await
