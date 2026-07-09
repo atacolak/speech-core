@@ -92,6 +92,12 @@ impl DetectorIngress {
         }
     }
 
+    pub fn transcript_token_committed(&self, token: TranscriptTokenSignal) -> Result<()> {
+        self.sender
+            .try_send(DetectorCommand::TranscriptTokenCommitted { token })
+            .map_err(|err| anyhow::anyhow!("detector queue rejected transcript token: {err}"))
+    }
+
     pub async fn end_session(
         &self,
         hello: &HelloState,
@@ -116,6 +122,19 @@ impl DetectorIngress {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscriptTokenSignal {
+    pub stream_id: String,
+    pub stream_session_id: String,
+    pub adapter_id: String,
+    pub token_index: u32,
+    pub text: String,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub decision_sample: u64,
+    pub probability: Option<f32>,
+}
+
 #[derive(Debug)]
 enum DetectorCommand {
     StartSession {
@@ -124,6 +143,9 @@ enum DetectorCommand {
     AudioFrame {
         frame: AudioFrame,
         ingress_receive_mono_ns: u64,
+    },
+    TranscriptTokenCommitted {
+        token: TranscriptTokenSignal,
     },
     EndSession {
         stream_id: String,
@@ -145,6 +167,11 @@ impl DetectorCommand {
                 frame.header.stream_id.clone(),
                 frame.header.stream_session_id.clone(),
                 frame.header.adapter_id.clone(),
+            ),
+            DetectorCommand::TranscriptTokenCommitted { token } => (
+                token.stream_id.clone(),
+                token.stream_session_id.clone(),
+                token.adapter_id.clone(),
             ),
             DetectorCommand::EndSession {
                 stream_id,
@@ -322,6 +349,21 @@ impl DetectorWorker {
                         &mut writer,
                     )?;
                     Ok(())
+                }
+                DetectorCommand::TranscriptTokenCommitted { token } => {
+                    let signals = vec![DetectorSignal::TranscriptTokenCommitted {
+                        detector: "nemotron_transcript",
+                        stream_id: token.stream_id,
+                        stream_session_id: token.stream_session_id,
+                        adapter_id: token.adapter_id,
+                        token_index: token.token_index,
+                        text: token.text,
+                        start_sample: token.start_sample,
+                        end_sample: token.end_sample,
+                        decision_sample: token.decision_sample,
+                        confidence: token.probability,
+                    }];
+                    self.handle_signals(signals, &mut writer)
                 }
                 DetectorCommand::EndSession {
                     stream_session_id,
@@ -562,6 +604,18 @@ impl DetectorWorker {
             {
                 self.cancel_semantic_rechecks_for_resumed_speech(stream_session_id, writer)?;
             }
+            if let DetectorSignal::TranscriptTokenCommitted {
+                stream_session_id,
+                end_sample,
+                ..
+            } = &signal
+            {
+                if self.semantic_rechecks.iter().any(|state| {
+                    state.stream_session_id == *stream_session_id && *end_sample > state.end_sample
+                }) {
+                    self.cancel_semantic_rechecks_for_resumed_speech(stream_session_id, writer)?;
+                }
+            }
             if let DetectorSignal::VadSegmentEnd {
                 stream_id,
                 stream_session_id,
@@ -783,6 +837,28 @@ pub enum DetectorSignal {
         adapter_id: String,
         start_sample: u64,
         decision_sample: u64,
+        confidence: Option<f32>,
+    },
+    TranscriptTokenCommitted {
+        detector: &'static str,
+        stream_id: String,
+        stream_session_id: String,
+        adapter_id: String,
+        token_index: u32,
+        text: String,
+        start_sample: u64,
+        end_sample: u64,
+        decision_sample: u64,
+        confidence: Option<f32>,
+    },
+    VadLowSilence {
+        detector: &'static str,
+        stream_id: String,
+        stream_session_id: String,
+        adapter_id: String,
+        start_sample: u64,
+        decision_sample: u64,
+        silence_samples: u64,
         confidence: Option<f32>,
     },
     ModelEou {

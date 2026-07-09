@@ -75,7 +75,11 @@ watch_trace_tokens="${SPEECH_CORE_WATCH_TRACE_TOKENS:-0}"
 record_audio="${SPEECH_CORE_RECORD_AUDIO:-1}"
 device_arg=()
 if [[ -n "${SPEECH_CORE_DEVICE:-}" ]]; then
-  device_arg=(--device "$SPEECH_CORE_DEVICE")
+  if "$bin_dir/speech-core-mic-adapter" --list-devices 2>/dev/null | grep -Fqi -- "$SPEECH_CORE_DEVICE"; then
+    device_arg=(--device "$SPEECH_CORE_DEVICE")
+  else
+    echo "warning: SPEECH_CORE_DEVICE=$SPEECH_CORE_DEVICE is not visible to CPAL; falling back to default input" >&2
+  fi
 fi
 
 while [[ $# -gt 0 ]]; do

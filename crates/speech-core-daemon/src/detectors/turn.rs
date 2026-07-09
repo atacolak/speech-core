@@ -26,6 +26,8 @@ pub struct TurnManagerConfig {
     pub model_alignment_timeout_ms: u32,
     /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
     pub human_hold_silence_ms: u32,
+    /// Close transcript-backed turns after this much low-VAD silence when VAD never opened acoustically.
+    pub transcript_silence_close_ms: u32,
     /// Require Smart Turn semantic completeness before accepting VAD speech_end.
     pub semantic_gate_enabled: bool,
     /// If true, Smart Turn incomplete decisions suppress VAD closure; if false, decisions are logged only.
@@ -43,6 +45,7 @@ impl Default for TurnManagerConfig {
             model_progress: None,
             model_alignment_timeout_ms: 3000,
             human_hold_silence_ms: 12000,
+            transcript_silence_close_ms: 700,
             semantic_gate_enabled: false,
             semantic_gate_close_enabled: false,
         }
@@ -84,6 +87,7 @@ impl TurnManager {
             semantic_gate_enabled: self.config.semantic_gate_enabled,
             semantic_gate_close_enabled: self.config.semantic_gate_close_enabled,
             human_hold_silence_ms: self.config.human_hold_silence_ms,
+            transcript_silence_close_ms: self.config.transcript_silence_close_ms,
             daemon_mono_ns: now_mono_ns(),
         })
     }
@@ -297,21 +301,37 @@ impl TurnManager {
                     }
                 }
                 if vad_close_enabled {
-                    // Wait for the model to catch up to end_sample before closing.
-                    // This fixes the event-ordering race where turn_closed lands before
-                    // the model's final transcript updates for the same audio.
+                    // Wait for ASR to catch up to the VAD decision sample, not just the
+                    // acoustic end sample. With a 96ms VAD hangover, the acoustic end can
+                    // land before a trailing short word has been committed by Nemotron.
+                    // If a committed token extends slightly past the VAD end while we are
+                    // waiting, include that token in this same turn and make queued token
+                    // signals late-for-closed-turn instead of starting a split transcript turn.
+                    let mut effective_end_sample = end_sample;
+                    let mut effective_decision_sample = decision_sample;
                     if let Some(ref model_progress) = model_progress {
                         let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
                         let deadline = Instant::now() + timeout;
                         loop {
                             let committed = model_progress.get(&stream_session_id).unwrap_or(0);
-                            if committed >= end_sample {
+                            if committed >= decision_sample {
                                 break;
                             }
                             if Instant::now() >= deadline {
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(1));
+                        }
+                        if let Some(token_end) =
+                            model_progress.last_token_end_sample(&stream_session_id)
+                        {
+                            let max_tail_sample =
+                                decision_sample.saturating_add(ms_to_samples(320));
+                            if token_end > effective_end_sample && token_end <= max_tail_sample {
+                                effective_end_sample = token_end;
+                                effective_decision_sample =
+                                    effective_decision_sample.max(token_end);
+                            }
                         }
                     }
                     session.close_turn(
@@ -320,8 +340,8 @@ impl TurnManager {
                         close_degraded,
                         close_detector,
                         close_confidence,
-                        end_sample,
-                        decision_sample,
+                        effective_end_sample,
+                        effective_decision_sample,
                         close_reason,
                         writer,
                     )?;
@@ -330,10 +350,10 @@ impl TurnManager {
                         stream_session_id,
                         adapter_id,
                         mode: EouResetMode::Decoder,
-                        anchor_sample: decision_sample,
+                        anchor_sample: effective_decision_sample,
                         source: close_source,
                         reason: close_reason,
-                        decision_sample,
+                        decision_sample: effective_decision_sample,
                     });
                 }
                 Ok(actions)
@@ -388,6 +408,136 @@ impl TurnManager {
                     })?;
                 }
                 Ok(Vec::new())
+            }
+            DetectorSignal::TranscriptTokenCommitted {
+                detector,
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                token_index,
+                text,
+                start_sample,
+                end_sample,
+                decision_sample,
+                confidence,
+            } => {
+                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                if !is_speech_evidence_text(&text) {
+                    return Ok(Vec::new());
+                }
+                let late_for_closed_turn = session
+                    .last_closed_decision_sample
+                    .is_some_and(|closed| end_sample <= closed);
+                writer.write(&TurnSignalObservedEvent {
+                    event: "turn_signal_observed",
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
+                    detector,
+                    signal: if late_for_closed_turn {
+                        "transcript_token_late"
+                    } else {
+                        "transcript_token_committed"
+                    },
+                    sample: start_sample,
+                    decision_sample,
+                    confidence,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
+                if late_for_closed_turn {
+                    return Ok(Vec::new());
+                }
+                if session.open_turn.is_none() {
+                    session.start_turn(start_sample, "transcript", writer)?;
+                }
+                session.in_speech = true;
+                session.last_human_hold_token_anchor = Some(end_sample);
+                let _ = token_index;
+                Ok(Vec::new())
+            }
+            DetectorSignal::VadLowSilence {
+                detector,
+                stream_id,
+                stream_session_id,
+                adapter_id,
+                start_sample: low_silence_start_sample,
+                decision_sample,
+                silence_samples,
+                confidence,
+            } => {
+                let transcript_silence_samples =
+                    ms_to_samples(self.config.transcript_silence_close_ms);
+                let model_progress = self.config.model_progress.clone();
+                let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
+                let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                let Some(open_turn) = session.open_turn.as_ref() else {
+                    return Ok(Vec::new());
+                };
+                if transcript_silence_samples == 0 || session.saw_vad_signal {
+                    return Ok(Vec::new());
+                }
+                let token_anchor = model_progress
+                    .as_ref()
+                    .and_then(|progress| progress.last_token_end_sample(&stream_session_id))
+                    .unwrap_or(open_turn.start_sample);
+                let transcript_quiet_samples = decision_sample.saturating_sub(token_anchor);
+                if silence_samples < transcript_silence_samples
+                    || transcript_quiet_samples < transcript_silence_samples
+                {
+                    return Ok(Vec::new());
+                }
+                let turn_id = open_turn.turn_id.clone();
+                let end_sample = token_anchor.max(open_turn.start_sample);
+                writer.write(&TurnEouCandidateEvent {
+                    event: "turn_eou_candidate",
+                    stream_id: stream_id.clone(),
+                    stream_session_id: stream_session_id.clone(),
+                    adapter_id: adapter_id.clone(),
+                    turn_id: turn_id.clone(),
+                    source: "transcript_silence",
+                    degraded: true,
+                    detector,
+                    confidence,
+                    start_sample: Some(open_turn.start_sample.max(low_silence_start_sample)),
+                    end_sample,
+                    decision_sample,
+                    text_delta: None,
+                    vad_end_to_model_eou_ms: None,
+                    vad_decision_to_model_eou_ms: None,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
+                if let Some(ref model_progress) = model_progress {
+                    let timeout = Duration::from_millis(model_alignment_timeout_ms as u64);
+                    let deadline = Instant::now() + timeout;
+                    loop {
+                        let committed = model_progress.get(&stream_session_id).unwrap_or(0);
+                        if committed >= end_sample || Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                session.close_turn(
+                    turn_id,
+                    "transcript_silence",
+                    true,
+                    detector,
+                    confidence,
+                    end_sample,
+                    decision_sample,
+                    "transcript_backed_turn_low_vad_silence",
+                    writer,
+                )?;
+                Ok(vec![DetectorAction::ResetEouState {
+                    stream_id,
+                    stream_session_id,
+                    adapter_id,
+                    mode: EouResetMode::Decoder,
+                    anchor_sample: decision_sample,
+                    source: "transcript_silence",
+                    reason: "transcript_backed_turn_low_vad_silence",
+                    decision_sample,
+                }])
             }
             DetectorSignal::ModelEou {
                 detector,
@@ -901,6 +1051,7 @@ struct TurnSessionStartEvent {
     semantic_gate_enabled: bool,
     semantic_gate_close_enabled: bool,
     human_hold_silence_ms: u32,
+    transcript_silence_close_ms: u32,
     daemon_mono_ns: u64,
 }
 
@@ -1055,6 +1206,10 @@ struct TurnSessionEndEvent {
 
 fn samples_to_ms(sample: u64) -> u64 {
     sample.saturating_mul(1_000) / 16_000
+}
+
+fn is_speech_evidence_text(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_alphanumeric())
 }
 
 fn ms_to_samples(ms: u32) -> u64 {

@@ -26,14 +26,14 @@ SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
 SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=600
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400
 ```
 
 meaning:
 
 1. vad emits speech start after 2 consecutive smoothed speech frames.
 2. vad emits speech end after 3 consecutive smoothed low-probability frames.
-3. tiny vad islands under 600ms are not allowed to become semantic closure candidates.
+3. tiny vad islands under 400ms are not allowed to become semantic closure candidates.
 4. if smart-turn holds incomplete and speech never resumes, low acoustic probability for 3s can close as degraded fallback.
 
 ## smart-turn config

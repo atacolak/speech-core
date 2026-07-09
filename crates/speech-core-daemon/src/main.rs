@@ -106,7 +106,7 @@ struct Args {
     /// Stable low-probability silence required before acoustic fallback closure.
     #[arg(
         long,
-        default_value_t = 3000,
+        default_value_t = 1700,
         env = "SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS"
     )]
     vad_acoustic_fallback_silence_ms: u32,
@@ -244,7 +244,7 @@ struct Args {
     /// Minimum VAD segment duration before accepting VAD speech_end as a turn boundary.
     #[arg(
         long,
-        default_value_t = 600,
+        default_value_t = 400,
         env = "SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS"
     )]
     turn_min_vad_speech_ms: u32,
@@ -252,10 +252,18 @@ struct Args {
     /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
     #[arg(
         long,
-        default_value_t = 12000,
+        default_value_t = 7000,
         env = "SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS"
     )]
     turn_human_hold_silence_ms: u32,
+
+    /// Close transcript-backed turns after this much low-VAD silence when VAD never opened acoustically.
+    #[arg(
+        long,
+        default_value_t = 700,
+        env = "SPEECH_CORE_TURN_TRANSCRIPT_SILENCE_CLOSE_MS"
+    )]
+    turn_transcript_silence_close_ms: u32,
 
     /// Minimum observed speech before accepting a model EOU token.
     #[arg(
@@ -318,18 +326,6 @@ async fn main() -> Result<()> {
     let logger = JsonlLogger::open(args.log_dir, event_tx.clone()).await?;
     let model_progress: Option<ModelProgressMap> =
         args.model_path.as_ref().map(|_| ModelProgressMap::new());
-    let model_ingress = args.model_path.clone().map(|model_path| {
-        ModelIngress::start(
-            ModelConfig {
-                model_path,
-                stream_chunk_ms: args.stream_chunk_ms,
-                att_context_right: args.att_context_right,
-                queue_frames: args.model_queue_frames,
-                model_progress: model_progress.clone(),
-            },
-            logger.clone(),
-        )
-    });
     let detector_config = DetectorConfig {
         queue_frames: args.detector_queue_frames,
         vad: args
@@ -382,6 +378,7 @@ async fn main() -> Result<()> {
             model_progress: model_progress.clone(),
             model_alignment_timeout_ms: args.turn_model_alignment_timeout_ms,
             human_hold_silence_ms: args.turn_human_hold_silence_ms,
+            transcript_silence_close_ms: args.turn_transcript_silence_close_ms,
             semantic_gate_enabled: args.turn_semantic_gate_enabled,
             semantic_gate_close_enabled: args.turn_semantic_gate_close_enabled,
         },
@@ -389,6 +386,19 @@ async fn main() -> Result<()> {
     let detector_ingress = detector_config
         .enabled()
         .then(|| DetectorIngress::start(detector_config, logger.clone()));
+    let model_ingress = args.model_path.clone().map(|model_path| {
+        ModelIngress::start(
+            ModelConfig {
+                model_path,
+                stream_chunk_ms: args.stream_chunk_ms,
+                att_context_right: args.att_context_right,
+                queue_frames: args.model_queue_frames,
+                model_progress: model_progress.clone(),
+                transcript_sink: detector_ingress.clone(),
+            },
+            logger.clone(),
+        )
+    });
     let state = Arc::new(DaemonState::new(logger, model_ingress, detector_ingress));
     let listener = TcpListener::bind(args.bind)
         .await

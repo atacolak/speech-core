@@ -135,7 +135,11 @@ impl AudioDetector for SileroVadDetector {
             emit_frames: self.config.emit_frames,
             smoothing_alpha: self.config.smoothing_alpha,
             stop_threshold: self.config.stop_threshold,
-            fallback_threshold: self.config.fallback_threshold,
+            fallback_threshold: self
+                .config
+                .fallback_threshold
+                .max(self.config.stop_threshold),
+            configured_fallback_threshold: self.config.fallback_threshold,
             acoustic_fallback_silence_ms: self.config.acoustic_fallback_silence_ms,
             open_start_mono_ns,
             open_end_mono_ns,
@@ -283,6 +287,7 @@ struct VadSession {
     last_segment_end_sample: Option<u64>,
     last_segment_end_confidence: Option<f32>,
     acoustic_fallback_emitted: bool,
+    low_silence_start_sample: Option<u64>,
     frames_processed: u64,
     segment_index: u32,
 }
@@ -310,6 +315,7 @@ impl VadSession {
             last_segment_end_sample: None,
             last_segment_end_confidence: None,
             acoustic_fallback_emitted: true,
+            low_silence_start_sample: None,
             frames_processed: 0,
             segment_index: 0,
         }
@@ -354,6 +360,7 @@ impl VadSession {
         if self.in_speech {
             if smoothed_probability >= stop_threshold {
                 self.last_voice_sample_end = Some(frame_end_sample);
+                self.low_silence_start_sample = None;
                 self.silence_counter = 0;
                 self.silence_start_sample = None;
                 signals.push(DetectorSignal::VadSpeechPresence {
@@ -414,7 +421,7 @@ impl VadSession {
                     self.silence_start_sample = None;
                 }
             }
-        } else if smoothed_probability >= start_threshold {
+        } else if raw_is_speech || smoothed_probability >= start_threshold {
             if self.onset_counter == 0 {
                 let pre_roll = (self.config.pre_speech_frames * FRAME_SAMPLES) as u64;
                 self.candidate_start_sample = Some(frame_start_sample.saturating_sub(pre_roll));
@@ -426,6 +433,7 @@ impl VadSession {
                 let start_sample = self.candidate_start_sample.unwrap_or(frame_start_sample);
                 self.current_segment_start_sample = Some(start_sample);
                 self.last_voice_sample_end = Some(frame_end_sample);
+                self.low_silence_start_sample = None;
                 self.acoustic_fallback_emitted = true;
                 self.onset_counter = 0;
                 writer.write(&VadSpeechStartEvent {
@@ -457,9 +465,31 @@ impl VadSession {
             self.candidate_start_sample = None;
         }
 
+        if !self.in_speech && smoothed_probability < stop_threshold {
+            let low_start = *self
+                .low_silence_start_sample
+                .get_or_insert(frame_start_sample);
+            signals.push(DetectorSignal::VadLowSilence {
+                detector: DETECTOR,
+                stream_id: self.hello.stream_id.clone(),
+                stream_session_id: self.hello.stream_session_id.clone(),
+                adapter_id: self.hello.adapter_id.clone(),
+                start_sample: low_start,
+                decision_sample: frame_end_sample,
+                silence_samples: frame_end_sample.saturating_sub(low_start),
+                confidence: Some(smoothed_probability),
+            });
+        } else if !self.in_speech {
+            self.low_silence_start_sample = None;
+        }
+
+        let effective_fallback_threshold = self
+            .config
+            .fallback_threshold
+            .max(self.config.stop_threshold);
         if !self.in_speech
             && !self.acoustic_fallback_emitted
-            && smoothed_probability <= self.config.fallback_threshold
+            && smoothed_probability <= effective_fallback_threshold
         {
             if let (Some(start_sample), Some(end_sample)) =
                 (self.last_segment_start_sample, self.last_segment_end_sample)
@@ -483,7 +513,8 @@ impl VadSession {
                         confidence: Some(smoothed_probability),
                         raw_probability: probability,
                         smoothed_probability,
-                        fallback_threshold: self.config.fallback_threshold,
+                        fallback_threshold: effective_fallback_threshold,
+                        configured_fallback_threshold: self.config.fallback_threshold,
                         acoustic_fallback_silence_ms: self.config.acoustic_fallback_silence_ms,
                         daemon_mono_ns: model_end_mono_ns,
                     })?;
@@ -620,6 +651,7 @@ struct VadSessionStartEvent {
     smoothing_alpha: f32,
     stop_threshold: f32,
     fallback_threshold: f32,
+    configured_fallback_threshold: f32,
     acoustic_fallback_silence_ms: u32,
     open_start_mono_ns: u64,
     open_end_mono_ns: u64,
@@ -729,6 +761,7 @@ struct VadAcousticFallbackEvent {
     raw_probability: f32,
     smoothed_probability: f32,
     fallback_threshold: f32,
+    configured_fallback_threshold: f32,
     acoustic_fallback_silence_ms: u32,
     daemon_mono_ns: u64,
 }

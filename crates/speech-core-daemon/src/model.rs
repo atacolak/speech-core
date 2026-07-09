@@ -11,6 +11,7 @@ use std::thread;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::detectors::{DetectorIngress, TranscriptTokenSignal};
 use crate::{HelloState, JsonlLogger};
 
 /// Shared model progress tracker: stream_session_id → latest committed audio sample.
@@ -71,7 +72,7 @@ impl ModelProgressMap {
 const TRANSCRIBE_OK: i32 = 0;
 const TRANSCRIBE_TIMESTAMPS_TOKEN: i32 = 4;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelConfig {
     pub model_path: PathBuf,
     pub stream_chunk_ms: u32,
@@ -79,6 +80,8 @@ pub struct ModelConfig {
     pub queue_frames: usize,
     /// Shared progress tracker so the TurnManager can wait for model catch-up.
     pub model_progress: Option<ModelProgressMap>,
+    /// Optional turn-manager event sink for committed transcript tokens.
+    pub transcript_sink: Option<DetectorIngress>,
 }
 
 #[derive(Clone)]
@@ -553,12 +556,10 @@ impl ModelWorker {
             })?;
         }
 
-        // Update shared progress so TurnManager can wait for model catch-up.
-        if let Some(ref progress) = self.model_progress {
-            let committed_samples = (update.audio_committed_ms.max(0) as u64).saturating_mul(16);
-            progress.update(&session.hello.stream_session_id, committed_samples);
-        }
-
+        // Shared progress is updated after committed tokens are read/recorded below.
+        // TurnManager uses this value as a catch-up barrier before closing VAD turns;
+        // publishing it before token forwarding creates a race where a trailing token
+        // can arrive just after turn_closed and get split into a transcript-backed turn.
         let committed = update.committed_tokens.max(0) as i32;
         let total = update.total_tokens.max(0) as i32;
         let upper = committed.min(total);
@@ -589,6 +590,14 @@ impl ModelWorker {
                 };
                 progress.record_token(&session.hello.stream_session_id, token_end_sample);
             }
+            let token_text = cstr_to_string(token.text);
+            let probability = if token.probability.is_nan() {
+                None
+            } else {
+                Some(token.probability)
+            };
+            let source_sample_start_estimate = timestamps_valid.then(|| ms_to_sample(token.t0_ms));
+            let source_sample_end_estimate = timestamps_valid.then(|| ms_to_sample(token.t1_ms));
             self.write_blocking(&TranscriptTokenCommittedEvent {
                 event: "transcript_token_committed",
                 stream_id: session.hello.stream_id.clone(),
@@ -596,16 +605,12 @@ impl ModelWorker {
                 adapter_id: session.hello.adapter_id.clone(),
                 token_index: token_index as u32,
                 token_id: token.id,
-                text: cstr_to_string(token.text),
+                text: token_text.clone(),
                 t0_ms: token.t0_ms,
                 t1_ms: token.t1_ms,
-                probability: if token.probability.is_nan() {
-                    None
-                } else {
-                    Some(token.probability)
-                },
-                source_sample_start_estimate: timestamps_valid.then(|| ms_to_sample(token.t0_ms)),
-                source_sample_end_estimate: timestamps_valid.then(|| ms_to_sample(token.t1_ms)),
+                probability,
+                source_sample_start_estimate,
+                source_sample_end_estimate,
                 input_received_ms: update.input_received_ms,
                 audio_committed_ms: update.audio_committed_ms,
                 buffered_ms: update.buffered_ms,
@@ -617,6 +622,48 @@ impl ModelWorker {
                 ),
                 alignment_quality: if timestamps_valid { "token" } else { "unknown" },
             })?;
+            if let Some(ref sink) = self.config.transcript_sink {
+                // Punctuation-only tail commits (".", "?", etc.) often arrive after
+                // the user has stopped speaking. They are part of the transcript text,
+                // but they are not independent speech evidence and must not reopen a
+                // turn or trigger speech-out by themselves.
+                if !is_speech_evidence_text(&token_text) {
+                    continue;
+                }
+                let start_sample = source_sample_start_estimate.unwrap_or_else(|| {
+                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                });
+                let end_sample = source_sample_end_estimate.unwrap_or_else(|| {
+                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                });
+                if let Err(err) = sink.transcript_token_committed(TranscriptTokenSignal {
+                    stream_id: session.hello.stream_id.clone(),
+                    stream_session_id: session.hello.stream_session_id.clone(),
+                    adapter_id: session.hello.adapter_id.clone(),
+                    token_index: token_index as u32,
+                    text: token_text,
+                    start_sample,
+                    end_sample,
+                    decision_sample: end_sample,
+                    probability,
+                }) {
+                    self.write_blocking(&ModelErrorEvent {
+                        event: "model_error",
+                        stream_id: session.hello.stream_id.clone(),
+                        stream_session_id: session.hello.stream_session_id.clone(),
+                        adapter_id: session.hello.adapter_id.clone(),
+                        message: format!(
+                            "failed to forward transcript token to turn manager: {err}"
+                        ),
+                        status: None,
+                        daemon_mono_ns: now_mono_ns(),
+                    })?;
+                }
+            }
+        }
+        if let Some(ref progress) = self.model_progress {
+            let committed_samples = (update.audio_committed_ms.max(0) as u64).saturating_mul(16);
+            progress.update(&session.hello.stream_session_id, committed_samples);
         }
         session.next_committed_token = session.next_committed_token.max(upper);
         Ok(())
@@ -695,6 +742,10 @@ fn decode_frame_to_f32(frame: &AudioFrame) -> Result<Vec<f32>> {
 
 fn status_string(status: i32) -> String {
     unsafe { cstr_to_string(sc_transcribe_status_string(status)) }
+}
+
+fn is_speech_evidence_text(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_alphanumeric())
 }
 
 fn cstr_to_string(ptr: *const c_char) -> String {
