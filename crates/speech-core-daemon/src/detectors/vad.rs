@@ -29,6 +29,10 @@ pub struct SileroVadConfig {
     pub stop_threshold: f32,
     pub fallback_threshold: f32,
     pub acoustic_fallback_silence_ms: u32,
+    /// Pre-VAD energy gate: skip inference when RMS < energy_threshold.
+    pub energy_enabled: bool,
+    /// Normalized RMS floor; audio below this is treated as silence.
+    pub energy_threshold: f32,
 }
 
 impl SileroVadConfig {
@@ -50,6 +54,8 @@ impl Default for SileroVadConfig {
             stop_threshold: 0.2,
             fallback_threshold: 0.1,
             acoustic_fallback_silence_ms: u32::MAX,
+            energy_enabled: false,
+            energy_threshold: 0.01,
         }
     }
 }
@@ -342,12 +348,25 @@ impl VadSession {
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorSignal>> {
         let model_start_mono_ns = now_mono_ns();
-        let result = self
-            .engine
-            .compute(frame)
-            .map_err(|e| anyhow::anyhow!("Silero VAD inference failed: {e}"))?;
+        // Energy gate: skip VAD inference on near-silent frames.
+        let energy_rms = if self.config.energy_enabled {
+            let sum_sq: f32 = frame.iter().map(|s| s * s).sum();
+            (sum_sq / frame.len() as f32).sqrt()
+        } else {
+            f32::NAN
+        };
+        let energy_gated = self.config.energy_enabled
+            && energy_rms < self.config.energy_threshold;
+        let probability = if energy_gated {
+            0.0_f32
+        } else {
+            let result = self
+                .engine
+                .compute(frame)
+                .map_err(|e| anyhow::anyhow!("Silero VAD inference failed: {e}"))?;
+            result.prob
+        };
         let model_end_mono_ns = now_mono_ns();
-        let probability = result.prob;
         self.last_probability = Some(probability);
         let previous_smoothed_probability = self.smoothed_probability.unwrap_or(probability);
         let alpha = self.config.smoothing_alpha.clamp(0.000_001, 1.0);
@@ -598,6 +617,12 @@ impl VadSession {
             smoothed_in_speech: self.in_speech,
             silence_counter: self.silence_counter as u32,
             hangover_frames: self.config.hangover_frames as u32,
+            energy_rms: if self.config.energy_enabled {
+                Some(energy_rms)
+            } else {
+                None
+            },
+            energy_gated,
             ingress_receive_mono_ns,
             detector_start_mono_ns: model_start_mono_ns,
             detector_end_mono_ns: model_end_mono_ns,
@@ -710,6 +735,8 @@ struct VadMeterEvent {
     smoothed_in_speech: bool,
     silence_counter: u32,
     hangover_frames: u32,
+    energy_rms: Option<f32>,
+    energy_gated: bool,
     ingress_receive_mono_ns: u64,
     detector_start_mono_ns: u64,
     detector_end_mono_ns: u64,

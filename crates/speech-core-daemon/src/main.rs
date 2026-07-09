@@ -115,6 +115,14 @@ struct Args {
     )]
     vad_acoustic_fallback_silence_ms: u32,
 
+    /// Gate VAD inference on audio energy: skip frames with RMS below this threshold.
+    #[arg(long, env = "SPEECH_CORE_VAD_ENERGY_ENABLED")]
+    vad_energy_enabled: bool,
+
+    /// Normalized RMS energy floor (0.0-1.0). Frames below this skip VAD entirely.
+    #[arg(long, default_value_t = 0.01, env = "SPEECH_CORE_VAD_ENERGY_THRESHOLD")]
+    vad_energy_threshold: f32,
+
     /// Optional Parakeet realtime EOU ONNX directory. Experimental/retired by default.
     #[arg(long, env = "SPEECH_CORE_EOU_MODEL_DIR")]
     eou_model_dir: Option<PathBuf>,
@@ -346,6 +354,8 @@ async fn main() -> Result<()> {
                 stop_threshold: args.vad_stop_threshold,
                 fallback_threshold: args.vad_fallback_threshold,
                 acoustic_fallback_silence_ms: args.vad_acoustic_fallback_silence_ms,
+                energy_enabled: args.vad_energy_enabled,
+                energy_threshold: args.vad_energy_threshold,
             }),
         eou: args
             .eou_model_dir
