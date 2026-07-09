@@ -704,10 +704,12 @@ impl JsonlLogger {
     async fn write<T: Serialize>(&self, event: &T) -> Result<()> {
         let mut line = serde_json::to_vec(event).context("serializing jsonl event")?;
         let text = String::from_utf8(line.clone()).context("json event should be utf-8")?;
-        line.push(b'\n');
-        let mut writer = self.inner.lock().await;
-        writer.write_all(&line).await?;
-        writer.flush().await?;
+        if !is_jsonl_filtered_event(&text) {
+            line.push(b'\n');
+            let mut writer = self.inner.lock().await;
+            writer.write_all(&line).await?;
+            writer.flush().await?;
+        }
         let _ = self.event_tx.send(text);
         Ok(())
     }
@@ -945,6 +947,10 @@ fn parse_recheck_offsets_ms(value: &str) -> Vec<u32> {
         .collect()
 }
 
+fn is_jsonl_filtered_event(text: &str) -> bool {
+    event_type_from_text(text).as_deref() == Some("vad_meter")
+}
+
 fn event_matches(
     text: &str,
     stream_id: Option<&str>,
@@ -955,10 +961,7 @@ fn event_matches(
         return false;
     };
     if let Some(expected) = event {
-        let observed = value
-            .get("event")
-            .or_else(|| value.get("type"))
-            .and_then(|v| v.as_str());
+        let observed = event_type_from_value(&value);
         if observed != Some(expected) {
             return false;
         }
@@ -974,6 +977,20 @@ fn event_matches(
         }
     }
     true
+}
+
+fn event_type_from_text(text: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return None;
+    };
+    event_type_from_value(&value).map(str::to_owned)
+}
+
+fn event_type_from_value(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("event")
+        .or_else(|| value.get("type"))
+        .and_then(|v| v.as_str())
 }
 
 fn validate_frame_against_hello(hello: &HelloState, frame: &AudioFrame) -> Result<()> {

@@ -579,6 +579,31 @@ impl VadSession {
             })?;
         }
 
+        writer.write(&VadMeterEvent {
+            event: "vad_meter",
+            stream_id: self.hello.stream_id.clone(),
+            stream_session_id: self.hello.stream_session_id.clone(),
+            adapter_id: self.hello.adapter_id.clone(),
+            detector: DETECTOR,
+            frame_index: self.frames_processed.saturating_sub(1),
+            sample_start: frame_start_sample,
+            sample_count: FRAME_SAMPLES as u32,
+            sample_time_ms: samples_to_ms(frame_start_sample),
+            probability,
+            smoothed_probability,
+            threshold: self.config.threshold,
+            stop_threshold,
+            fallback_threshold: self.config.fallback_threshold,
+            raw_is_speech,
+            smoothed_in_speech: self.in_speech,
+            silence_counter: self.silence_counter as u32,
+            hangover_frames: self.config.hangover_frames as u32,
+            ingress_receive_mono_ns,
+            detector_start_mono_ns: model_start_mono_ns,
+            detector_end_mono_ns: model_end_mono_ns,
+            detector_duration_ms: ns_to_ms(model_end_mono_ns.saturating_sub(model_start_mono_ns)),
+        })?;
+
         if self.config.emit_frames {
             writer.write(&VadFrameEvent {
                 event: "vad_frame",
@@ -657,6 +682,32 @@ struct VadStateEvent {
     raw_changed: bool,
     state_changed: bool,
     hangover_progress: bool,
+    silence_counter: u32,
+    hangover_frames: u32,
+    ingress_receive_mono_ns: u64,
+    detector_start_mono_ns: u64,
+    detector_end_mono_ns: u64,
+    detector_duration_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct VadMeterEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    detector: &'static str,
+    frame_index: u64,
+    sample_start: u64,
+    sample_count: u32,
+    sample_time_ms: u64,
+    probability: f32,
+    smoothed_probability: f32,
+    threshold: f32,
+    stop_threshold: f32,
+    fallback_threshold: f32,
+    raw_is_speech: bool,
+    smoothed_in_speech: bool,
     silence_counter: u32,
     hangover_frames: u32,
     ingress_receive_mono_ns: u64,

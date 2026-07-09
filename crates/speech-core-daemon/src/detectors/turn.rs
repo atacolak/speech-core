@@ -346,6 +346,19 @@ impl TurnManager {
                             decision_sample,
                             alignment_deadline,
                         );
+                        // After the model has consumed all input audio, wait briefly for
+                        // pending transcript tokens to arrive. Nemotron emits tokens
+                        // asynchronously — they can lag 50-200ms behind input consumption.
+                        loop {
+                            let token_caught_up = model_progress
+                                .last_token_end_sample(&stream_session_id)
+                                .map(|token_end| token_end >= effective_decision_sample)
+                                .unwrap_or(true);
+                            if token_caught_up || Instant::now() >= alignment_deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                         apply_trailing_token_extension(
                             model_progress,
                             &stream_session_id,
