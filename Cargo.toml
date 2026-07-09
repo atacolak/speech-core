@@ -5,6 +5,7 @@ members = [
     "crates/speech-core-mic-adapter",
     "crates/speech-core-file-adapter",
     "crates/speech-core-watch",
+    "crates/speech-out",
 ]
 resolver = "2"
 

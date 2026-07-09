@@ -1803,6 +1803,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "speech-out"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "speech-core-protocol",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "spm_precompiled"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
