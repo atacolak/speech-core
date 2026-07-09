@@ -68,8 +68,8 @@ echo "  human_hold_ms:     $turn_human_hold_silence_ms"
 echo "  transcript_close_ms:$turn_transcript_silence_close_ms"
 echo "  model_eou_close:   $turn_model_eou_close_enabled"
 echo
-echo "sfnix client example:"
-echo "  SPEECH_CORE_WS_URL=ws://$(tailscale ip -4 | head -n1):8765/ws/audio-ingress /tmp/speech-core-native-build/scripts/sfnix-live-session.sh"
+echo "client example:"
+echo "  SPEECH_CORE_WS_URL=ws://$(tailscale ip -4 | head -n1):8765/ws/audio-ingress /tmp/speech-core-native-build/scripts/speech-core-live-session.sh"
 echo
 
 export SPEECH_CORE_VAD_THRESHOLD="$vad_threshold"

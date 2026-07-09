@@ -1,3 +1,6 @@
+//! speech-in file adapter — replays WAV files to the daemon over websocket for
+//! repeatable detector and turn-detection testing.
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};

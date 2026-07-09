@@ -1,3 +1,6 @@
+//! speech-in mic adapter — captures system microphone audio via CPAL and streams
+//! timestamped PCM frames to the daemon over websocket.
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

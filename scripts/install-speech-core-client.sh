@@ -7,15 +7,15 @@ libexec_dir="${SPEECH_CORE_LIBEXEC_DIR:-$HOME/.local/libexec/speech-core}"
 state_dir="${SPEECH_CORE_STATE_DIR:-$HOME/.local/state/speech-core}"
 config_dir="${SPEECH_CORE_CONFIG_DIR:-$HOME/.config/speech-core}"
 systemd_user_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-ws_url="${SPEECH_CORE_WS_URL:-ws://100.68.60.39:8765/ws/audio-ingress}"
-stream_id="${SPEECH_CORE_STREAM_ID:-sfnix.live_mic}"
-adapter_id="${SPEECH_CORE_ADAPTER_ID:-sfnix.cpal.default}"
+ws_url="${SPEECH_CORE_WS_URL:-}"
+stream_id="${SPEECH_CORE_STREAM_ID:-laptop.live_mic}"
+adapter_id="${SPEECH_CORE_ADAPTER_ID:-laptop.cpal.default}"
 sample_rate_hz="${SPEECH_CORE_SAMPLE_RATE_HZ:-16000}"
 channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
 frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
 watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
-out_ws_url="${SPEECH_OUT_WS_URL:-ws://100.68.60.39:8788/ws/speech-out}"
+out_ws_url="${SPEECH_OUT_WS_URL:-}"
 out_steps="${SPEECH_OUT_STEPS:-5}"
 out_speed="${SPEECH_OUT_SPEED:-1.30}"
 out_voice="${SPEECH_OUT_VOICE:-M1}"
@@ -33,7 +33,7 @@ nix-shell --run 'cargo build -p speech-core-mic-adapter -p speech-core-watch -p 
 install -m 0755 target/debug/speech-core-mic-adapter "$libexec_dir/speech-core-mic-adapter"
 install -m 0755 target/debug/speech-core-watch "$libexec_dir/speech-core-watch"
 install -m 0755 target/debug/speech-out "$libexec_dir/speech-out"
-install -m 0755 scripts/sfnix-live-session.sh "$bin_dir/speech-core-live-session"
+install -m 0755 scripts/speech-core-live-session.sh "$bin_dir/speech-core-live-session"
 install -m 0755 scripts/speech-out-live-session.sh "$bin_dir/speech-out-live-session"
 install -m 0755 scripts/speech-core-dictation-run.sh "$bin_dir/speech-core-dictation-run"
 install -m 0755 scripts/speech-core-dictation-toggle.sh "$bin_dir/speech-core-dictation-toggle"
@@ -119,7 +119,7 @@ WantedBy=default.target
 EOF_UNIT
 
 cat <<EOF_DONE
-installed sfnix speech-core client
+installed speech-core client
   adapter wrapper: $bin_dir/speech-core-mic-adapter
   watcher wrapper: $bin_dir/speech-core-watch
   speech-out:      $bin_dir/speech-out

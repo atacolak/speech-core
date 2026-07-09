@@ -1,3 +1,6 @@
+//! shared protocol — binary frame envelope, audio frame headers, control messages,
+//! and timing provenance used by all speech-core crates.
+
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -587,7 +590,7 @@ mod tests {
     #[test]
     fn uncalibrated_cross_host_latency_is_unknown() {
         let provenance = TimestampProvenance::uncalibrated(
-            "host:sfnix:monotonic",
+            "host:client:monotonic",
             ClockDomain::HostMonotonic,
             TimestampQuality::SourceCapture,
         );
@@ -599,7 +602,7 @@ mod tests {
     #[test]
     fn same_clock_source_capture_latency_is_computed() {
         let provenance = TimestampProvenance::same_clock(
-            "host:sfub:monotonic",
+            "host:server:monotonic",
             ClockDomain::HostMonotonic,
             TimestampQuality::SourceCapture,
         );
@@ -611,7 +614,7 @@ mod tests {
     #[test]
     fn capture_latency_requires_source_capture_quality_when_clocks_are_comparable() {
         let provenance = TimestampProvenance::same_clock(
-            "host:sfub:monotonic",
+            "host:server:monotonic",
             ClockDomain::HostMonotonic,
             TimestampQuality::CallbackReceive,
         );
@@ -623,7 +626,7 @@ mod tests {
     #[test]
     fn adapter_send_latency_does_not_require_source_capture_quality() {
         let provenance = TimestampProvenance::same_clock(
-            "host:sfub:monotonic",
+            "host:server:monotonic",
             ClockDomain::HostMonotonic,
             TimestampQuality::CallbackReceive,
         );

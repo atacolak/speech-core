@@ -4,17 +4,17 @@ this is the reality as of the current working tree. if another doc disagrees, tr
 
 ## one-line summary
 
-`speech-core` is a rust speech runtime: laptop mic audio streams to the sfub daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, smart turn v3 can semantically gate turn closure, and speech-out provides the separate local tts/output seam.
+`speech-core` is a rust speech runtime: laptop mic audio streams to the server daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, smart turn v3 can semantically gate turn closure, and speech-out provides the separate local tts/output seam.
 
 ## current live path
 
 ```text
-sfnix laptop
+the laptop
   speech-core-mic-adapter
     captures cpal mic audio as 16khz mono pcm_s16le
     sends websocket audio frames
       ↓
-sfub
+server
   speech-core-daemon
     validates frame/session metadata
     writes jsonl event log
@@ -24,7 +24,7 @@ sfub
     on vad speech_end, runs smart turn v3 once on recent turn audio
     turn manager promotes accepted boundaries into turn_closed
       ↓
-sfnix or sfub
+laptop
   speech-core-watch / speech-core-live-session
     prints transcript text
     prints <EOU> when turn_closed arrives
@@ -113,9 +113,9 @@ this is less magical and less chatty. good.
 
 ## what works
 
-- websocket audio transport from sfnix to sfub.
+- websocket audio transport from laptop to server.
 - native nixos build/install path for the laptop client.
-- sfub systemd user service for the daemon.
+- server systemd user service for the daemon.
 - nemotron streaming transcript.
 - silero vad acoustic pauses.
 - smart turn v3 direct rust onnx semantic endpoint gate.
@@ -132,7 +132,7 @@ this is less magical and less chatty. good.
 
 ## useful commands
 
-sfub daemon:
+server daemon:
 
 ```bash
 systemctl --user status speech-core-daemon.service
@@ -141,7 +141,7 @@ journalctl --user -u speech-core-daemon.service -f
 cat ~/.config/speech-core/daemon.env
 ```
 
-sfnix laptop:
+the laptop:
 
 ```bash
 speech-core-live-session
@@ -155,8 +155,8 @@ repo:
 cargo test --workspace
 SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx \
   cargo test -p speech-core-daemon real_model_smoke_when_env_set -- --nocapture
-./scripts/install-sfub-daemon.sh
-./scripts/sfnix-sync-build-adapter.sh
+./scripts/install-speech-core-daemon.sh
+./scripts/speech-core-sync-build-adapter.sh
 ```
 
 

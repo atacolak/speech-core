@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wrapper for DPDFNet mic proxy — called by speech-core-dpdfnet-mic.service.
 # Sources speech-core env, activates venv, sets LD_LIBRARY_PATH for NixOS,
-# then runs sfnix-mic-denoise.py.
+# then runs mic-denoise.py.
 set -euo pipefail
 
 VENV_DIR="${DPDFNET_VENV_DIR:-/tmp/dpdfnet-venv}"
@@ -9,12 +9,12 @@ CACHE_DIR="${DPDFNET_CACHE_DIR:-$HOME/.cache/dpdfnet}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT=""
 
-# Locate sfnix-mic-denoise.py
+# Locate mic-denoise.py
 for candidate in \
-  "$SCRIPT_DIR/sfnix-mic-denoise.py" \
-  "$SCRIPT_DIR/../experimental/sfnix-mic-denoise.py" \
-  "$HOME/.local/libexec/speech-core/sfnix-mic-denoise.py" \
-  "$HOME/workspace/speech-core/scripts/experimental/sfnix-mic-denoise.py"; do
+  "$SCRIPT_DIR/mic-denoise.py" \
+  "$SCRIPT_DIR/../experimental/mic-denoise.py" \
+  "$HOME/.local/libexec/speech-core/mic-denoise.py" \
+  "$HOME/workspace/speech-core/scripts/experimental/mic-denoise.py"; do
   if [[ -f "$candidate" ]]; then
     PYTHON_SCRIPT="$candidate"
     break
@@ -22,7 +22,7 @@ for candidate in \
 done
 
 if [[ -z "$PYTHON_SCRIPT" ]]; then
-  echo "FATAL: sfnix-mic-denoise.py not found" >&2
+  echo "FATAL: mic-denoise.py not found" >&2
   exit 1
 fi
 
@@ -72,9 +72,9 @@ if [[ -z "${SPEECH_CORE_PORTAUDIO_LIB:-}" ]]; then
 fi
 
 args=(
-  --url "${SPEECH_CORE_WS_URL:-ws://100.68.60.39:8765/ws/audio-ingress}"
-  --stream-id "${SPEECH_CORE_DPDFNET_STREAM_ID:-${SPEECH_CORE_STREAM_ID:-sfnix.dpdfnet_mic}}"
-  --adapter-id "${SPEECH_CORE_DPDFNET_ADAPTER_ID:-sfnix.dpdfnet}"
+  --url "${SPEECH_CORE_WS_URL:-}"
+  --stream-id "${SPEECH_CORE_DPDFNET_STREAM_ID:-${SPEECH_CORE_STREAM_ID:-laptop.dpdfnet_mic}}"
+  --adapter-id "${SPEECH_CORE_DPDFNET_ADAPTER_ID:-laptop.dpdfnet}"
   --model "${DPDFNET_MODEL:-dpdfnet2}"
 )
 if [[ -n "${SPEECH_CORE_STREAM_SESSION_ID:-}" ]]; then

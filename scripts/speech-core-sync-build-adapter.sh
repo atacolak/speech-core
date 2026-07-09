@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-remote_host="${SPEECH_CORE_REMOTE_HOST:-sfnix}"
+remote_host="${SPEECH_CORE_REMOTE_HOST:-}"
 remote_dir="${SPEECH_CORE_REMOTE_DIR:-/tmp/speech-core-native-build}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -16,4 +16,4 @@ ssh "$remote_host" "cd '$remote_dir' && target/debug/speech-core-mic-adapter --h
 
 echo "native adapter: $remote_host:$remote_dir/target/debug/speech-core-mic-adapter"
 echo "native watcher: $remote_host:$remote_dir/target/debug/speech-core-watch"
-echo "laptop live command: cd $remote_dir && SPEECH_CORE_WS_URL=ws://100.68.60.39:8765/ws/audio-ingress ./scripts/sfnix-live-session.sh"
+echo "client live command: cd $remote_dir && SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress ./scripts/speech-core-live-session.sh"

@@ -1,3 +1,6 @@
+//! speech-in daemon — the ear. Ingests audio over websocket, runs ASR + VAD + turn detection,
+//! emits transcript-update and turn-closed events.
+
 mod detectors;
 mod model;
 

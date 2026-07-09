@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EXPERIMENTAL — DPDFNet2 denoise wrapper for sfnix mic ingest.
+EXPERIMENTAL — DPDFNet2 denoise wrapper for laptop mic ingest.
 
 Captures microphone audio via sounddevice, denoises with dpdfnet.StreamEnhancer,
 and forwards enhanced PCM frames to speech-core-daemon via WebSocket.
@@ -9,19 +9,19 @@ This is a PROXY that replaces speech-core-mic-adapter for testing.
 It implements a minimal subset of the speech-core WebSocket protocol.
 
 Usage:
-  # On sfnix (NixOS):
+  # On the laptop (NixOS):
   nix-shell -p python312 stdenv.cc.cc.lib zlib portaudio --run '
     export LD_LIBRARY_PATH=$(for f in $NIX_LDFLAGS; do case "$f" in -L/*) dir="${f#-L}"; [ -d "$dir" ] && echo -n "$dir:"; esac; done)
     source ~/dpdfnet-env/bin/activate
-    python3 scripts/experimental/sfnix-mic-denoise.py [options]
+    python3 scripts/experimental/mic-denoise.py [options]
   '
 
 Options:
   --model NAME         DPDFNet model name (default: dpdfnet2)
   --device NAME        Input device name substring
   --list-devices       List audio input devices and exit
-  --url URL            WebSocket URL (default: ws://100.68.60.39:8765/ws/audio-ingress)
-  --stream-id ID       Stream identifier (default: sfnix.denoised_mic)
+  --url URL            WebSocket URL (default: ws://<server-address>:8765/ws/audio-ingress)
+  --stream-id ID       Stream identifier (default: laptop.denoised_mic)
   --dry-run            Don't connect to WebSocket, just save to WAV
   --save-wav PATH      Save raw+denoised WAV for comparison
 
@@ -39,8 +39,8 @@ from pathlib import Path
 import numpy as np
 
 # ── Constants ────────────────────────────────────────────────────────────────
-DEFAULT_URL = "ws://100.68.60.39:8765/ws/audio-ingress"
-DEFAULT_STREAM_ID = "sfnix.denoised_mic"
+DEFAULT_URL = "ws://<server-address>:8765/ws/audio-ingress"
+DEFAULT_STREAM_ID = "laptop.denoised_mic"
 DEFAULT_MODEL = "dpdfnet2"
 SR = 16000
 FRAME_MS = 20
@@ -96,7 +96,7 @@ def list_devices():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="DPDFNet2 denoise wrapper for sfnix mic ingest (EXPERIMENTAL)"
+        description="DPDFNet2 denoise wrapper for laptop mic ingest (EXPERIMENTAL)"
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model name (default: {DEFAULT_MODEL})")
     parser.add_argument("--device", type=int, default=None, help="Input device index")
@@ -104,7 +104,7 @@ def parse_args():
     parser.add_argument("--url", default=DEFAULT_URL, help=f"WebSocket URL (default: {DEFAULT_URL})")
     parser.add_argument("--stream-id", default=DEFAULT_STREAM_ID, help=f"Stream ID (default: {DEFAULT_STREAM_ID})")
     parser.add_argument("--stream-session-id", default=None, help="Stream session id (default: UUID)")
-    parser.add_argument("--adapter-id", default=None, help="Adapter id (default: generated sfnix.dpdfnet.*)")
+    parser.add_argument("--adapter-id", default=None, help="Adapter id (default: generated laptop.dpdfnet.*)")
     parser.add_argument("--dry-run", action="store_true", help="No WebSocket, just save WAV")
     parser.add_argument("--save-wav", type=Path, default=None, help="Save raw+denoised WAV pair")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
@@ -233,7 +233,7 @@ def main():
     import sounddevice as sd
     import dpdfnet
 
-    adapter_id = args.adapter_id or f"sfnix.dpdfnet.{uuid.uuid4().hex[:8]}"
+    adapter_id = args.adapter_id or f"laptop.dpdfnet.{uuid.uuid4().hex[:8]}"
     session_id = args.stream_session_id or str(uuid.uuid4())
     stream_id = args.stream_id
 

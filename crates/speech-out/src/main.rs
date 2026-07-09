@@ -1,3 +1,6 @@
+//! speech-out daemon — the mouth. Synthesizes text to speech over websocket,
+//! streams audio chunks back to clients for local playback.
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
@@ -52,7 +55,7 @@ struct Cli {
 enum SpeechOutCommand {
     /// Synthesize or route one local utterance of text.
     Say(SayArgs),
-    /// Run the desktop/sfub websocket TTS daemon. Inference happens here.
+    /// Run the websocket TTS daemon on the server. Inference happens here.
     Daemon(DaemonArgs),
     /// Connect to a speech-out daemon and play streamed audio chunks on this device.
     Play(PlayArgs),
@@ -197,7 +200,7 @@ struct DaemonArgs {
 
 #[derive(Debug, Parser)]
 struct PlayArgs {
-    /// Text to synthesize on the desktop/sfub daemon.
+    /// Text to synthesize on the server daemon.
     text: Option<String>,
 
     /// Read utterance text from stdin.

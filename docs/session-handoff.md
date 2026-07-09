@@ -29,7 +29,7 @@ they contain useful history, but some sections are stale because implementation 
 ## current runtime summary
 
 ```text
-sfnix mic adapter -> sfub daemon -> nemotron transcript + silero vad acoustic boundary + smart-turn-v3 semantic gate -> watcher prints transcript + <EOU>
+laptop mic adapter -> server daemon -> nemotron transcript + silero vad acoustic boundary + smart-turn-v3 semantic gate -> watcher prints transcript + <EOU>
 ```
 
 parakeet realtime eou is disabled by default.
@@ -68,7 +68,7 @@ for line in p.open(errors='replace'):
     try: o = json.loads(line)
     except Exception: continue
     sid = o.get('stream_session_id')
-    if sid and o.get('stream_id') == 'sfnix.live_mic':
+    if sid and o.get('stream_id') == 'laptop.live_mic':
         sessions.setdefault(sid, []).append(o)
 if sessions:
     sid, evs = next(reversed(sessions.items()))

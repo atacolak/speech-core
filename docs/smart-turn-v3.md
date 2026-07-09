@@ -6,7 +6,7 @@ plainly: silero still finds acoustic silence quickly. smart turn then looks at t
 
 ## model artifact
 
-current default path used by the sfub scripts:
+current default path used by the server scripts:
 
 ```text
 ~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
@@ -81,7 +81,7 @@ SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
 ```
 
-`install-sfub-daemon.sh` and `sfub-start-nemotron-daemon.sh` default the model path and semantic gate to enabled. set `SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=false` to log decisions without letting them suppress vad closure.
+`install-speech-core-daemon.sh` and `start-speech-core-daemon.sh` default the model path and semantic gate to enabled. set `SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=false` to log decisions without letting them suppress vad closure.
 
 ## events
 

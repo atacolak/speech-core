@@ -77,10 +77,10 @@ else
   bin_dir="$repo_root/target/debug"
 fi
 
-core_ws_url="${SPEECH_CORE_WS_URL:-ws://100.68.60.39:8765/ws/audio-ingress}"
-out_ws_url="${SPEECH_OUT_WS_URL:-ws://100.68.60.39:8788/ws/speech-out}"
-stream_id="${SPEECH_CORE_STREAM_ID:-sfnix.live_mic}"
-adapter_id="${SPEECH_CORE_ADAPTER_ID:-sfnix.cpal.default}"
+core_ws_url="${SPEECH_CORE_WS_URL:-}"
+out_ws_url="${SPEECH_OUT_WS_URL:-}"
+stream_id="${SPEECH_CORE_STREAM_ID:-laptop.live_mic}"
+adapter_id="${SPEECH_CORE_ADAPTER_ID:-laptop.cpal.default}"
 sample_rate_hz="${SPEECH_CORE_SAMPLE_RATE_HZ:-16000}"
 channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"
@@ -106,7 +106,7 @@ watch_trace_tokens="${SPEECH_CORE_WATCH_TRACE_TOKENS:-0}"
 device_arg=()
 if [[ -n "${SPEECH_CORE_DEVICE:-}" ]]; then
   # CPAL does not necessarily expose PipeWire/Pulse source names as device names
-  # (on sfnix it exposes a generic "pipewire" device). Treat an unavailable
+  # (on some systems CPAL exposes a generic "pipewire" device). Treat an unavailable
   # configured device as a soft preference, not a hard failure that kills capture.
   if "$bin_dir/speech-core-mic-adapter" --list-devices 2>/dev/null | grep -Fqi -- "$SPEECH_CORE_DEVICE"; then
     device_arg=(--device "$SPEECH_CORE_DEVICE")
@@ -147,7 +147,7 @@ usage: speech-out-live-session [--debug-tui|--tui|--transcript|--jsonl|--mode MO
 
 Developer harness: reuse the speech-core live mic/session behavior and the same debug TUI, subscribe to speech-in turn_closed events, then append/trigger a short speech-out response (default: "heard you."). Defaults to --debug-tui because this is the useful diagnostic surface for testing the end-to-end speech loop.
 
-Expected topology: speech-core daemon and speech-out daemon run on sfub/desktop; this laptop/client script streams mic audio and plays speech-out websocket chunks locally.
+Expected topology: speech-core daemon and speech-out daemon run on the server; this laptop/client script streams mic audio and plays speech-out websocket chunks locally.
 EOF_HELP
       exit 0
       ;;

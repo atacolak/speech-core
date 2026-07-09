@@ -27,7 +27,7 @@ contract:
 important ids:
 
 ```text
-stream_id             stable logical source, e.g. sfnix.live_mic
+stream_id             stable logical source, e.g. laptop.live_mic
 stream_session_id     one capture run/process/session
 adapter_id            capture implementation/device identity
 seq                   frame sequence inside the session
@@ -244,20 +244,20 @@ speech-core-watch --verbose           # legacy debug in transcript mode
 
 ## 7. install/runtime seam
 
-sfub daemon:
+server daemon:
 
 ```text
-scripts/install-sfub-daemon.sh
+scripts/install-speech-core-daemon.sh
 ~/.config/speech-core/daemon.env
 ~/.config/systemd/user/speech-core-daemon.service
 ~/.local/state/speech-core/logs/events.jsonl
 ```
 
-sfnix client:
+laptop client:
 
 ```text
-scripts/sfnix-sync-build-adapter.sh
-scripts/install-sfnix-client.sh
+scripts/speech-core-sync-build-adapter.sh
+scripts/install-speech-core-client.sh
 ~/.config/speech-core/client.env
 ~/.local/bin/speech-core-live-session
 ```

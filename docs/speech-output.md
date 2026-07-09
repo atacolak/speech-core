@@ -27,11 +27,11 @@ Installed/process-facing name should be `speech-out`.
 The interactive MVP is websocket based:
 
 ```text
-sfub/desktop: speech-out daemon --bind 0.0.0.0:8788
-laptop/client: speech-out play --url ws://sfub:8788/ws/speech-out "heard you."
+the server: speech-out daemon --bind 0.0.0.0:8788
+laptop/client: speech-out play --url ws://<server>:8788/ws/speech-out "heard you."
 ```
 
-Inference stays on sfub/desktop. Client devices connect as playback adapters and receive evented websocket text messages plus binary WAV byte chunks. The daemon synthesizes text chunks sequentially: one Supertonic HTTP request per text chunk. The client playback adapter also plays completed WAV chunks sequentially via a single playback worker. Do not spawn one player per chunk concurrently; that creates overlapping "chorus" playback and can kill short utterances when the client process exits.
+Inference stays on the server. Client devices connect as playback adapters and receive evented websocket text messages plus binary WAV byte chunks. The daemon synthesizes text chunks sequentially: one Supertonic HTTP request per text chunk. The client playback adapter also plays completed WAV chunks sequentially via a single playback worker. Do not spawn one player per chunk concurrently; that creates overlapping "chorus" playback and can kill short utterances when the client process exits.
 
 ## backend contract
 
@@ -68,7 +68,7 @@ SPEECH_OUT_LANG=en
 SPEECH_OUT_OUTPUT=/tmp/out.wav
 SPEECH_OUT_TIMEOUT_SECS=60
 SPEECH_OUT_PLAY_COMMAND=pw-play
-SPEECH_OUT_WS_URL=ws://100.68.60.39:8788/ws/speech-out
+SPEECH_OUT_WS_URL=ws://<server-address>:8788/ws/speech-out
 SPEECH_OUT_DAEMON_BIND=0.0.0.0:8788
 SPEECH_OUT_WARM_TTL_SECS=1200
 SPEECH_OUT_SUPERTONIC_STARTUP_GRACE_MS=5000
@@ -76,7 +76,7 @@ SPEECH_OUT_SUPERTONIC_STARTUP_GRACE_MS=5000
 
 ## websocket daemon / playback adapter
 
-Run on sfub/desktop:
+Run on the server:
 
 ```bash
 cargo run -p speech-out -- daemon \
@@ -90,7 +90,7 @@ Send a request and play it on a client/laptop:
 
 ```bash
 speech-out play \
-  --url ws://100.68.60.39:8788/ws/speech-out \
+  --url ws://<server-address>:8788/ws/speech-out \
   --steps 5 --speed 1.30 --voice M1 --lang en \
   "heard you."
 ```
@@ -123,8 +123,8 @@ speech_out_playback_failed     # client-side event from speech-out play
 `scripts/speech-out-live-session.sh` reuses the speech-core live microphone/session pattern. It streams mic audio through `speech-core-mic-adapter`, feeds speech-in events plus speech-out events through the same `speech-core-watch --mode debug` TUI, watches for speech-in `turn_closed`, and triggers/appends a short speech-out response (default `heard you.`) through the speech-out websocket daemon:
 
 ```bash
-SPEECH_CORE_WS_URL=ws://100.68.60.39:8765/ws/audio-ingress \
-SPEECH_OUT_WS_URL=ws://100.68.60.39:8788/ws/speech-out \
+SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress \
+SPEECH_OUT_WS_URL=ws://<server-address>:8788/ws/speech-out \
 ./scripts/speech-out-live-session.sh --steps 5 --speed 1.30 --voice M1 --style calm
 ```
 

@@ -35,9 +35,9 @@ fi
 
 libexec_dir="${SPEECH_CORE_LIBEXEC_DIR:-$HOME/.local/libexec/speech-core}"
 state_root="${SPEECH_CORE_STATE_DIR:-$HOME/.local/state/speech-core}"
-ws_url="${SPEECH_CORE_WS_URL:-ws://100.68.60.39:8765/ws/audio-ingress}"
-stream_id="${SPEECH_CORE_DICTATION_STREAM_ID:-sfnix.dictation}"
-adapter_id="${SPEECH_CORE_ADAPTER_ID:-sfnix.cpal.default}"
+ws_url="${SPEECH_CORE_WS_URL:-}"
+stream_id="${SPEECH_CORE_DICTATION_STREAM_ID:-laptop.dictation}"
+adapter_id="${SPEECH_CORE_ADAPTER_ID:-laptop.cpal.default}"
 sample_rate_hz="${SPEECH_CORE_SAMPLE_RATE_HZ:-16000}"
 channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"

@@ -1,10 +1,10 @@
-# DPDFNet2 Neural Denoise — sfnix Laptop Mic Ingress Evaluation
+# DPDFNet2 Neural Denoise — Laptop Mic Ingress Evaluation
 
 ## Status: Experimental / Feasibility Prototype
 
 **Date:** 2026-07-08  
-**Evaluator:** execution-plane (sfUB → sfnix SSH probe)  
-**Target:** Laptop (sfnix) mic ingest preprocessing, before WebSocket send to daemon  
+**Evaluator:** execution-plane (server → the laptop SSH probe)  
+**Target:** Laptop (the laptop) mic ingest preprocessing, before WebSocket send to daemon  
 **Constraint:** Do NOT touch `speech-core-daemon` or existing live-session scripts.
 
 ---
@@ -16,14 +16,14 @@
 | Model tested | `dpdfnet2` (2.49M params, 1.35G MACs, 9.7 MB ONNX) |
 | Sample rate | 16 kHz (model native) |
 | Frame size | 20 ms (320 samples) — matches speech-core default |
-| StreamEnhancer latency | **8.52 ms / frame** on sfnix (NixOS, Intel x86_64) |
+| StreamEnhancer latency | **8.52 ms / frame** on the laptop (NixOS, Intel x86_64) |
 | Real-time budget | 20 ms / frame |
 | Headroom | **~2.3× faster than real-time** |
 | ONNX runtime | onnxruntime CPUExecutionProvider (1 thread) |
 | License | Apache 2.0 |
 | Install method | `pip install dpdfnet` (venv on NixOS via nix-shell) |
 
-**Verdict: FEASIBLE.** DPDFNet2 StreamEnhancer runs comfortably faster than real-time on sfnix at 16 kHz with the default `dpdfnet2` model. The lighter `baseline` model would be even faster.
+**Verdict: FEASIBLE.** DPDFNet2 StreamEnhancer runs comfortably faster than real-time on the laptop at 16 kHz with the default `dpdfnet2` model. The lighter `baseline` model would be even faster.
 
 ---
 
@@ -32,13 +32,13 @@
 ### Current pipeline (no denoise)
 
 ```
-sfnix mic → speech-core-mic-adapter (CPAL) → WebSocket → speech-core-daemon (sfUB)
+the laptop mic → speech-core-mic-adapter (CPAL) → WebSocket → speech-core-daemon (server)
 ```
 
 ### Proposed denoise seam
 
 ```
-sfnix mic → Python denoise wrapper (DPDFNet2 StreamEnhancer) → speech-core-mic-adapter or direct WebSocket → daemon
+the laptop mic → Python denoise wrapper (DPDFNet2 StreamEnhancer) → speech-core-mic-adapter or direct WebSocket → daemon
 ```
 
 The denoise wrapper can either:
@@ -50,7 +50,7 @@ Option 2 is cleaner but duplicates the WebSocket framing logic (available in `sp
 
 ---
 
-## Installation on sfnix (NixOS)
+## Installation on the laptop (NixOS)
 
 ### One-time setup
 
@@ -80,7 +80,7 @@ nix-shell -p python312 stdenv.cc.cc.lib zlib --run '
 
 ## Performance Measurements
 
-### sfUB (Ubuntu 24.04, same Intel x86_64 arch)
+### server (Ubuntu 24.04, same Intel x86_64 arch)
 
 | Test | Result |
 |---|---|
@@ -88,18 +88,18 @@ nix-shell -p python312 stdenv.cc.cc.lib zlib --run '
 | StreamEnhancer 50 frames (1s) | 109.2 ms total, **2.18 ms/frame** |
 | Real-time headroom | **9.2× faster** |
 
-### sfnix (NixOS, Intel x86_64)
+### the laptop (NixOS, Intel x86_64)
 
 | Test | Result |
 |---|---|
 | StreamEnhancer 50 frames (1s) | 426.2 ms total, **8.52 ms/frame** |
 | Real-time headroom | **2.3× faster** |
 
-The ~4× difference between sfUB and sfnix is likely due to NixOS LD_LIBRARY_PATH overhead (dynamic linker resolving paths per call). A properly packaged NixOS build (with rpath set) would close this gap.
+The ~4× difference between server and the laptop is likely due to NixOS LD_LIBRARY_PATH overhead (dynamic linker resolving paths per call). A properly packaged NixOS build (with rpath set) would close this gap.
 
 ### Model variants
 
-| Model | Params | MACs | ONNX size | Est. latency (sfnix) |
+| Model | Params | MACs | ONNX size | Est. latency (the laptop) |
 |---|---|---|---|---|
 | `baseline` | 2.31M | 0.36G | 8.3 MB | ~3-4 ms (fastest) |
 | `dpdfnet2` | 2.49M | 1.35G | 9.7 MB | **8.5 ms ✓** |
@@ -123,10 +123,10 @@ The ~4× difference between sfUB and sfnix is likely due to NixOS LD_LIBRARY_PAT
 
 ## Next Safe Integration Plan
 
-1. **Phase 0 (this evaluation):** ✅ Done. DPDFNet2 confirmed feasible at 2.3× real-time on sfnix.
+1. **Phase 0 (this evaluation):** ✅ Done. DPDFNet2 confirmed feasible at 2.3× real-time on the laptop.
 
 2. **Phase 1 — Prototype wrapper script:**  
-   Create `scripts/experimental/sfnix-mic-denoise.py` that:
+   Create `scripts/experimental/mic-denoise.py` that:
    - Captures mic audio via `sounddevice`
    - Denoises with `dpdfnet.StreamEnhancer`
    - Sends enhanced audio to daemon WebSocket (reimplementing the speech-core wire protocol subset)
@@ -138,7 +138,7 @@ The ~4× difference between sfUB and sfnix is likely due to NixOS LD_LIBRARY_PAT
 
 4. **Phase 3 — Integration decision:**  
    If wrapper is stable:
-   - Option A: Replace `speech-core-mic-adapter` service with denoise wrapper (on sfnix only, gated by env var)
+   - Option A: Replace `speech-core-mic-adapter` service with denoise wrapper (on the laptop only, gated by env var)
    - Option B: Add denoise as a new crate `speech-core-mic-denoise` or extend the mic adapter with optional ONNX preprocessing (requires adding onnxruntime to Cargo deps)
 
 ---
@@ -146,7 +146,7 @@ The ~4× difference between sfUB and sfnix is likely due to NixOS LD_LIBRARY_PAT
 ## Files in this directory
 
 - `test_dpdfnet_perf.py` — Synthetic benchmark: measures StreamEnhancer throughput at various frame sizes
-- `sfnix-mic-denoise.py` — Real mic capture + denoise + WebSocket proxy (Phase 1 wrapper)
+- `mic-denoise.py` — Real mic capture + denoise + WebSocket proxy (Phase 1 wrapper)
 - `README-dpdfnet2-denoise.md` — This file
 
 ---

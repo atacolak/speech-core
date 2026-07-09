@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DPDFNet2 performance benchmark for sfnix mic ingest.
+DPDFNet2 performance benchmark for laptop mic ingest.
 Measures StreamEnhancer throughput at various frame sizes.
 
 Usage:
-  # On sfnix (NixOS):
+  # On the laptop (NixOS):
   nix-shell -p python312 stdenv.cc.cc.lib zlib --run '
     export LD_LIBRARY_PATH=$(for f in $NIX_LDFLAGS; do case "$f" in -L/*) dir="${f#-L}"; [ -d "$dir" ] && echo -n "$dir:"; esac; done)
     source ~/dpdfnet-env/bin/activate

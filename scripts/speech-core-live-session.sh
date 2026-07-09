@@ -59,9 +59,9 @@ else
   bin_dir="$repo_root/target/debug"
 fi
 
-ws_url="${SPEECH_CORE_WS_URL:-ws://100.68.60.39:8765/ws/audio-ingress}"
-stream_id="${SPEECH_CORE_STREAM_ID:-sfnix.live_mic}"
-adapter_id="${SPEECH_CORE_ADAPTER_ID:-sfnix.cpal.default}"
+ws_url="${SPEECH_CORE_WS_URL:-}"
+stream_id="${SPEECH_CORE_STREAM_ID:-laptop.live_mic}"
+adapter_id="${SPEECH_CORE_ADAPTER_ID:-laptop.cpal.default}"
 sample_rate_hz="${SPEECH_CORE_SAMPLE_RATE_HZ:-16000}"
 channels="${SPEECH_CORE_CHANNELS:-1}"
 format="${SPEECH_CORE_FORMAT:-pcm-s16-le}"

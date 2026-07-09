@@ -1,6 +1,6 @@
 # laptop-audio
 
-Local OS-level microphone configuration tools for the sfnix laptop. These are **not** part of the speech-core daemon or speech seams.
+Local OS-level microphone configuration tools for the laptop. These are **not** part of the speech-core daemon or speech seams.
 
 ## Why this is separate
 
@@ -24,7 +24,7 @@ This directory holds the tools that make the laptop's microphone signal clean be
 | `dpdfnet-toggle.sh` | Start/stop DPDFNet neural noise suppression proxy. |
 | `dpdfnet-mic.sh` | DPDFNet mic proxy wrapper (called by systemd service). |
 | `dpdfnet-test.sh` | Record N seconds through DPDFNet and save raw + denoised WAVs. |
-| `sfnix-mic-denoise.py` | Python DPDFNet denoising proxy — captures via sounddevice, denoises, sends to speech-core WebSocket. |
+| `mic-denoise.py` | Python DPDFNet denoising proxy — captures via sounddevice, denoises, sends to speech-core WebSocket. |
 | `test_dpdfnet_perf.py` | DPDFNet performance benchmark. |
 
 ## Relationship to speech-core

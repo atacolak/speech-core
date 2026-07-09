@@ -90,7 +90,7 @@ PY_MODEL
 
 # Ensure libexec script is in place
 if [[ ! -x "$LIBEXEC_DIR/speech-core-dpdfnet-mic" ]]; then
-  echo "ERROR: $LIBEXEC_DIR/speech-core-dpdfnet-mic not found. Run install-sfnix-client.sh first." >&2
+  echo "ERROR: $LIBEXEC_DIR/speech-core-dpdfnet-mic not found. Run install-speech-core-client.sh first." >&2
   exit 1
 fi
 

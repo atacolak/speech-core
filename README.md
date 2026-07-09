@@ -14,6 +14,18 @@ right now the mature seam is **speech-in**. it listens to live microphone audio,
 
 `speech-out` is the next seam: a separate output path for local text-to-speech, playback, cancellation, and barge-in. it should not live inside the speech-in daemon. input and output are both transformations over data, but their failure modes are different. speech-in must stay low-latency and cannot be blocked by synthesis, playback queues, voice model loading, or output-device nonsense. speech-out must be allowed to own model warmup, utterance queues, audio playback, and interruption.
 
+## environment
+
+| var | used by | why |
+|-----|---------|-----|
+| `SPEECH_CORE_WS_URL` | client scripts, adapter | `ws://<server>:8765/ws/audio-ingress` — where the speech-in daemon listens |
+| `SPEECH_OUT_WS_URL` | client scripts, speech-out | `ws://<server>:8788/ws/speech-out` — where the speech-out daemon listens |
+| `SPEECH_CORE_MODEL_PATH` | daemon | path to nemotron GGUF model file |
+| `SPEECH_CORE_VAD_MODEL_PATH` | daemon | path to silero VAD ONNX model (bundled in `models/`) |
+| `SPEECH_CORE_SMART_TURN_MODEL_PATH` | daemon | path to smart-turn-v3 ONNX model |
+
+install scripts write these into `~/.config/speech-core/client.env` and `daemon.env`.
+
 ## current operational docs
 
 start here if you are continuing work in a new session:
@@ -29,16 +41,26 @@ short version: speech-in currently turns live audio into `transcript_update`, `t
 
 ## workspace
 
+two peer daemons: one for hearing, one for speaking. the laptop runs adapters and a subscriber; the server runs daemons and models.
+
 ```text
-crates/speech-core-protocol      shared frame/control/event structs and binary frame envelope
-crates/speech-core-daemon        speech-in websocket ingress server, model/detector workers, jsonl logger
-crates/speech-core-mic-adapter   speech-in cpal microphone adapter plus synthetic/dry-run generator
-crates/speech-core-file-adapter  speech-in wav replay adapter for repeatable detector/eou probes
-crates/speech-core-watch         speech-in live transcript/jsonl event subscriber
-crates/speech-out                speech-out websocket daemon, local cli, and playback client
+  speech-in (the ear)                 speech-out (the mouth)
+  ──────────────────                  ──────────────────────
+  speech-core-daemon                  speech-out
+    └─ ASR + VAD + turn detection       └─ TTS + playback streaming
+
+  speech-core-mic-adapter
+    └─ CPAL mic → websocket
+  speech-core-file-adapter
+    └─ WAV replay → websocket
+  speech-core-watch
+    └─ transcript/event subscriber
+
+  speech-core-protocol
+    └─ shared: frame envelope, control messages, timing
 ```
 
-crate names keep the historical `speech-core-*` prefix for now because they are installed binaries and script targets. the seam names are the conceptual API: `speech-in` for ingestion/endpointing and `speech-out` for utterance/playback.
+crate names keep the `speech-core-*` prefix because they are installed binaries and script targets. the seam names are the conceptual API: `speech-in` for ingestion/endpointing and `speech-out` for utterance/playback.
 
 The protocol preserves timing provenance required by `docs/speech-core/10-adapter-transport-architecture.md`:
 
@@ -112,7 +134,7 @@ remaining bytes PCM payload
 
 JSON control messages are sent as WebSocket text messages. `hello` is required for adapter/session identification; server acknowledgements and metric events are also sent as JSON text.
 
-## Run on sfUB with synthetic adapter
+## Run on the server with synthetic adapter
 
 From the repo root:
 
@@ -126,8 +148,8 @@ In another shell:
 cargo run -p speech-core-mic-adapter -- \
   --synthetic \
   --url ws://127.0.0.1:8765/ws/audio-ingress \
-  --stream-id sfub.synthetic \
-  --adapter-id sfub.synthetic.1 \
+  --stream-id server.synthetic \
+  --adapter-id server.synthetic.1 \
   --frames 50
 ```
 
@@ -272,7 +294,7 @@ Parakeet realtime EOU is retired for now. live laptop tests showed many raw `<EO
 ```bash
 SPEECH_CORE_EOU_MODEL_DIR=~/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true \
-./scripts/install-sfub-daemon.sh
+./scripts/install-speech-core-daemon.sh
 ```
 
 If enabled, Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
@@ -308,11 +330,11 @@ cargo run -p speech-core-file-adapter -- \
 
 ## Install and persistence
 
-Install the sfUB daemon as a user systemd service:
+Install the the server daemon as a user systemd service:
 
 ```bash
 cd speech-core
-./scripts/install-sfub-daemon.sh
+./scripts/install-speech-core-daemon.sh
 ```
 
 This installs:
@@ -334,11 +356,11 @@ systemctl --user restart speech-core-daemon.service
 journalctl --user -u speech-core-daemon.service -f
 ```
 
-Install the sfnix/laptop client after syncing the workspace there:
+Install the laptop client after syncing the workspace there:
 
 ```bash
 cd /tmp/speech-core-native-build
-./scripts/install-sfnix-client.sh
+./scripts/install-speech-core-client.sh
 ```
 
 This installs:
@@ -366,20 +388,20 @@ systemctl --user status speech-core-mic-adapter.service
 
 ## Live transcript session
 
-Start the daemon on sfUB with the Nemotron model:
+Start the daemon on the server with the Nemotron model:
 
 ```bash
 cd speech-core
-./scripts/sfub-start-nemotron-daemon.sh
+./scripts/start-speech-core-daemon.sh
 ```
 
 This prints the JSONL log directory and listens on `0.0.0.0:8765` by default.
 
-On sfnix/the laptop, run:
+On the laptop, run:
 
 ```bash
 cd /tmp/speech-core-native-build
-SPEECH_CORE_WS_URL=ws://100.68.60.39:8765/ws/audio-ingress ./scripts/sfnix-live-session.sh
+SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress ./scripts/speech-core-live-session.sh
 ```
 
 The session script starts a live transcript watcher and the CPAL mic adapter with one generated `stream_session_id`. Transcript updates are printed as soon as the daemon emits `transcript_update` events. Press `ctrl-c` to stop capture; the script waits briefly for final model/session events.
@@ -389,8 +411,8 @@ For raw daemon events instead of transcript text:
 ```bash
 cd /tmp/speech-core-native-build
 target/debug/speech-core-watch \
-  --url ws://100.68.60.39:8765/ws/audio-ingress \
-  --stream-id sfnix.live_mic \
+  --url ws://<server-address>:8765/ws/audio-ingress \
+  --stream-id laptop.live_mic \
   --mode jsonl
 ```
 
@@ -404,21 +426,21 @@ cargo run -p speech-core-mic-adapter -- --dry-run --frames 5
 
 Use this on remote/headless machines to verify the adapter binary and frame construction without audio hardware.
 
-## Real cpal adapter on sfnix
+## Real cpal adapter on the laptop
 
-sfnix is NixOS, so do not copy a generic dynamically linked Linux binary from sfUB and expect it to execute directly. It may fail with the NixOS stub loader (`could not start dynamically linked executable`). Build the adapter on sfnix instead:
+the laptop is NixOS, so do not copy a generic dynamically linked Linux binary from the server and expect it to execute directly. It may fail with the NixOS stub loader (`could not start dynamically linked executable`). Build the adapter on the laptop instead:
 
 ```bash
-./scripts/sfnix-sync-build-adapter.sh
+./scripts/speech-core-sync-build-adapter.sh
 ```
 
-That rsyncs this workspace to `/tmp/speech-core-native-build` on sfnix and runs:
+That rsyncs this workspace to `/tmp/speech-core-native-build` on the laptop and runs:
 
 ```bash
 nix-shell --run 'cargo build -p speech-core-mic-adapter -p speech-core-watch'
 ```
 
-The resulting binary can be run directly on sfnix:
+The resulting binary can be run directly on the laptop:
 
 ```bash
 /tmp/speech-core-native-build/target/debug/speech-core-mic-adapter --help
@@ -430,19 +452,19 @@ List input devices:
 /tmp/speech-core-native-build/target/debug/speech-core-mic-adapter --list-devices
 ```
 
-Run the daemon on sfUB, listening on the Tailscale-facing address or all interfaces as appropriate:
+Run the daemon on the server, listening on the Tailscale-facing address or all interfaces as appropriate:
 
 ```bash
 cargo run -p speech-core-daemon -- --bind 0.0.0.0:8765 --log-dir ./logs
 ```
 
-Run the native adapter on sfnix:
+Run the native adapter on the laptop:
 
 ```bash
 /tmp/speech-core-native-build/target/debug/speech-core-mic-adapter \
-  --url ws://sfUB:8765/ws/audio-ingress \
-  --stream-id sfnix.default_mic \
-  --adapter-id sfnix.cpal.default \
+  --url ws://<server>:8765/ws/audio-ingress \
+  --stream-id laptop.default_mic \
+  --adapter-id laptop.cpal.default \
   --sample-rate-hz 16000 \
   --channels 1
 ```
@@ -452,15 +474,15 @@ Select a device by substring if needed:
 ```bash
 /tmp/speech-core-native-build/target/debug/speech-core-mic-adapter \
   --device "USB" \
-  --url ws://sfUB:8765/ws/audio-ingress \
-  --stream-id sfnix.usb_mic
+  --url ws://<server>:8765/ws/audio-ingress \
+  --stream-id laptop.usb_mic
 ```
 
 ### Current v1 real-capture limitation
 
 The real cpal path is intentionally conservative and does **not** resample or downmix yet. It asks cpal for the wire sample rate/channel count directly, defaulting to 16 kHz mono. If the device does not support that exact shape, the adapter exits with a clear error. Synthetic mode remains the portable smoke-test path.
 
-The adapter currently does not implement a clock offset calibration handshake. On sfnix -> sfUB, cross-host latency values should remain `status=uncalibrated`/`value_ms=null` until calibration is added.
+The adapter currently does not implement a clock offset calibration handshake. From laptop to server, cross-host latency values should remain `status=uncalibrated`/`value_ms=null` until calibration is added.
 
 ## Development checks
 

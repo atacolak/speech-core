@@ -174,7 +174,7 @@ systemctl --user enable speech-core-daemon.service speech-out-daemon.service
 systemctl --user restart speech-core-daemon.service speech-out-daemon.service
 
 cat <<EOF_DONE
-installed sfub speech-core + speech-out daemons
+installed speech-core + speech-out daemons
   speech-core:  $bin_dir/speech-core-daemon
   speech-out:   $bin_dir/speech-out
   watcher:      $bin_dir/speech-core-watch

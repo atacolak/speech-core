@@ -1,3 +1,6 @@
+//! speech-in event subscriber — connects to the daemon and displays live transcripts,
+//! VAD diagnostics, and turn events (TUI, transcript, or JSONL modes).
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
