@@ -11,7 +11,7 @@ bind="${SPEECH_CORE_DAEMON_BIND:-0.0.0.0:8765}"
 stream_chunk_ms="${SPEECH_CORE_STREAM_CHUNK_MS:-160}"
 att_context_right="${SPEECH_CORE_ATT_CONTEXT_RIGHT:-1}"
 model_queue_frames="${SPEECH_CORE_MODEL_QUEUE_FRAMES:-2048}"
-vad_model_path="${SPEECH_CORE_VAD_MODEL_PATH:-}"
+vad_model_path="${SPEECH_CORE_VAD_MODEL_PATH:-$HOME/.cache/speech-core/models/silero_vad_v4.onnx}"
 vad_threshold="${SPEECH_CORE_VAD_THRESHOLD:-0.5}"
 vad_onset_frames="${SPEECH_CORE_VAD_ONSET_FRAMES:-2}"
 vad_hangover_frames="${SPEECH_CORE_VAD_HANGOVER_FRAMES:-3}"
@@ -56,6 +56,10 @@ speech_out_timeout_secs="${SPEECH_OUT_TIMEOUT_SECS:-90}"
 speech_out_curl_command="${SPEECH_OUT_CURL_COMMAND:-curl}"
 
 mkdir -p "$bin_dir" "$state_dir/logs" "$config_dir" "$systemd_user_dir"
+
+# Bundle Silero VAD model into the local cache so the daemon can find it.
+mkdir -p "$HOME/.cache/speech-core/models"
+cp "$repo_root/models/silero_vad_v4.onnx" "$HOME/.cache/speech-core/models/"
 cd "$repo_root"
 
 cargo build --release -p speech-core-daemon -p speech-core-watch -p speech-core-file-adapter -p speech-out >/dev/null
