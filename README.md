@@ -1,6 +1,18 @@
-# speech-core transport v1
+# speech-core
 
-Durable Rust scaffold for speech-core central inference-host ingress plus source-device microphone adapters. The default path remains transport-only: timestamped PCM frames over persistent WebSocket, daemon-side validation/metrics, and JSONL event logs. The daemon can optionally load a transcribe.cpp Nemotron streaming GGUF and emit model/transcript JSONL events behind the same ingress.
+`speech-core` is the local speech substrate for realtime human/agent interaction.
+
+this repository is organized around two seams:
+
+```text
+speech-in   = the ear: microphone audio -> transcript + turn events
+agent loop  = the brain/router: decides what to do with a completed turn
+speech-out  = the mouth: text -> audible speech
+```
+
+right now the mature seam is **speech-in**. it listens to live microphone audio, transcribes speech, tracks acoustic speech presence, and decides when a user utterance is ready to hand to an agent.
+
+`speech-out` is the next seam: a separate output path for local text-to-speech, playback, cancellation, and barge-in. it should not live inside the speech-in daemon. input and output are both transformations over data, but their failure modes are different. speech-in must stay low-latency and cannot be blocked by synthesis, playback queues, voice model loading, or output-device nonsense. speech-out must be allowed to own model warmup, utterance queues, audio playback, and interruption.
 
 ## current operational docs
 
@@ -13,17 +25,20 @@ docs/seams.md             component boundaries and contracts
 docs/session-handoff.md   compact context for the next assistant session
 ```
 
-short version: current `<EOU>` is silero vad turn closure, not a language-aware eou model. a pause of about 360ms can close a turn if the speech segment was at least 700ms long.
+short version: speech-in currently turns live audio into `transcript_update`, `turn_closed`, and diagnostic side-channel events. silero vad proposes acoustic boundaries; smart-turn v3 checks whether those boundaries sound semantically complete; tiny vad islands under 400ms are ignored; a longer 1700ms acoustic fallback prevents the turn from hanging forever.
 
-## Workspace
+## workspace
 
 ```text
 crates/speech-core-protocol      shared frame/control/event structs and binary frame envelope
-crates/speech-core-daemon        websocket audio ingress server, model/detector workers, JSONL logger
-crates/speech-core-mic-adapter   cpal microphone adapter plus synthetic/dry-run generator
-crates/speech-core-file-adapter  wav replay adapter for repeatable detector/EOU probes
-crates/speech-core-watch         live transcript/jsonl event subscriber
+crates/speech-core-daemon        speech-in websocket ingress server, model/detector workers, jsonl logger
+crates/speech-core-mic-adapter   speech-in cpal microphone adapter plus synthetic/dry-run generator
+crates/speech-core-file-adapter  speech-in wav replay adapter for repeatable detector/eou probes
+crates/speech-core-watch         speech-in live transcript/jsonl event subscriber
+crates/speech-out                speech-out websocket daemon, local cli, and playback client
 ```
+
+crate names keep the historical `speech-core-*` prefix for now because they are installed binaries and script targets. the seam names are the conceptual API: `speech-in` for ingestion/endpointing and `speech-out` for utterance/playback.
 
 The protocol preserves timing provenance required by `docs/speech-core/10-adapter-transport-architecture.md`:
 
@@ -163,44 +178,96 @@ model_error
 
 `transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
 
-## VAD turn detection and retired Parakeet realtime EOU
+## speech-in turn detection
 
-The current interactive turn boundary path is deliberately simple:
+`speech-in` turns live microphone audio into structured conversation events.
 
 ```text
-microphone audio -> Silero VAD -> turn_closed source=vad -> watcher prints <EOU>
-                     |
-                     +-> Nemotron ASR keeps streaming transcript text
+microphone audio
+  -> timestamped pcm frames
+  -> websocket ingress
+  -> nemotron streaming transcription
+  -> silero voice activity detection
+  -> smart-turn v3 semantic endpointing
+  -> transcript_update + turn_closed events
 ```
 
-Silero VAD consumes 30 ms / 480-sample frames and emits:
+the goal is not merely to detect sound. the goal is to detect human utterances well enough that an agent can respond naturally.
+
+that means speech-in has to answer several different questions:
 
 ```text
-vad_session_start
-vad_speech_start
-vad_speech_end
-vad_frame              # only with --vad-emit-frames
-vad_session_end
+is there speech-like audio?
+is this speech segment long enough to be human speech rather than a click or flap?
+did the transcription model produce words?
+does the current audio/text sound semantically complete?
+if it does not sound complete yet, should we check again after a little more silence?
+if the system hears human-like sound for a long time but gets no words, should it report that as a hold/debug condition?
 ```
 
-Current installed default policy:
+### vad policy: acoustic speech presence
+
+silero vad is used as the acoustic speech-presence sensor. it gives the system a low-latency signal that says, approximately, “this sounds like speech” or “this no longer sounds like speech.”
+
+current installed default policy:
 
 ```text
-SPEECH_CORE_VAD_HANGOVER_FRAMES=12        # 12 * 30ms = ~360ms silence before speech_end
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=700   # suppress short mic clicks / noise bursts
+SPEECH_CORE_VAD_THRESHOLD=0.5
+SPEECH_CORE_VAD_HANGOVER_FRAMES=3        # 3 native silero frames ≈ 96ms
+SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
+SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
+SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400   # suppress short mic clicks / noise bursts
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
+SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
 SPEECH_CORE_EOU_MODEL_DIR=               # empty: Parakeet realtime EOU worker disabled
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 ```
 
-Why Parakeet realtime EOU is retired for now:
+silero runs on its native 512-sample inference window at 16khz, about 32ms. the smoothing matters because raw vad probability can flap during breath, plosives, room noise, or low-energy syllables. instead of treating each raw probability spike as truth, speech-in smooths the probabilities and uses that smoothed state to reduce tiny speech islands and false boundaries.
 
-- live laptop tests showed many raw `<EOU>` tokens on silence/background state.
-- model EOU often arrived late relative to Silero speech_end.
-- recent ~59s live session produced one real spoken region in the transcript, but Parakeet emitted 51 EOU tokens, 50 of which were suppressed.
-- same session had short false VAD blips before speech; `TURN_MIN_VAD_SPEECH_MS=700` filters those, and a larger VAD hangover should merge tiny internal dips.
+the minimum speech duration matters too. vad islands under 400ms are not allowed to become real turn candidates. this protects the semantic endpointing layer from being asked to close a “turn” that was only a click, breath, or detector blip.
 
-The Parakeet EOU code remains in-tree for experiments, but it is not part of the default runtime. To re-enable it intentionally:
+### smart-turn policy: semantic endpointing
+
+smart-turn v3 is used as the semantic endpointing model. vad tells us there may be a boundary. smart-turn asks a different question:
+
+```text
+does this sound like the user has finished their utterance?
+```
+
+a pause is not always an ending. humans pause mid-sentence. they think, restart, breathe, and make filler sounds. speech-in treats vad silence as a candidate boundary, not as final conversational truth.
+
+the smart-turn model appears to perform best when it gets a small amount of silence after the acoustic boundary, around the low-hundreds of milliseconds range. the current system uses an aggressive early pre-check at about 96ms to test lower-latency behavior, then repeats checks on a geometric schedule:
+
+```text
+96ms, 192ms, 384ms, 768ms, 1536ms
+```
+
+these are offsets after the acoustic end sample.
+
+if smart-turn says the utterance is semantically complete, speech-in closes the turn early. if it says incomplete, the system waits and checks again. this is meant to handle speech where the first pause is not the real end.
+
+there is also an acoustic fallback. if the user stops producing human-like speech and smart-turn still does not confidently close the turn, the system can close after a longer silence window (3000 milliseconds) instead of hanging forever.
+
+### human hold event
+
+there is a separate diagnostic event for a weird but important state:
+
+```text
+the system hears sustained human-like audio,
+but the transcription model is not producing words.
+```
+
+after 12 seconds of this condition, speech-in emits `turn_human_hold`.
+
+this is not an end-of-utterance. it is a side-channel signal. later, speech-out can use this to say a small nudge like “still listening” or “take your time,” but the important thing is that this is not confused with the main transcript/turn stream. agents should treat it as diagnostic or interaction metadata, not as a user message.
+
+### retired Parakeet realtime EOU
+
+Parakeet realtime EOU is retired for now. live laptop tests showed many raw `<EOU>` tokens on silence/background state, and model EOU often arrived late relative to silero speech_end. the code remains in-tree for experiments, but it is not part of the default runtime. to re-enable it intentionally:
 
 ```bash
 SPEECH_CORE_EOU_MODEL_DIR=/home/sf/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
@@ -410,3 +477,8 @@ cargo check --workspace
 - no browser adapter yet;
 - no QUIC/WebRTC transport yet;
 - no daemon config loader yet beyond CLI flags.
+
+
+### speech-out live test harness
+
+`speech-out-live-session` mirrors `speech-core-live-session --debug-tui` by default. It keeps the speech-in observability surface — VAD bars, pause glyphs, smart-turn probe glyphs, close markers — and appends the generated speech-out response below the completed turn. This is the preferred manual harness for feeling end-to-end latency and seeing which seam is responsible for delay.

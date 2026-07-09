@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const SAMPLE_RATE: u64 = 16_000;
 const MAX_TUI_TURNS: usize = 10;
-const MAX_TUI_NOTES: usize = 6;
+const MAX_TUI_NOTES: usize = 10;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "watch live speech-core daemon events")]
@@ -42,6 +42,15 @@ struct Args {
     /// Replay events from a jsonl file instead of opening a websocket.
     #[arg(long)]
     replay_events: Option<PathBuf>,
+
+    /// Read jsonl events from stdin instead of opening a websocket. Useful for composing the TUI with sidecar event producers.
+    #[arg(long)]
+    stdin_events: bool,
+
+    /// Enable speech-out-specific TUI additions: output glyphs, tuning row, and ASR dispatch seam notes.
+    /// Keep this off for plain speech-core-live-session so speech-in and speech-out diagnostics stay separate.
+    #[arg(long)]
+    speech_out_ui: bool,
 
     /// Print compact endpointing diagnostics alongside transcript output.
     /// Only affects transcript mode; tui/debug modes are already endpoint-oriented.
@@ -172,11 +181,14 @@ struct TuiModel {
     stream_session_id: Option<String>,
     vad_config: Option<String>,
     smart_turn_config: Option<String>,
+    speech_out_ui: bool,
     turns: Vec<TuiTurn>,
     current: Option<usize>,
     next_turn_number: u64,
     notes: VecDeque<String>,
     live_vad_bar: String,
+    speech_out_params: Option<String>,
+    first_mono_ns: Option<u64>,
     last_transcript_display: String,
 }
 
@@ -186,6 +198,7 @@ struct TuiTurn {
     sections: Vec<TuiSection>,
     text: String,
     glyphs: Vec<String>,
+    outputs: Vec<SpeechOutLine>,
     boundary: Option<BoundaryState>,
     paused: bool,
     closed: bool,
@@ -197,7 +210,21 @@ struct TuiSection {
     glyphs: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SpeechOutLine {
+    text: String,
+    chunks: Vec<String>,
+    glyphs: Vec<String>,
+}
+
 impl TuiModel {
+    fn new(speech_out_ui: bool) -> Self {
+        Self {
+            speech_out_ui,
+            ..Self::default()
+        }
+    }
+
     fn handle(&mut self, value: &Value) {
         if let Some(session_id) = value.get("stream_session_id").and_then(|v| v.as_str()) {
             self.stream_session_id
@@ -277,6 +304,9 @@ impl TuiModel {
                 }
                 self.last_transcript_display = display;
             }
+            "model_chunk_processed" if self.speech_out_ui => {
+                self.handle_model_chunk_processed(value);
+            }
             "vad_speech_start" => {
                 if let Some(idx) = self.current_open_turn() {
                     if self.turns[idx].paused {
@@ -314,10 +344,13 @@ impl TuiModel {
                     check_count: 0,
                     pending_check_glyph: None,
                 });
-                self.note(format!(
-                    "vad candidate boundary at {}; smart-turn probes begin",
-                    sample_field_ms(value, "end_sample")
-                ));
+                self.note_event(
+                    value,
+                    format!(
+                        "vad candidate boundary at {}; smart-turn probes begin",
+                        sample_field_ms(value, "end_sample")
+                    ),
+                );
             }
             "smart_turn_candidate" => {
                 let idx = self.ensure_turn();
@@ -374,11 +407,14 @@ impl TuiModel {
                 if let Some(boundary) = self.turns[idx].boundary.as_mut() {
                     boundary.pending_check_glyph = None;
                 }
-                self.note(format!(
-                    "smart-turn check {} -> {} p={probability:.3}",
-                    check_count,
-                    if complete { "complete" } else { "hold" }
-                ));
+                self.note_event(
+                    value,
+                    format!(
+                        "smart-turn check {} -> {} p={probability:.3}",
+                        check_count,
+                        if complete { "complete" } else { "hold" }
+                    ),
+                );
             }
             "smart_turn_recheck_scheduled" => {
                 let idx = self.ensure_turn();
@@ -388,9 +424,10 @@ impl TuiModel {
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or_default();
-                self.note(format!(
-                    "semantic rechecks scheduled: {remaining} remaining"
-                ));
+                self.note_event(
+                    value,
+                    format!("semantic rechecks scheduled: {remaining} remaining"),
+                );
             }
             "smart_turn_recheck_exhausted" => {
                 let idx = self.ensure_turn();
@@ -412,7 +449,7 @@ impl TuiModel {
             "turn_eou_suppressed" => {
                 let source = value.get("source").and_then(|v| v.as_str()).unwrap_or("?");
                 let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                self.note(format!("no eou: {source}/{reason}"));
+                self.note_event(value, format!("no eou: {source}/{reason}"));
             }
             "turn_closed" => {
                 let idx = self.ensure_turn();
@@ -425,7 +462,198 @@ impl TuiModel {
                 self.turns[idx].closed = true;
                 self.turns[idx].paused = false;
                 self.current = None;
-                self.note(format!("turn closed by {source}"));
+                self.note_event(value, format!("turn closed by {source}"));
+            }
+            "speech_out_request_received" if self.speech_out_ui => {
+                let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.trim().is_empty() {
+                    let idx = self.last_turn_for_output();
+                    self.turns[idx].outputs.push(SpeechOutLine {
+                        text: text.trim().to_owned(),
+                        chunks: Vec::new(),
+                        glyphs: vec!["⇢".to_owned()],
+                    });
+                }
+                let mut note = "speech-out request received".to_owned();
+                if let Some(num_chunks) = value.get("num_chunks").and_then(|v| v.as_u64()) {
+                    note.push_str(&format!(" — {num_chunks} text chunks"));
+                }
+                self.note_event(value, note);
+            }
+            "speech_out_text_chunks" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                if let Some(chunks) = value.get("chunks").and_then(|v| v.as_array()) {
+                    let rendered_chunks = chunks
+                        .iter()
+                        .filter_map(|c| c.as_str())
+                        .map(|c| c.trim().to_owned())
+                        .filter(|c| !c.is_empty())
+                        .collect::<Vec<_>>();
+                    let count = rendered_chunks.len();
+                    let total_chars: usize = rendered_chunks.iter().map(|c| c.len()).sum();
+                    if let Some(output) = self.turns[idx].outputs.last_mut() {
+                        output.chunks = rendered_chunks;
+                    }
+                    self.note_event(
+                        value,
+                        format!("speech-out text chunked: {count} chunks, {total_chars} chars"),
+                    );
+                }
+                self.push_output_glyph(idx, "✂");
+            }
+            "speech_out_synthesis_started" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                self.push_output_glyph(idx, "⌁");
+                let mut note = "speech-out synthesis started".to_owned();
+                if let Some(ms) = value
+                    .get("request_received_to_synthesis_started_ms")
+                    .and_then(|v| v.as_f64())
+                {
+                    note.push_str(&format!(" ({ms:.1}ms setup)"));
+                }
+                self.note_event(value, note);
+            }
+            "speech_out_audio_chunk" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                let seq = value
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                if seq == 0 {
+                    self.push_output_glyph(idx, "▣");
+                    let bytes = value
+                        .get("bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_default();
+                    let mut note = format!("speech-out first audio chunk {bytes}b");
+                    if let Some(ms) = value
+                        .get("synthesis_started_to_first_audio_ms")
+                        .and_then(|v| v.as_f64())
+                    {
+                        note.push_str(&format!(" (ttfb={ms:.1}ms)"));
+                    }
+                    self.note_event(value, note);
+                }
+            }
+            "speech_out_completed" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                self.push_output_glyph(idx, "✓");
+                let bytes = value.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                let chunks = value
+                    .get("chunk_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let mut note = format!("speech-out completed: {bytes}b in {chunks} chunks");
+                if let Some(ms) = value
+                    .get("total_synthesis_duration_ms")
+                    .and_then(|v| v.as_f64())
+                {
+                    note.push_str(&format!(", {ms:.0}ms"));
+                }
+                if let Some(secs) = value.get("audio_duration_secs").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(", audio={secs:.1}s"));
+                }
+                if let Some(rtf) = value.get("realtime_factor").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(", rtf={rtf:.2}x"));
+                }
+                self.note_event(value, note);
+            }
+
+            "speech_out_skipped" if self.speech_out_ui => {
+                let reason = value
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                self.note_event(value, format!("speech-out skipped: {reason}"));
+            }
+            "speech_out_echo_suppressed" if self.speech_out_ui => {
+                let context = value
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("transcript");
+                self.note_event(value, format!("speech-out self-echo suppressed: {context}"));
+            }
+            "speech_out_barge_in" if self.speech_out_ui => {
+                if let Some(idx) = self.turns.len().checked_sub(1) {
+                    if !self.turns[idx].outputs.is_empty() {
+                        self.push_output_glyph(idx, "⏹");
+                    }
+                }
+                let trigger = value
+                    .get("trigger")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user_speech");
+                self.note_event(
+                    value,
+                    format!("speech-out cancelled by barge-in: {trigger}"),
+                );
+            }
+            "speech_out_playback_started" if self.speech_out_ui => {
+                let seq = value
+                    .get("playback_seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                self.note_event(value, format!("speech-out playback started: chunk {seq}"));
+            }
+            "speech_out_playback_completed" if self.speech_out_ui => {
+                let seq = value
+                    .get("playback_seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let mut note = format!("speech-out playback completed: chunk {seq}");
+                if let Some(ms) = value.get("playback_duration_ms").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(" ({ms:.0}ms)"));
+                }
+                self.note_event(value, note);
+            }
+            "speech_out_playback_failed" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                self.push_output_glyph(idx, "✗");
+                let seq = value
+                    .get("playback_seq")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                self.note_event(
+                    value,
+                    format!("speech-out playback failed: chunk {seq}: {message}"),
+                );
+            }
+            "speech_out_failed" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                self.push_output_glyph(idx, "✗");
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                self.note_event(value, format!("speech-out failed: {message}"));
+            }
+            "speech_out_params_updated" if self.speech_out_ui => {
+                let selected = value
+                    .get("selected")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let speed = value
+                    .get("speed")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "?".to_owned());
+                let steps = value
+                    .get("steps")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                let voice = value.get("voice").and_then(|v| v.as_str()).unwrap_or("?");
+                self.speech_out_params = Some(format!(
+                    "tuning  [j/k select, h/l adjust] selected={selected} speed={speed} steps={steps} voice={voice}"
+                ));
+                self.note_event(
+                    value,
+                    format!("speech-out tuning: selected={selected} speed={speed} steps={steps} voice={voice}"),
+                );
             }
             "vad_state" | "vad_meter" | "vad_frame" => {
                 let probability = value
@@ -449,20 +677,26 @@ impl TuiModel {
             "vad_acoustic_fallback" => {
                 let idx = self.ensure_turn();
                 self.push_wait(idx);
-                self.note(format!(
-                    "acoustic fallback armed at {}; low smoothed vad",
-                    sample_field_ms(value, "decision_sample")
-                ));
+                self.note_event(
+                    value,
+                    format!(
+                        "acoustic fallback armed at {}; low smoothed vad",
+                        sample_field_ms(value, "decision_sample")
+                    ),
+                );
             }
             "turn_human_hold" => {
                 let ms_without_tokens = value
                     .get("ms_without_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or_default();
-                self.note(format!(
-                    "human hold: speech-like audio for {} without new transcript tokens",
-                    format_ms(ms_without_tokens)
-                ));
+                self.note_event(
+                    value,
+                    format!(
+                        "human hold: speech-like audio for {} without new transcript tokens",
+                        format_ms(ms_without_tokens)
+                    ),
+                );
             }
             _ => {}
         }
@@ -480,7 +714,17 @@ impl TuiModel {
         if let Some(smart) = &self.smart_turn_config {
             out.push_str(&format!("{smart}\n"));
         }
-        out.push_str("glyphs  ◖ speech  ◗ pause  ①②③④ semantic checks  ◆ close  ↺ resume  · wait  ◇ unresolved/fallback\n\n");
+        out.push_str("glyphs  ◖ speech  ◗ pause  ①②③④ semantic checks  ◆ close  ↺ resume  · wait  ◇ unresolved/fallback\n");
+        if self.speech_out_ui {
+            out.push_str(
+                "output  ⇢ request  ✂ chunked  ⌁ synth  ▣ first-audio  ✓ done  ✗ failed\n",
+            );
+            if let Some(params) = &self.speech_out_params {
+                out.push_str(params);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
 
         let start = self.turns.len().saturating_sub(MAX_TUI_TURNS);
         for turn in &self.turns[start..] {
@@ -522,6 +766,16 @@ impl TuiModel {
             .filter(|idx| self.turns.get(*idx).is_some_and(|turn| !turn.closed))
     }
 
+    fn last_turn_for_output(&mut self) -> usize {
+        if let Some(idx) = self.current_open_turn() {
+            return idx;
+        }
+        if !self.turns.is_empty() {
+            return self.turns.len() - 1;
+        }
+        self.new_turn()
+    }
+
     fn new_turn(&mut self) -> usize {
         self.next_turn_number = self.next_turn_number.saturating_add(1);
         self.turns.push(TuiTurn {
@@ -529,6 +783,7 @@ impl TuiModel {
             sections: Vec::new(),
             text: String::new(),
             glyphs: Vec::new(),
+            outputs: Vec::new(),
             boundary: None,
             paused: false,
             closed: false,
@@ -551,6 +806,25 @@ impl TuiModel {
 
     fn push_wait(&mut self, idx: usize) {
         self.push_glyph(idx, "·");
+    }
+
+    fn push_output_glyph(&mut self, idx: usize, glyph: &str) {
+        if self.turns[idx].outputs.is_empty() {
+            self.turns[idx].outputs.push(SpeechOutLine {
+                text: "∅".to_owned(),
+                chunks: Vec::new(),
+                glyphs: Vec::new(),
+            });
+        }
+        let output = self.turns[idx].outputs.last_mut().expect("output exists");
+        if output
+            .glyphs
+            .last()
+            .is_some_and(|existing| existing == glyph)
+        {
+            return;
+        }
+        output.glyphs.push(glyph.to_owned());
     }
 
     fn push_vad_bar(
@@ -599,6 +873,15 @@ impl TuiModel {
         }
     }
 
+    fn note_event(&mut self, value: &Value, note: String) {
+        let note = if let Some(ms) = self.relative_event_ms(value) {
+            format!("+{ms:07.1}ms {note}")
+        } else {
+            note
+        };
+        self.note(note);
+    }
+
     fn note(&mut self, note: String) {
         if self.notes.back() == Some(&note) {
             return;
@@ -607,6 +890,52 @@ impl TuiModel {
         while self.notes.len() > MAX_TUI_NOTES {
             self.notes.pop_front();
         }
+    }
+
+    fn relative_event_ms(&mut self, value: &Value) -> Option<f64> {
+        let ns = event_mono_ns(value)?;
+        let first = *self.first_mono_ns.get_or_insert(ns);
+        Some(ns.saturating_sub(first) as f64 / 1_000_000.0)
+    }
+
+    fn handle_model_chunk_processed(&mut self, value: &Value) {
+        let changed = value
+            .get("result_changed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || value
+                .get("committed_changed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            || value
+                .get("tentative_changed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        let start = value
+            .get("chunk_source_sample_start")
+            .and_then(|v| v.as_u64())
+            .map(|s| format_ms(samples_to_ms(s)))
+            .unwrap_or_else(|| "?".to_owned());
+        let count = value
+            .get("chunk_sample_count")
+            .and_then(|v| v.as_u64())
+            .map(|s| format_ms(samples_to_ms(s)))
+            .unwrap_or_else(|| "?".to_owned());
+        let committed = value
+            .get("committed_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        let total = value
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        self.note_event(
+            value,
+            format!("↱ transcriber dispatch: audio @{start}+{count} tokens={committed}/{total}"),
+        );
     }
 }
 
@@ -625,8 +954,33 @@ impl TuiTurn {
             out.push('\n');
             out.push_str(&render_section(&current));
         }
+        for output in &self.outputs {
+            out.push('\n');
+            let glyphs = if output.glyphs.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", output.glyphs.join(" "))
+            };
+            out.push_str("  ");
+            out.push_str(&glyphs);
+            out.push('"');
+            out.push_str(&normalized_speech_out_text(output));
+            out.push('"');
+        }
         out
     }
+}
+
+fn normalized_speech_out_text(output: &SpeechOutLine) -> String {
+    if output.chunks.is_empty() {
+        return normalized_text(&output.text);
+    }
+    output
+        .chunks
+        .iter()
+        .map(|chunk| normalized_text(chunk))
+        .collect::<Vec<_>>()
+        .join(" ✂ ")
 }
 
 fn render_section(section: &TuiSection) -> String {
@@ -650,11 +1004,38 @@ fn render_section(section: &TuiSection) -> String {
     line
 }
 
+fn write_stdout_text(text: &str) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    if let Err(err) = handle.write_all(text.as_bytes()) {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        return Err(err).context("writing to stdout");
+    }
+    if let Err(err) = handle.flush() {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        return Err(err).context("flushing stdout");
+    }
+    Ok(())
+}
+
+fn write_stdout_line(text: &str) -> Result<()> {
+    write_stdout_text(&format!("{text}\n"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(path) = &args.replay_events {
         return replay_events(&args, path);
+    }
+    if args.stdin_events {
+        let stdin = io::stdin();
+        let reader = stdin.lock();
+        return process_event_lines(&args, reader, true);
     }
 
     let (mut ws, _) = connect_async(&args.url)
@@ -670,7 +1051,7 @@ async fn main() -> Result<()> {
         .await?;
 
     let mut transcript_state = TranscriptState::default();
-    let mut tui_model = TuiModel::default();
+    let mut tui_model = TuiModel::new(args.speech_out_ui);
 
     while let Some(msg) = ws.next().await {
         match msg? {
@@ -695,15 +1076,24 @@ async fn main() -> Result<()> {
 fn replay_events(args: &Args, path: &PathBuf) -> Result<()> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::new(file);
+    process_event_lines(args, reader, false)
+}
+
+fn process_event_lines<R: BufRead>(args: &Args, reader: R, live_render: bool) -> Result<()> {
     let mut transcript_state = TranscriptState::default();
-    let mut tui_model = TuiModel::default();
+    let mut tui_model = TuiModel::new(args.speech_out_ui);
     for line in reader.lines() {
         let line = line?;
-        handle_text_event(args, &line, &mut transcript_state, &mut tui_model, false)?;
+        handle_text_event(
+            args,
+            &line,
+            &mut transcript_state,
+            &mut tui_model,
+            live_render,
+        )?;
     }
-    if args.mode.is_tui() {
-        print!("{}", tui_model.render(args.mode.is_debug()));
-        io::stdout().flush()?;
+    if args.mode.is_tui() && !live_render {
+        write_stdout_text(&tui_model.render(args.mode.is_debug()))?;
     }
     Ok(())
 }
@@ -716,7 +1106,7 @@ fn handle_text_event(
     live_render: bool,
 ) -> Result<()> {
     match args.mode {
-        Mode::Jsonl => println!("{text}"),
+        Mode::Jsonl => write_stdout_line(text)?,
         Mode::Inject => {
             let value: Value = match serde_json::from_str(text) {
                 Ok(value) => value,
@@ -738,8 +1128,10 @@ fn handle_text_event(
             };
             tui_model.handle(&value);
             if live_render {
-                print!("\x1b[2J\x1b[H{}", tui_model.render(args.mode.is_debug()));
-                io::stdout().flush()?;
+                write_stdout_text(&format!(
+                    "\x1b[2J\x1b[H{}",
+                    tui_model.render(args.mode.is_debug())
+                ))?;
             }
         }
     }
@@ -1208,6 +1600,17 @@ fn sample_field_ms(value: &Value, field: &str) -> String {
 
 fn samples_to_ms(sample: u64) -> u64 {
     sample.saturating_mul(1_000) / SAMPLE_RATE
+}
+
+fn event_mono_ns(value: &Value) -> Option<u64> {
+    [
+        "daemon_mono_ns",
+        "ingress_receive_mono_ns",
+        "detector_end_mono_ns",
+        "model_feed_end_mono_ns",
+    ]
+    .iter()
+    .find_map(|field| value.get(*field).and_then(|v| v.as_u64()))
 }
 
 fn format_ms(ms: u64) -> String {

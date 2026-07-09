@@ -4,7 +4,7 @@ this is the reality as of the current working tree. if another doc disagrees, tr
 
 ## one-line summary
 
-`speech-core` is a rust speech runtime: laptop mic audio streams to the sfub daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, and smart turn v3 can semantically gate turn closure.
+`speech-core` is a rust speech runtime: laptop mic audio streams to the sfub daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, smart turn v3 can semantically gate turn closure, and speech-out provides the separate local tts/output seam.
 
 ## current live path
 
@@ -43,8 +43,8 @@ SPEECH_CORE_VAD_HANGOVER_FRAMES=3
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=600
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=1700
+SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
 SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
 SPEECH_CORE_SMART_TURN_THRESHOLD=0.5
@@ -53,7 +53,8 @@ SPEECH_CORE_SMART_TURN_CPU_COUNT=1
 SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
 SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
-SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7000
+SPEECH_CORE_TURN_TRANSCRIPT_SILENCE_CLOSE_MS=700
 SPEECH_CORE_EOU_MODEL_DIR=
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 ```
@@ -64,9 +65,9 @@ important translation:
 - silero vad uses its native 512-sample inference window at 16khz, about 32ms. transport frames may still be 20ms.
 - vad starts speech after 2 smoothed speech frames, roughly 64ms above threshold.
 - vad ends speech after 3 smoothed stopping frames, roughly 96ms below stop threshold.
-- turn manager ignores vad segments whose current vad segment duration is under 600ms.
+- turn manager ignores vad segments whose current vad segment duration is under 400ms.
 - smart turn runs after vad speech_end. with the default 3-frame hangover the first probe is at about +96ms after the assumed end sample; if incomplete and no speech resumes, the geometric schedule preserves checks at +192ms, +384ms, +768ms, and +1536ms.
-- if speech-like vad islands continue for 12s after the last committed transcript token without new tokens, the daemon emits `turn_human_hold`; this does not close the turn.
+- if speech-like vad islands continue for 7s after the last committed transcript token without new tokens, the daemon emits `turn_human_hold`; this does not close the turn.
 - smart turn timeout/unavailable/error fails open to vad close.
 - parakeet realtime eou is disabled by default.
 
@@ -90,7 +91,7 @@ smart turn timed out / was unavailable / failed
 turn manager emitted turn_closed source=vad degraded=true
 ```
 
-incomplete semantic decisions suppress immediate vad close. if the delayed recheck still holds and speech does not resume, acoustic fallback can close only after 3000ms of low-probability silence:
+incomplete semantic decisions suppress immediate vad close. if the delayed recheck still holds and speech does not resume, acoustic fallback can close only after 1700ms of low-probability silence:
 
 ```text
 vad_acoustic_fallback
@@ -157,3 +158,8 @@ SPEECH_CORE_SMART_TURN_MODEL_PATH=/home/sf/workspace/external/smart-turn-v3/smar
 ./scripts/install-sfub-daemon.sh
 ./scripts/sfnix-sync-build-adapter.sh
 ```
+
+
+## manual tui convention
+
+For manual substrate-contact testing, `speech-core-live-session --debug-tui` is the preferred diagnostic surface. `speech-out-live-session` defaults to the same debug TUI and appends the spoken response line after `turn_closed`, so the operator can see speech-in endpointing and speech-out generation in one place. The minimal transcript mode is for normal use, not tuning.
