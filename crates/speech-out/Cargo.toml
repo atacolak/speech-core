@@ -11,7 +11,7 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 speech-core-protocol = { path = "../speech-core-protocol" }
-tokio = { workspace = true, features = ["io-std", "process"] }
+tokio = { workspace = true, features = ["io-std", "process", "signal"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

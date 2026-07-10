@@ -1908,6 +1908,7 @@ async fn send_json_to_sink(
     Ok(())
 }
 
+#[allow(unused_assignments)]
 async fn run_play(args: PlayArgs) -> Result<()> {
     validate_synthesis_controls(args.steps, args.speed)?;
     let text = read_text(args.text.as_deref(), args.stdin).await?;
@@ -1955,9 +1956,46 @@ async fn run_play(args: PlayArgs) -> Result<()> {
     };
     let mut playback_chunk: Vec<u8> = Vec::new();
 
-    while let Some(message) = ws.next().await {
-        match message? {
-            Message::Text(text) => {
+    // Set up signal watchers so SIGTERM / SIGINT trigger a graceful
+    // WebSocket Cancel before the process exits.  This allows the shell
+    // harness (scripts/speech-out-live-session.sh) to send a normal
+    // SIGTERM instead of resorting to SIGKILL, and gives the daemon a
+    // chance to stop synthesis and emit `speech_out_cancelled`.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .ok();
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .ok();
+
+    let mut cancelled = false;
+    let mut done = false;
+    while !done {
+        let message = tokio::select! {
+            msg = ws.next() => msg,
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    let _ = s.recv().await;
+                    return true;
+                }
+                futures_util::future::pending::<bool>().await
+            } => {
+                cancelled = true;
+                done = true;
+                continue;
+            }
+            _ = async {
+                if let Some(ref mut s) = sigint {
+                    let _ = s.recv().await;
+                    return true;
+                }
+                futures_util::future::pending::<bool>().await
+            } => {
+                cancelled = true;
+                done = true;
+                continue;
+            }
+        };
+        match message {
+            Some(Ok(Message::Text(text))) => {
                 eprintln!("{text}");
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                     match value.get("event").and_then(|v| v.as_str()) {
@@ -2002,6 +2040,7 @@ async fn run_play(args: PlayArgs) -> Result<()> {
                                     "note": "client-side terminal playback completion; daemon speech_out_completed means synthesis stream delivered",
                                 }))?
                             );
+                            done = true;
                             break;
                         }
                         Some("speech_out_cancelled") => {
@@ -2026,17 +2065,52 @@ async fn run_play(args: PlayArgs) -> Result<()> {
                     }
                 }
             }
-            Message::Binary(bytes) => {
+            Some(Ok(Message::Binary(bytes))) => {
                 if args.output.is_some() {
                     output_wav_chunks.push(bytes);
                 } else {
                     playback_chunk.extend_from_slice(&bytes);
                 }
             }
-            Message::Close(_) => break,
+            Some(Ok(Message::Close(_))) => {
+                done = true;
+                break;
+            }
+            Some(Err(err)) => return Err(err.into()),
+            None => {
+                done = true;
+                break;
+            }
             _ => {}
         }
     }
+
+    if cancelled {
+        // Send a protocol-level Cancel to the daemon so it can stop
+        // synthesis and emit speech_out_cancelled rather than timing out.
+        let cancel_msg = serde_json::to_string(&json!({
+            "type": "cancel",
+            "utterance_id": utterance_id,
+            "reason": "client_signal",
+        }))?;
+        // Best-effort: the daemon or connection may already be gone.
+        let _ = ws.send(Message::Text(cancel_msg)).await;
+
+        eprintln!(
+            "{}",
+            serde_json::to_string(&json!({
+                "event": "speech_out_playback_cancelled",
+                "terminal": true,
+                "terminal_status": "cancelled",
+                "utterance_id": utterance_id,
+                "reason": "client_signal",
+                "client_mono_ns": now_mono_ns(),
+            }))?
+        );
+        // Discard accumulated playback chunk rather than playing it.
+        return Ok(());
+    }
+
     if let Some(output_path) = &args.output {
         let merged = merge_pcm_wavs(&output_wav_chunks).with_context(|| {
             format!(

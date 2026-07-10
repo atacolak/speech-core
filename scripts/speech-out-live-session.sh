@@ -1,5 +1,86 @@
 #!/usr/bin/env bash
+# shellcheck shell=bash
+# Hardened speech-out live session harness.
+# See tests/test-speech-out-live-session.sh for deterministic validation.
 set -euo pipefail
+
+# ── Clock-domain helpers ────────────────────────────────────────────────
+# The TUI event stream spans two clock domains:
+#   - Server/daemon events carry `daemon_mono_ns` (server CLOCK_MONOTONIC).
+#   - Client/playback events carry `client_mono_ns` (client CLOCK_MONOTONIC).
+#
+# Harness-emitted events (barge-in, param changes, echo suppression, etc.)
+# must NOT pretend to be in either domain by injecting a zero or fake
+# timestamp.  Instead, they carry two fields:
+#   - `diagnostic_mono_ns`:  harness-local elapsed ns since script start,
+#     computed from /proc/uptime (same CLOCK_MONOTONIC as client side).
+#   - `diagnostic_clock_origin`:  literal string "harness_local_monotonic"
+#     so renderers can display it differently or exclude it from timing
+#     calculations that assume a single domain.
+#
+# Server events pass through with their original `daemon_mono_ns`;
+# playback events pass through with their original `client_mono_ns`.
+
+# Snapshot of harness start in monotonic ns (or 0 if unavailable).
+_harness_start_ns=0
+_harness_start_ns_init() {
+  if [[ -r /proc/uptime ]]; then
+    local sec nsec
+    IFS=' .' read -r sec nsec _ < /proc/uptime 2>/dev/null || true
+    if [[ -n "$sec" && "$sec" =~ ^[0-9]+$ ]]; then
+      nsec="${nsec:-0}"
+      nsec="$(printf '%-09s' "$nsec" | tr ' ' '0')"
+      nsec="${nsec:0:9}"
+      _harness_start_ns="${sec}$(printf '%09d' "$((10#$nsec))" 2>/dev/null || printf '%09d' 0)"
+      return
+    fi
+  fi
+  _harness_start_ns=0
+}
+_harness_start_ns_init
+
+diagnostic_mono_ns() {
+  if (( _harness_start_ns == 0 )); then
+    printf '0'
+    return
+  fi
+  local sec nsec now_ns
+  if [[ -r /proc/uptime ]]; then
+    IFS=' .' read -r sec nsec _ < /proc/uptime 2>/dev/null || true
+    if [[ -n "$sec" && "$sec" =~ ^[0-9]+$ ]]; then
+      nsec="${nsec:-0}"
+      nsec="$(printf '%-09s' "$nsec" | tr ' ' '0')"
+      nsec="${nsec:0:9}"
+      now_ns="${sec}$(printf '%09d' "$((10#$nsec))" 2>/dev/null || printf '%09d' 0)"
+      # Emit elapsed ns since harness start as a bare number (no quotes in JSON).
+      printf '%s' "$(( now_ns - _harness_start_ns ))" 2>/dev/null || printf '0'
+      return
+    fi
+  fi
+  printf '0'
+}
+
+# ── JSON field extraction without per-line jq spawning ──────────────────
+# Extracts a string value for a top-level key from a flat-ish JSON object.
+# Avoids spawning jq for every event line; falls back to jq for nested objects.
+json_get_string() {
+  local key="$1" raw input
+  if IFS= read -r -d '' input 2>/dev/null || true; then
+    :
+  else
+    input="$(cat)"
+  fi
+  raw="$input"
+  # Attempt fast-path: extract "key":"value" with bash builtins.
+  local pat='"'"$key"'"[[:space:]]*:[[:space:]]*"([^"]*)"'
+  if [[ "$raw" =~ $pat ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$raw" | jq -r --arg k "$key" '.[$k] // ""' 2>/dev/null || true
+  else
+    printf '\n'
+  fi
+}
 
 env_file="${SPEECH_CORE_CONFIG_FILE:-$HOME/.config/speech-core/client.env}"
 # Preserve explicit environment values before sourcing defaults.
@@ -268,8 +349,8 @@ emit_ui_event() {
 }
 
 emit_params_event() {
-  emit_ui_event "$(printf '{"event":"speech_out_params_updated","stream_session_id":"%s","selected":"%s","speed":%s,"steps":%s,"voice":"%s"}' \
-    "$session_id" "$selected_param" "$speed" "$steps" "$voice")"
+  emit_ui_event "$(printf '{"event":"speech_out_params_updated","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","selected":"%s","speed":%s,"steps":%s,"voice":"%s"}' \
+    "$(diagnostic_mono_ns)" "$session_id" "$selected_param" "$speed" "$steps" "$voice")"
 }
 
 voice_index() {
@@ -319,32 +400,101 @@ select_param() {
 }
 
 keyboard_loop() {
+  local input_fd="$1"
+  if [[ ! -r "$input_fd" ]]; then
+    echo "keyboard: no readable input fd $input_fd — controls disabled" >&2
+    return 0
+  fi
   emit_params_event
   local key
-  while IFS= read -rsn1 key; do
+  # Save terminal settings so we can restore on exit.
+  local saved_stty
+  saved_stty="$(stty -g <"$input_fd" 2>/dev/null || true)"
+  if [[ -n "$saved_stty" ]]; then
+    stty raw -echo min 1 time 0 <"$input_fd" 2>/dev/null || true
+  fi
+  while IFS= read -rsn1 -t 0.25 key <"$input_fd" 2>/dev/null; do
+    [[ -z "$key" ]] && continue
     case "$key" in
       j) select_param 1 ;;
       k) select_param -1 ;;
       h) adjust_selected_param -1 ;;
       l) adjust_selected_param 1 ;;
       q) kill -INT $$ 2>/dev/null || true; break ;;
+      $'\x03') kill -INT $$ 2>/dev/null || true; break ;;  # Ctrl-C
     esac
   done
+  # Restore terminal.
+  if [[ -n "$saved_stty" ]]; then
+    stty "$saved_stty" <"$input_fd" 2>/dev/null || true
+  fi
 }
 
-# Keep stdin attached to this harness for key controls; event flow uses websockets/fifos.
-keyboard_loop &
-keyboard_pid=$!
+# Resolve the best keyboard input file descriptor.
+# Prefer /dev/tty for interactive sessions; fall back to stdin if it is a terminal;
+# otherwise leave keyboard disabled.
+_keyboard_fd=""
+if [[ -r /dev/tty && -c /dev/tty ]]; then
+  _keyboard_fd=/dev/tty
+elif [[ -t 0 ]]; then
+  _keyboard_fd=/dev/stdin
+fi
+if [[ -n "$_keyboard_fd" ]]; then
+  keyboard_loop "$_keyboard_fd" &
+  keyboard_pid=$!
+else
+  keyboard_pid=""
+  echo "keyboard: no tty available — j/k/h/l/q controls disabled (set SPEECH_OUT_NO_TTY_OK=1 to suppress this message)" >&2
+fi
+
+# ── Process management ──────────────────────────────────────────────────
+
+_kill_tree_timeout_secs="${SPEECH_OUT_KILL_TIMEOUT_SECS:-3}"
 
 kill_tree() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
   kill -0 "$pid" 2>/dev/null || return 0
-  local child
-  while IFS= read -r child; do
-    [[ -n "$child" ]] && kill_tree "$child"
-  done < <(pgrep -P "$pid" 2>/dev/null || true)
-  kill "$pid" 2>/dev/null || true
+
+  # Try to kill the entire process group first if the child is a group leader.
+  local pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
+    kill -TERM -"$pgid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+
+  # Wait briefly for graceful exit (0.1s per tick, timeout_secs * 10 ticks).
+  local waited=0 max_ticks=$(( _kill_tree_timeout_secs * 10 ))
+  while (( waited < max_ticks )); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1 2>/dev/null || true
+    waited=$((waited + 1))
+  done
+
+  # Escalate to SIGKILL.
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
+      kill -KILL -"$pgid" 2>/dev/null || true
+    else
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
+kill_tree_no_wait() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  local pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
+    kill -TERM -"$pgid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
 }
 
 tts_active() {
@@ -355,6 +505,12 @@ tts_active() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# ── Cancellation state tracking ─────────────────────────────────────────
+# Tracks whether the current speech-out was cancelled by user action
+# (barge-in, keyboard quit) vs natural completion or failure.
+_speech_out_cancelled=0
+_speech_out_cancel_reason=""
+
 cancel_speech_out() {
   local trigger="${1:-user_speech}"
   if ! tts_active; then
@@ -363,8 +519,22 @@ cancel_speech_out() {
   fi
   local pid
   pid="$(cat "$tts_pid_file" 2>/dev/null || true)"
+  _speech_out_cancelled=1
+  _speech_out_cancel_reason="$trigger"
+
   echo "[$(date --iso-8601=seconds)] barge-in ($trigger) -> cancel speech-out pid=$pid" >>"$trigger_log"
-  emit_ui_event "$(printf '{"event":"speech_out_barge_in","stream_session_id":"%s","trigger":"%s","tts_pid":%s}'     "$session_id" "$trigger" "${pid:-0}")"
+  emit_ui_event "$(printf '{"event":"speech_out_barge_in","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","trigger":"%s","tts_pid":%s}'     "$(diagnostic_mono_ns)" "$session_id" "$trigger" "${pid:-0}")"
+
+  # Attempt graceful termination via SIGTERM, then escalate after timeout.
+  # This distinguishes expected cancellation from a raw kill -9.
+  #
+  # Rationale: the script spawns `speech-out play` as a child process.
+  # `run_play` (crates/speech-out/src/main.rs) now sets up tokio signal
+  # watchers for SIGTERM/SIGINT.  On receipt it sends a protocol-level
+  # `Cancel` WebSocket message to the daemon (so the daemon stops
+  # synthesis and emits speech_out_cancelled), then exits cleanly.
+  # If the child does not exit within the timeout window, we escalate
+  # to SIGKILL.
   kill_tree "$pid"
   rm -f "$tts_pid_file"
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
@@ -436,7 +606,7 @@ suppress_self_echo_if_needed() {
   expected="$(current_tts_expected_text)"
   if echo_like_text "$heard" "$expected"; then
     echo "[$(date --iso-8601=seconds)] suppress self-echo ($context): heard=$(printf '%q' "$heard") expected=$(printf '%q' "$expected")" >>"$trigger_log"
-    emit_ui_event "$(printf '{"event":"speech_out_echo_suppressed","stream_session_id":"%s","context":"%s"}' "$session_id" "$context")"
+    emit_ui_event "$(printf '{"event":"speech_out_echo_suppressed","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","context":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$context")"
     return 0
   fi
   return 1
@@ -490,10 +660,7 @@ run_speech_out() {
   fi
 }
 
-json_get_string() {
-  local key="$1"
-  jq -r --arg key "$key" '.[$key] // ""' 2>/dev/null || true
-}
+
 
 turn_text=""
 barge_vad_seen=0
@@ -537,10 +704,10 @@ barge_vad_seen=0
           barge_vad_seen=0
           if [[ -z "${turn_text//[[:space:]]/}" ]]; then
             echo "[$(date --iso-8601=seconds)] turn_closed with empty transcript -> skip speech-out" >>"$trigger_log"
-            emit_ui_event "$(printf '{"event":"speech_out_skipped","stream_session_id":"%s","reason":"empty_transcript"}' "$session_id")"
+            emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"empty_transcript"}' "$(diagnostic_mono_ns)" "$session_id")"
           elif suppress_self_echo_if_needed "$turn_text" turn_closed; then
             echo "[$(date --iso-8601=seconds)] turn_closed self-echo -> skip speech-out" >>"$trigger_log"
-            emit_ui_event "$(printf '{"event":"speech_out_skipped","stream_session_id":"%s","reason":"self_echo"}' "$session_id")"
+            emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"self_echo"}' "$(diagnostic_mono_ns)" "$session_id")"
           else
             cancel_speech_out new_response
             run_speech_out &
@@ -553,27 +720,84 @@ barge_vad_seen=0
     done &
 watch_pid=$!
 
-adapter_pid=""
-cleaned_up=0
+# ── Cleanup and signal handling ─────────────────────────────────────────
+#
+# Design constraints:
+# 1. First SIGINT triggers exactly one idempotent cleanup path.
+# 2. Nested signals (double Ctrl-C) are ignored after the first.
+# 3. No parent wait deadlock — all child waits have timeouts.
+# 4. trap is only on INT TERM (not EXIT) — the explicit cleanup call at
+#    script end handles the normal-exit path, preventing double-invocation
+#    from EXIT firing after a signal-driven cleanup.
+
+_signal_received=0
+_cleaned_up=0
+
+_on_signal() {
+  # Ignore nested signals: the first one owns cleanup.
+  if (( _signal_received )); then
+    echo "" >&2
+    echo "signal already handled; waiting for cleanup to finish..." >&2
+    return
+  fi
+  _signal_received=1
+  printf '\n' >&2
+  echo "received signal — shutting down..." >&2
+  cleanup
+}
+
 reap_stale_session_processes() {
   local sid="$1"
-  pgrep -af "speech-core-watch .*--stream-session-id $sid" | awk '{print $1}' | while read -r pid; do
-    [[ -n "$pid" ]] && kill_tree "$pid"
+  # Non-recursive: list and kill in one pass.
+  local pids
+  pids="$(pgrep -af "speech-core-watch .*--stream-session-id $sid" 2>/dev/null | awk '{print $1}' || true)"
+  for pid in $pids; do
+    [[ -n "$pid" ]] && kill_tree_no_wait "$pid"
   done
 }
+
 cleanup() {
-  if [[ "$cleaned_up" == 1 ]]; then return; fi
-  cleaned_up=1
+  # Idempotent: only execute once regardless of how many times called.
+  if (( _cleaned_up )); then
+    return 0
+  fi
+  _cleaned_up=1
+
+  # Cancel any active speech-out before tearing down processes.
   cancel_speech_out session_end || true
-  if [[ -n "${adapter_pid:-}" ]]; then kill_tree "$adapter_pid"; wait "$adapter_pid" 2>/dev/null || true; fi
-  sleep "${SPEECH_CORE_FINAL_WAIT_SECS:-1}"
+
+  # Terminate adapter with a brief wait (not indefinite).
+  if [[ -n "${adapter_pid:-}" ]]; then
+    kill_tree "$adapter_pid"
+    wait "$adapter_pid" 2>/dev/null || true
+  fi
+
+  # Close the event fifo writer so watchers see EOF.
   exec 3>&- 2>/dev/null || true
-  kill_tree "${keyboard_pid:-}"
-  kill_tree "$watch_pid"
-  kill_tree "$ui_pid"
-  wait "$watch_pid" "$ui_pid" "${keyboard_pid:-}" 2>/dev/null || true
+
+  # Terminate keyboard loop.
+  if [[ -n "${keyboard_pid:-}" ]]; then
+    kill_tree "$keyboard_pid"
+    wait "$keyboard_pid" 2>/dev/null || true
+    keyboard_pid=""
+  fi
+
+  # Terminate watchers.
+  if [[ -n "${watch_pid:-}" ]]; then
+    kill_tree "$watch_pid"
+    wait "$watch_pid" 2>/dev/null || true
+  fi
+  if [[ -n "${ui_pid:-}" ]]; then
+    kill_tree "$ui_pid"
+    wait "$ui_pid" 2>/dev/null || true
+  fi
+
+  # Reap any remaining session watchers.
   reap_stale_session_processes "$session_id" || true
-  rm -f "$event_fifo" "$param_update_fifo"
+
+  # Clean up named pipes.
+  rm -f "$event_fifo" "$param_update_fifo" 2>/dev/null || true
+
   echo
   echo "session ended"
   echo "  session_id: $session_id"
@@ -581,8 +805,12 @@ cleanup() {
   if [[ ${#record_arg[@]} -gt 0 ]]; then
     echo "  audio_wav:  $record_wav"
   fi
+  if (( _speech_out_cancelled )); then
+    echo "  cancelled:   $_speech_out_cancel_reason"
+  fi
 }
-trap cleanup INT TERM EXIT
+
+trap _on_signal INT TERM
 
 "$bin_dir/speech-core-mic-adapter" \
   --url "$core_ws_url" \
