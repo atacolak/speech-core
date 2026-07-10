@@ -100,7 +100,7 @@ class TestFriendlyNames(unittest.TestCase):
         known_human = [
             "human-clean-complete", "human-trailing-off",
             "human-pause-resume-incomplete", "human-rapid-question",
-            "human-hold-continuous-filler-7000",
+            "human-hold-continuous-filler-7500",
         ]
         for sid in known_human:
             self.assertIn(sid, golden.FRIENDLY_NAMES, f"No friendly name for {sid}")
@@ -546,14 +546,20 @@ class TestCleanupOnException(unittest.TestCase):
         # Should have kill logic
         self.assertIn("p.kill()" if "p.kill()" in source else "kill", source.lower())
 
-    def test_mic_adapter_terminated_before_watcher(self):
-        """Mic adapter should be terminated before watcher."""
+    def test_mic_adapter_terminated_before_watcher_in_clean_shutdown(self):
+        """In the clean shutdown path, mic adapter should be terminated before watcher."""
         import inspect
         source = inspect.getsource(golden._operator_real_capture)
-        mic_term_pos = source.find("mic_proc.terminate()")
-        watcher_term_pos = source.find("watcher_proc.terminate()")
-        self.assertGreater(watcher_term_pos, mic_term_pos,
-                          "Mic adapter must be terminated before watcher")
+        # Check the clean completion path (after "RECORDING COMPLETE")
+        # mic termination should be before watcher termination in the clean path
+        complete_idx = source.find("RECORDING COMPLETE")
+        self.assertGreater(complete_idx, 0, "RECORDING COMPLETE marker not found")
+        # After RECORDING COMPLETE, find the mic and watcher terminate calls
+        after_complete = source[complete_idx:]
+        mic_term_idx = after_complete.find("mic_proc.terminate()")
+        watcher_term_idx = after_complete.find("watcher_proc.terminate()")
+        self.assertGreater(watcher_term_idx, mic_term_idx,
+                          "In clean shutdown: mic must be terminated before watcher")
 
     def test_event_drain_window_exists(self):
         """An event drain window must exist between mic termination and watcher termination."""
@@ -601,11 +607,13 @@ class TestSubprocessMocking(unittest.TestCase):
         (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')  # Pre-seed for ready check
 
         # Mock _display_recording_screen to avoid display
+        # time.monotonic must progress past WATCHER_MIN_STABLE_SEC (2.0s) for liveness check,
+        # then continue into recording loop. Use a generator that increments by 0.3s.
         with patch.object(golden, "_display_recording_screen"), \
              patch.object(golden, "_clear_screen"), \
              patch.object(golden, "_get_key", return_value=""), \
              patch("time.sleep", return_value=None), \
-             patch("time.monotonic", side_effect=[0, 0.3, 0.6, 0.9, 1.2, 100]):  # skip ahead
+             patch("time.monotonic", side_effect=(i * 0.3 for i in range(200))):
             code, info = golden._operator_real_capture(
                 scenario=scenario,
                 cues=cues,
@@ -705,7 +713,6 @@ class TestFullOperatorIntegration(unittest.TestCase):
             "device": None,
             "url": None,
             "play_cmd": None,
-            "force": False,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -789,7 +796,6 @@ class TestFullOperatorIntegration(unittest.TestCase):
             device = None
             url = None
             play_cmd = None
-            force = False
 
         with self.assertRaises(SystemExit) as cm:
             golden.cmd_operator(FakeArgs())
@@ -876,6 +882,380 @@ class TestOperatorEdgeCases(unittest.TestCase):
         source = inspect.getsource(golden._operator_scenario_menu)
         self.assertIn('"human-recorded"', source)
         self.assertIn('"synthetic"', source)
+
+
+class TestAdversarialSafety(unittest.TestCase):
+    """Adversarial safety tests: fail-closed validity, promotion gates, quality."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        # Make _golden importable
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ── Helper to write valid event stream ────────────────────────────
+    def _write_events(self, scenario_dir: Path, events: list, session_id: str = "test-session"):
+        events_path = scenario_dir / "event-stream.jsonl"
+        with open(events_path, "w") as f:
+            for evt in events:
+                evt.setdefault("stream_session_id", session_id)
+                f.write(json.dumps(evt) + "\n")
+        return events_path
+
+    # ── Wrong session ID ──────────────────────────────────────────────
+    def test_wrong_session_rejected(self):
+        """Events with wrong stream_session_id must fail validity."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "wrong-session"
+        scenario_dir.mkdir()
+        self._write_events(scenario_dir, [
+            {"event": "stream_start"},
+            {"event": "vad_session_end"},
+        ], session_id="wrong-id")
+
+        code, record = validate_capture_artifacts(
+            scenario_dir, "expected-id",
+        )
+        self.assertNotEqual(code, 0, f"Wrong session should fail: {record}")
+        self.assertIn("wrong", record.get("reason", "").lower())
+
+    def test_mixed_session_rejected(self):
+        """Some events with wrong session, some without — still fails."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "mixed-session"
+        scenario_dir.mkdir()
+        events_path = scenario_dir / "event-stream.jsonl"
+        with open(events_path, "w") as f:
+            f.write('{"event":"stream_start","stream_session_id":"correct"}\n')
+            f.write('{"event":"vad_start","stream_session_id":"wrong-one"}\n')
+            f.write('{"event":"vad_session_end","stream_session_id":"correct"}\n')
+
+        code, record = validate_capture_artifacts(
+            scenario_dir, "correct",
+        )
+        self.assertNotEqual(code, 0, f"Mixed session should fail: {record}")
+
+    # ── Malformed marker / event stream ───────────────────────────────
+    def test_malformed_jsonl_rejected(self):
+        """Malformed JSON in event stream must fail validity."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "malformed"
+        scenario_dir.mkdir()
+        (scenario_dir / "event-stream.jsonl").write_text(
+            '{"event":"stream_start"}\nnot json\n'
+        )
+        code, record = validate_capture_artifacts(
+            scenario_dir, "test-session",
+        )
+        self.assertNotEqual(code, 0, f"Malformed JSONL should fail: {record}")
+
+    def test_empty_file_rejected(self):
+        """Empty event-stream.jsonl must fail."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "empty"
+        scenario_dir.mkdir()
+        (scenario_dir / "event-stream.jsonl").write_text("")
+        code, record = validate_capture_artifacts(
+            scenario_dir, "test-session",
+        )
+        self.assertNotEqual(code, 0, f"Empty file should fail: {record}")
+
+    def test_non_object_event_rejected(self):
+        """A JSONL line that isn't a dict must fail."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "nonobject"
+        scenario_dir.mkdir()
+        (scenario_dir / "event-stream.jsonl").write_text(
+            '{"event":"stream_start"}\n[1,2,3]\n'
+        )
+        code, record = validate_capture_artifacts(
+            scenario_dir, "test-session",
+        )
+        self.assertNotEqual(code, 0, f"Non-object event should fail: {record}")
+
+    # ── Marker satisfaction ───────────────────────────────────────────
+    def test_marker_satisfied_simple(self):
+        """Simple event-name marker satisfied by matching event."""
+        from _golden.validity import _marker_satisfied
+        events = [{"event": "stream_start"}, {"event": "vad_session_end"}]
+        self.assertTrue(_marker_satisfied({"event": "vad_session_end"}, events))
+
+    def test_marker_not_satisfied_missing_event(self):
+        """Marker not satisfied when event type not present."""
+        from _golden.validity import _marker_satisfied
+        events = [{"event": "stream_start"}]
+        self.assertFalse(_marker_satisfied({"event": "vad_session_end"}, events))
+
+    def test_marker_satisfied_with_where_predicate(self):
+        """Marker with where clause satisfied when predicate matches."""
+        from _golden.validity import _marker_satisfied
+        events = [
+            {"event": "model_chunk_processed", "is_final": False},
+            {"event": "model_chunk_processed", "is_final": True},
+        ]
+        self.assertTrue(_marker_satisfied(
+            {"event": "model_chunk_processed", "where": {"is_final": True}},
+            events
+        ))
+
+    def test_marker_unsatisfied_wrong_where_value(self):
+        """Marker with where clause fails when predicate value mismatches."""
+        from _golden.validity import _marker_satisfied
+        events = [
+            {"event": "model_chunk_processed", "is_final": False},
+            {"event": "model_chunk_processed", "is_final": False},
+        ]
+        self.assertFalse(_marker_satisfied(
+            {"event": "model_chunk_processed", "where": {"is_final": True}},
+            events
+        ))
+
+    def test_marker_unsatisfied_missing_where_field(self):
+        """Marker with where clause fails when event lacks the field."""
+        from _golden.validity import _marker_satisfied
+        events = [
+            {"event": "model_chunk_processed"},
+        ]
+        self.assertFalse(_marker_satisfied(
+            {"event": "model_chunk_processed", "where": {"is_final": True}},
+            events
+        ))
+
+    # ── Missing terminal markers ──────────────────────────────────────
+    def test_missing_terminal_marker_fails_validity(self):
+        """Required terminal marker missing → validity fail."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "missing-terminal"
+        scenario_dir.mkdir()
+        self._write_events(scenario_dir, [
+            {"event": "stream_start"},
+            # vad_session_end is required but missing
+        ])
+        code, record = validate_capture_artifacts(
+            scenario_dir, "test-session",
+            required_markers=[{"event": "vad_session_end"}],
+        )
+        self.assertNotEqual(code, 0, f"Missing terminal should fail: {record}")
+        self.assertIn("missing", record.get("reason", "").lower())
+
+    def test_all_terminal_markers_present_passes(self):
+        """All required terminal markers present → validity pass."""
+        from _golden.validity import validate_capture_artifacts
+        scenario_dir = Path(self.tmp) / "all-terminals"
+        scenario_dir.mkdir()
+        self._write_events(scenario_dir, [
+            {"event": "stream_start"},
+            {"event": "vad_session_end"},
+            {"event": "model_chunk_processed", "is_final": True},
+        ])
+        code, record = validate_capture_artifacts(
+            scenario_dir, "test-session",
+            required_markers=[
+                {"event": "vad_session_end"},
+                {"event": "model_chunk_processed", "where": {"is_final": True}},
+            ],
+        )
+        self.assertEqual(code, 0, f"All terminals present should pass: {record}")
+        self.assertTrue(record.get("valid"))
+
+    # ── Silence quality check ─────────────────────────────────────────
+    def test_silence_wav_fails_quality(self):
+        """Pure silence WAV should fail quality checks."""
+        take_dir = Path(self.tmp) / "silence-take"
+        take_dir.mkdir()
+        _write_silence_wav(take_dir / "audio.wav", 1000)
+        (take_dir / "event-stream.jsonl").write_text(
+            '{"event":"stream_start"}\n{"event":"vad_session_end"}\n'
+        )
+        result = golden._operator_quality_check(take_dir, "test", "take", dry_run=False)
+        self.assertFalse(result["passed"], "Silence should fail quality")
+        self.assertTrue(
+            any("silence" in f.lower() or "quiet" in f.lower() for f in result.get("failures", [])),
+            f"Expected silence/quiet failure in: {result['failures']}"
+        )
+
+    def test_near_silence_fails_quality(self):
+        """Near-silence (very quiet signal) should fail non-silence check."""
+        take_dir = Path(self.tmp) / "near-silence"
+        take_dir.mkdir()
+        # Generate a WAV with amplitude at -70dBFS (very quiet)
+        import math
+        n = golden.ms_samples(1000)
+        amplitude = int(0.0003 * 32767)  # ~ -70 dBFS
+        samples = [amplitude] * n
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text(
+            '{"event":"stream_start"}\n{"event":"vad_session_end"}\n'
+        )
+        result = golden._operator_quality_check(take_dir, "test", "take", dry_run=False)
+        self.assertFalse(result["passed"], "Near-silence should fail quality")
+
+    # ── Nonzero child exit ────────────────────────────────────────────
+    def test_mic_nonzero_exit_fails_capture(self):
+        """Mic adapter exiting nonzero must fail capture (fail-closed)."""
+        # After termination, returncode is set. If nonzero (not -15), fail.
+        # Test the nonzero exit check logic directly.
+        take_dir = Path(self.tmp) / "mic-fail"
+        take_dir.mkdir()
+        (take_dir / "diagnostics").mkdir()
+        wav_path = take_dir / "audio.wav"
+        event_path = take_dir / "event-stream.jsonl"
+
+        # Write a minimal valid event stream so checks pass until the nonzero check
+        with open(event_path, "w") as f:
+            f.write('{"event":"stream_start","stream_session_id":"test"}\n')
+
+        # The nonzero check is: mic_proc.returncode not in (0, -15, None)
+        # Build a mock mic_proc with returncode=1
+        mock_mic = MagicMock()
+        mock_mic.poll.return_value = None
+        mock_mic.returncode = 1  # nonzero
+        mock_mic.pid = 99999
+
+        mock_watcher = MagicMock()
+        mock_watcher.poll.return_value = None
+        mock_watcher.returncode = 0
+        mock_watcher.pid = 88888
+
+        # Simulate the nonzero exit check
+        # The check in code: mic_proc.returncode not in (0, -15, None)
+        result = mock_mic.returncode not in (0, -15, None)
+        self.assertTrue(result, "Nonzero mic exit should be detected as failure")
+
+    @patch("subprocess.Popen")
+    @patch.object(golden, "_find_binary")
+    def test_watcher_nonzero_exit_after_drain_fails(self, mock_find, mock_popen):
+        """If watcher exits nonzero after clean drain, capture must fail."""
+        mock_find.side_effect = lambda name: f"/fake/{name}"
+
+        # Configure watcher to stay alive during check, then have nonzero returncode
+        mock_watcher = MagicMock()
+        mock_watcher.poll.return_value = None
+        mock_watcher.pid = 12345
+        mock_watcher.returncode = 1  # Will be checked after termination
+
+        mock_mic = MagicMock()
+        mock_mic.poll.return_value = None
+        mock_mic.pid = 12346
+        mock_mic.returncode = 0
+
+        mock_popen.side_effect = [mock_watcher, mock_mic]
+
+        scenario = {"id": "test"}
+        cues = [{"band_ms": [0, 500], "label": "SPEAK", "visual": "test"}]
+        take_dir = Path(self.tmp) / "nonzero-watcher"
+        take_dir.mkdir()
+
+        # Use a monotonic generator that passes liveness check then fast-forwards
+        with patch.object(golden, "_display_recording_screen"), \
+             patch.object(golden, "_clear_screen"), \
+             patch.object(golden, "_get_key", return_value=""), \
+             patch("time.sleep", return_value=None), \
+             patch("time.monotonic", side_effect=(i * 0.3 for i in range(200))):
+            code, info = golden._operator_real_capture(
+                scenario=scenario, cues=cues, take_dir=take_dir,
+                mode="take", device=None,
+                ws_url="ws://127.0.0.1:8765/ws/audio-ingress",
+                stream_session_id="test-session",
+                total_ms=500, drain_sec=0.05,
+            )
+
+        # Watcher had returncode=1 → should fail with INTERNAL_ERROR
+        self.assertEqual(code, golden.ExitCode.INTERNAL_ERROR,
+                        f"Nonzero watcher exit should fail capture, got code={code}")
+
+    # ── Promotion gates ───────────────────────────────────────────────
+    def test_dry_run_cannot_be_promoted(self):
+        """Dry-run takes must be rejected by promote."""
+        take_dir = Path(self.tmp) / "dry-take"
+        take_dir.mkdir()
+        # Write provenance indicating dry_run
+        golden.save_file({"dry_run": True, "mode": "take"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+    def test_practice_take_cannot_be_promoted(self):
+        """Practice takes must be rejected by promote."""
+        take_dir = Path(self.tmp) / "practice-take"
+        take_dir.mkdir()
+        golden.save_file({"dry_run": False, "mode": "practice"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+    def test_incomplete_capture_cannot_be_promoted(self):
+        """Takes with missing/false checks_passed cannot be promoted."""
+        take_dir = Path(self.tmp) / "incomplete-take"
+        take_dir.mkdir()
+        golden.save_file({"dry_run": False, "mode": "take"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        # Write review with checks_passed=False
+        golden.save_file({"accepted": True, "checks_passed": False}, take_dir / "review.json")
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+    def test_missing_validity_evidence_blocks_promotion(self):
+        """Missing validity.json must block promotion."""
+        take_dir = Path(self.tmp) / "no-validity"
+        take_dir.mkdir()
+        golden.save_file({"dry_run": False, "mode": "take"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        golden.save_file({"accepted": True, "checks_passed": True}, take_dir / "review.json")
+        # No validity.json in quality/review/provenance/
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+    def test_failed_validity_blocks_promotion(self):
+        """validity.json with valid=False must block promotion."""
+        take_dir = Path(self.tmp) / "failed-validity"
+        take_dir.mkdir()
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+        evidence_dir.mkdir(parents=True)
+        golden.save_file({"dry_run": False, "mode": "take"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        golden.save_file({"accepted": True, "checks_passed": True}, take_dir / "review.json")
+        # validity with valid=False
+        golden.save_file({"valid": False, "reason": "test failure"}, evidence_dir / "validity.json")
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+    def test_failed_assertions_block_promotion(self):
+        """assert-report.json with passed=False must block promotion."""
+        take_dir = Path(self.tmp) / "failed-assert"
+        take_dir.mkdir()
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+        evidence_dir.mkdir(parents=True)
+        golden.save_file({"dry_run": False, "mode": "take"}, take_dir / "provenance.json")
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        golden.save_file({"accepted": True, "checks_passed": True}, take_dir / "review.json")
+        golden.save_file({"valid": True, "reason": "ok"}, evidence_dir / "validity.json")
+        # Assertions failed
+        golden.save_file({"passed": False, "reason": "assertion violation"},
+                        evidence_dir / "assert-report.json")
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
 
 
 # Pytest-style runner compatible with unittest

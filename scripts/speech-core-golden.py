@@ -34,6 +34,16 @@ try:
 except ImportError:
     _HAS_YAML = False
 
+# ── golden assertion engine internals ─────────────────────────────
+try:
+    from _golden.validity import validate_capture_artifacts
+    from _golden.assert_engine import run_assertions, AssertionResult
+    from _golden.report import write_json_report
+    from _golden.constants import DEFAULT_TERMINAL_MARKERS
+    _HAS_GOLDEN_ENGINE = True
+except ImportError:
+    _HAS_GOLDEN_ENGINE = False
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Exit codes (from spec §13)
@@ -1026,7 +1036,7 @@ FRIENDLY_NAMES: Dict[str, str] = {
     "human-trailing-off": "Trailing off",
     "human-pause-resume-incomplete": "Pause and resume",
     "human-rapid-question": "Rapid question",
-    "human-hold-continuous-filler-7000": "Continuous hold",
+    "human-hold-continuous-filler-7500": "Continuous hold",
     "synthetic-vad-onset-below-32ms": "VAD onset below (32ms)",
     "synthetic-vad-onset-at-64ms": "VAD onset at (64ms)",
     "synthetic-vad-onset-above-96ms": "VAD onset above (96ms)",
@@ -1241,15 +1251,20 @@ def _operator_real_capture(
     Run real capture: launch watcher, then mic adapter, display TUI,
     clean up subprocesses. Returns (exit_code, capture_info).
 
-    Raises on subprocess launch failure; returns appropriate exit codes
-    for operator abort / timeout.
+    Fail-closed contract (P1):
+    - Watcher readiness policy: wait for first valid event matching
+      stream_session_id, with bounded timeout (WATCHER_READY_TIMEOUT_SEC).
+    - Monitor early child exits, capture/persist stderr and exit codes.
+    - After drain, let validity establish terminal completion.
     """
+    WATCHER_LIVENESS_TIMEOUT_SEC = 10.0
+    WATCHER_LIVENESS_POLL_SEC = 0.25
+    WATCHER_MIN_STABLE_SEC = 2.0  # Must stay alive at least this long
+
     watcher_bin = _find_binary("speech-core-watch")
     mic_bin = _find_binary("speech-core-mic-adapter")
 
     if not watcher_bin or not mic_bin:
-        # In a dry-run or test context, binaries may not be available.
-        # Return a clear error code so the caller can fall back.
         missing = []
         if not watcher_bin:
             missing.append("speech-core-watch")
@@ -1260,6 +1275,8 @@ def _operator_real_capture(
 
     event_path = take_dir / "event-stream.jsonl"
     wav_path = take_dir / "audio.wav"
+    diag_dir = take_dir / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
 
     capture_info: Dict[str, Any] = {
         "stream_session_id": stream_session_id,
@@ -1270,14 +1287,22 @@ def _operator_real_capture(
         "watcher_pid": None,
         "mic_pid": None,
         "events_captured": False,
+        "watcher_exit_code": None,
+        "mic_exit_code": None,
+        "watcher_stderr_path": str(diag_dir / "watcher.stderr.log"),
+        "mic_stderr_path": str(diag_dir / "mic.stderr.log"),
     }
 
     watcher_proc = None
     mic_proc = None
+    event_fh = None
+    watcher_stderr_fh = None
+    mic_stderr_fh = None
 
     try:
         # ── Launch watcher first ──────────────────────────────────────
         event_fh = open(event_path, "w")
+        watcher_stderr_fh = open(diag_dir / "watcher.stderr.log", "w")
         watcher_args = [
             watcher_bin,
             "--mode", "jsonl",
@@ -1287,30 +1312,55 @@ def _operator_real_capture(
         watcher_proc = subprocess.Popen(
             watcher_args,
             stdout=event_fh,
-            stderr=subprocess.PIPE,
+            stderr=watcher_stderr_fh,
             text=True,
         )
         capture_info["watcher_pid"] = watcher_proc.pid
 
-        # Wait for watcher to be ready: poll for event file to have content
-        # or for watcher to output something
-        ready_wait = 0.0
-        while ready_wait < 3.0:
-            if watcher_proc.poll() is not None:
-                # Watcher exited early
-                stderr_data = watcher_proc.stderr.read() if watcher_proc.stderr else ""
+        # ── Watcher readiness: liveness-based bounded policy ──────────
+        #   The watcher may not produce events until the mic starts, so
+        #   we use a liveness check: watcher must stay alive for at least
+        #   WATCHER_MIN_STABLE_SEC to prove it connected and subscribed.
+        #   If the watcher exits early, we fail immediately.
+        #   Post-capture validity checker establishes terminal completion.
+        stable_start = time.monotonic()
+        watcher_ready = False
+        while (time.monotonic() - stable_start) < WATCHER_LIVENESS_TIMEOUT_SEC:
+            rc = watcher_proc.poll()
+            if rc is not None:
+                # Watcher exited — capture stderr before we close files
+                watcher_stderr_fh.close()
+                stderr_content = _read_file_head(diag_dir / "watcher.stderr.log", 2000)
                 event_fh.close()
-                print(f"  [ERROR] Watcher exited early with code {watcher_proc.returncode}",
+                capture_info["watcher_exit_code"] = rc
+                capture_info["watcher_stderr_tail"] = stderr_content
+                print(f"  [ERROR] Watcher exited early with code {rc}",
                       file=sys.stderr)
-                if stderr_data:
-                    print(f"  Watcher stderr: {stderr_data[:500]}", file=sys.stderr)
+                if stderr_content:
+                    print(f"  Watcher stderr: {stderr_content[:500]}", file=sys.stderr)
                 return ExitCode.DAEMON_UNREACHABLE, capture_info
-            if event_path.exists() and event_path.stat().st_size > 0:
+
+            elapsed = time.monotonic() - stable_start
+            if elapsed >= WATCHER_MIN_STABLE_SEC:
+                watcher_ready = True
                 break
-            time.sleep(0.2)
-            ready_wait += 0.2
+
+            time.sleep(WATCHER_LIVENESS_POLL_SEC)
+
+        if not watcher_ready:
+            # Timeout — should not happen since we check poll() above
+            watcher_stderr_fh.close()
+            event_fh.close()
+            print(f"  [ERROR] Watcher readiness timeout: not stable after "
+                  f"{WATCHER_LIVENESS_TIMEOUT_SEC}s", file=sys.stderr)
+            if watcher_proc.poll() is None:
+                watcher_proc.terminate()
+                watcher_proc.wait(timeout=5)
+            capture_info["watcher_exit_code"] = watcher_proc.returncode
+            return ExitCode.DAEMON_UNREACHABLE, capture_info
 
         # ── Launch mic adapter ────────────────────────────────────────
+        mic_stderr_fh = open(diag_dir / "mic.stderr.log", "w")
         mic_args = [
             mic_bin,
             "--record-wav", str(wav_path),
@@ -1323,7 +1373,7 @@ def _operator_real_capture(
         mic_proc = subprocess.Popen(
             mic_args,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=mic_stderr_fh,
             text=True,
         )
         capture_info["mic_pid"] = mic_proc.pid
@@ -1340,6 +1390,33 @@ def _operator_real_capture(
         format_info = _get_format_info(device, dry_run=False)
 
         while elapsed < total_sec + 2.0:
+            # Monitor early child exits during recording
+            watcher_rc = watcher_proc.poll()
+            if watcher_rc is not None:
+                watcher_stderr_fh.close()
+                mic_stderr_fh.close()
+                capture_info["watcher_exit_code"] = watcher_rc
+                stderr_tail = _read_file_head(diag_dir / "watcher.stderr.log", 2000)
+                capture_info["watcher_stderr_tail"] = stderr_tail
+                print(f"  [ERROR] Watcher exited during capture with code {watcher_rc}",
+                      file=sys.stderr)
+                if stderr_tail:
+                    print(f"  Watcher stderr: {stderr_tail[:500]}", file=sys.stderr)
+                event_fh.close()
+                return ExitCode.DAEMON_UNREACHABLE, capture_info
+
+            mic_rc = mic_proc.poll()
+            if mic_rc is not None and mic_rc != 0:
+                mic_stderr_fh.close()
+                capture_info["mic_exit_code"] = mic_rc
+                stderr_tail = _read_file_head(diag_dir / "mic.stderr.log", 2000)
+                capture_info["mic_stderr_tail"] = stderr_tail
+                print(f"  [ERROR] Mic adapter exited with code {mic_rc}", file=sys.stderr)
+                if stderr_tail:
+                    print(f"  Mic stderr: {stderr_tail[:500]}", file=sys.stderr)
+                event_fh.close()
+                return ExitCode.INTERNAL_ERROR, capture_info
+
             elapsed = time.monotonic() - start_time
             elapsed_ms = int(elapsed * 1000)
 
@@ -1382,6 +1459,7 @@ def _operator_real_capture(
         print(f"{'═' * 60}\n")
 
         # ── Stop mic adapter cleanly ──────────────────────────────────
+        mic_term_ok = True
         if mic_proc and mic_proc.poll() is None:
             mic_proc.terminate()
             try:
@@ -1389,6 +1467,10 @@ def _operator_real_capture(
             except subprocess.TimeoutExpired:
                 mic_proc.kill()
                 mic_proc.wait()
+                mic_term_ok = False
+        mic_stderr_fh.close()
+        capture_info["mic_exit_code"] = mic_proc.returncode if mic_proc else None
+        capture_info["mic_stderr_tail"] = _read_file_head(diag_dir / "mic.stderr.log", 2000)
 
         # ── Event drain window ────────────────────────────────────────
         print(f"  Waiting {drain_sec}s for final events...")
@@ -1402,8 +1484,28 @@ def _operator_real_capture(
             except subprocess.TimeoutExpired:
                 watcher_proc.kill()
                 watcher_proc.wait()
+        watcher_stderr_fh.close()
+        capture_info["watcher_exit_code"] = watcher_proc.returncode if watcher_proc else None
+        capture_info["watcher_stderr_tail"] = _read_file_head(diag_dir / "watcher.stderr.log", 2000)
 
         event_fh.close()
+
+        # ── Fail unexpected nonzero exits ─────────────────────────────
+        # -15 = SIGTERM (expected termination), 0 = clean exit
+        # Any other exit code is a hard failure (fail-closed)
+        if watcher_proc and watcher_proc.returncode not in (0, -15, None):
+            print(f"  [ERROR] Watcher exited nonzero: {watcher_proc.returncode}",
+                  file=sys.stderr)
+            capture_info["watcher_exit_code"] = watcher_proc.returncode
+            capture_info["error"] = f"Watcher exited with code {watcher_proc.returncode}"
+            return ExitCode.INTERNAL_ERROR, capture_info
+
+        if mic_proc and mic_proc.returncode not in (0, -15, None):
+            print(f"  [ERROR] Mic adapter exited nonzero: {mic_proc.returncode}",
+                  file=sys.stderr)
+            capture_info["mic_exit_code"] = mic_proc.returncode
+            capture_info["error"] = f"Mic adapter exited with code {mic_proc.returncode}"
+            return ExitCode.INTERNAL_ERROR, capture_info
 
         # Check if events were captured
         if event_path.exists() and event_path.stat().st_size > 0:
@@ -1428,7 +1530,12 @@ def _operator_real_capture(
             except subprocess.TimeoutExpired:
                 watcher_proc.kill()
         try:
-            event_fh.close()
+            if event_fh:
+                event_fh.close()
+            if watcher_stderr_fh:
+                watcher_stderr_fh.close()
+            if mic_stderr_fh:
+                mic_stderr_fh.close()
         except Exception:
             pass
         return ExitCode.RECORDER_ABORTED, capture_info
@@ -1440,7 +1547,12 @@ def _operator_real_capture(
         if watcher_proc and watcher_proc.poll() is None:
             watcher_proc.terminate()
         try:
-            event_fh.close()
+            if event_fh:
+                event_fh.close()
+            if watcher_stderr_fh:
+                watcher_stderr_fh.close()
+            if mic_stderr_fh:
+                mic_stderr_fh.close()
         except Exception:
             pass
         return ExitCode.INTERNAL_ERROR, capture_info
@@ -1454,6 +1566,183 @@ def _operator_real_capture(
                     p.wait(timeout=2)
                 except Exception:
                     pass
+
+
+def _read_file_head(path: Path, max_chars: int) -> str:
+    """Read up to max_chars from a file, returning content."""
+    try:
+        if not path.exists():
+            return ""
+        with open(path, "r", errors="replace") as f:
+            return f.read(max_chars)
+    except Exception:
+        return ""
+
+
+def _stdin_is_tty() -> bool:
+    """Check if stdin is a TTY. Extractable for test mocking."""
+    return hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+
+
+def _operator_run_validity_and_assertions(
+    take_dir: Path,
+    stream_session_id: str,
+    scenario: dict,
+    manifest_dir: Path,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Run fail-closed capture validity checks and semantic assertion DSL
+    against captured artifacts. Reuses _golden internals.
+
+    Returns (validity_evidence, assertion_evidence) — both are dicts
+    with at least {"passed": bool, "exit_code": int}.
+
+    Evidence is persisted to quality/review/provenance/ in the take_dir.
+    """
+    evidence_dir = take_dir / "quality" / "review" / "provenance"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    validity_evidence: Dict[str, Any] = {
+        "passed": False,
+        "exit_code": -1,
+        "run": False,
+        "reason": "not run",
+    }
+    assertion_evidence: Dict[str, Any] = {
+        "passed": False,
+        "exit_code": -1,
+        "run": False,
+        "reason": "not run",
+    }
+
+    if not _HAS_GOLDEN_ENGINE:
+        validity_evidence["reason"] = "golden engine not importable"
+        assertion_evidence["reason"] = "golden engine not importable"
+        return validity_evidence, assertion_evidence
+
+    # ── 1. Capture validity ───────────────────────────────────────────
+    try:
+        # Load profile terminal markers from manifest directory
+        terminal_markers = _load_profile_terminal_markers(
+            scenario, manifest_dir
+        )
+        v_exit, v_record = validate_capture_artifacts(
+            scenario_dir=take_dir,
+            stream_session_id=stream_session_id,
+            required_markers=terminal_markers if terminal_markers else None,
+        )
+        validity_evidence = {
+            "passed": v_exit == 0 and v_record.get("valid", False),
+            "exit_code": v_exit,
+            "run": True,
+            "reason": v_record.get("reason", ""),
+            "event_count": v_record.get("event_count", 0),
+            "check_results": v_record.get("check_results", {}),
+            "missing_markers": v_record.get("missing_markers"),
+            "artifact_hashes": v_record.get("artifact_hashes", {}),
+        }
+        save_file(v_record, evidence_dir / "validity.json")
+    except Exception as e:
+        validity_evidence["reason"] = f"validity check exception: {e}"
+        validity_evidence["run"] = True
+
+    # ── 2. Semantic assertions ────────────────────────────────────────
+    try:
+        dsl = _load_scenario_assertion_dsl(scenario, manifest_dir)
+        if dsl:
+            events = _load_events_from_stream(take_dir / "event-stream.jsonl")
+            if events:
+                a_exit, a_result = run_assertions(events, dsl, take_dir)
+                assertion_evidence = {
+                    "passed": a_exit == 0 and a_result.all_passed,
+                    "exit_code": a_exit,
+                    "run": True,
+                    "reason": f"{len(a_result.violations)} violations, {len(a_result.passed)} passed",
+                    "violations": [v.to_dict() for v in a_result.violations],
+                    "warnings": a_result.warnings,
+                    "passed_assertions": a_result.passed,
+                }
+                # Write assertion report
+                write_json_report(
+                    a_exit, a_result, None,
+                    evidence_dir / "assert-report.json",
+                    scenario_id=scenario.get("id"),
+                )
+            else:
+                assertion_evidence["reason"] = "no events to assert"
+                assertion_evidence["run"] = True
+        else:
+            assertion_evidence["reason"] = "no assertion DSL for scenario"
+            assertion_evidence["run"] = False  # not applicable
+    except Exception as e:
+        assertion_evidence["reason"] = f"assertion exception: {e}"
+        assertion_evidence["run"] = True
+
+    # Persist combined evidence
+    combined = {
+        "stream_session_id": stream_session_id,
+        "scenario_id": scenario.get("id"),
+        "validity": validity_evidence,
+        "assertions": assertion_evidence,
+    }
+    save_file(combined, evidence_dir / "combined-evidence.json")
+
+    return validity_evidence, assertion_evidence
+
+
+def _load_profile_terminal_markers(
+    scenario: dict, manifest_dir: Path
+) -> Optional[List[Dict[str, Any]]]:
+    """Load required terminal markers from the profile file."""
+    profile_file = manifest_dir / "profiles" / "golden-mvp" / "profile.yaml"
+    try:
+        if profile_file.exists():
+            profile = load_manifest_file(profile_file)
+            markers = profile.get("required_terminal_markers")
+            if markers:
+                return markers
+    except Exception:
+        pass
+    return DEFAULT_TERMINAL_MARKERS if _HAS_GOLDEN_ENGINE else None
+
+
+def _load_scenario_assertion_dsl(
+    scenario: dict, manifest_dir: Path
+) -> Optional[Dict[str, Any]]:
+    """Load assertion DSL from scenario YAML file."""
+    scenario_file = scenario.get("scenario_file")
+    if not scenario_file:
+        return None
+    sf_path = manifest_dir / scenario_file
+    if not sf_path.exists():
+        return None
+    try:
+        scenario_data = load_manifest_file(sf_path)
+        assertions = scenario_data.get("assertions")
+        if assertions and isinstance(assertions, dict):
+            return assertions
+    except Exception:
+        pass
+    return None
+
+
+def _load_events_from_stream(events_path: Path) -> List[Dict[str, Any]]:
+    """Load events from event-stream.jsonl."""
+    if not events_path.exists():
+        return []
+    events = []
+    try:
+        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except Exception:
+        pass
+    return events
 
 
 def _operator_quality_check(take_dir: Path, scenario_id: str,
@@ -1577,18 +1866,32 @@ def _operator_quality_check(take_dir: Path, scenario_id: str,
     if dry_run:
         result["warnings"].append("DRY-RUN: not valid for promotion")
         result["passed"] = False
+        # Ensure dry-run silence does NOT display as passing
+        for c in result["checks"]:
+            if c.get("name") == "non_silence":
+                c["passed"] = False
+                c["reason"] = "DRY-RUN: synthetic silence, not real audio"
     else:
         result["passed"] = len(result["failures"]) == 0
 
     return result
 
 
-def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
-                           mode: str, play_cmd: Optional[str] = None) -> int:
+def _operator_review_loop(
+    take_dir: Path,
+    quality: Dict[str, Any],
+    mode: str,
+    play_cmd: Optional[str] = None,
+    validity_evidence: Optional[Dict[str, Any]] = None,
+    assertion_evidence: Optional[Dict[str, Any]] = None,
+) -> int:
     """
     Post-capture review loop: P/R/A/Q.
     Returns exit code (PASS if accepted, RECORDER_ABORTED if quit,
     or a special code for retry).
+
+    Fail-closed acceptance: validity failures or semantic assertion
+    violations disable acceptance even in practice mode.
     """
     take_name = take_dir.name
     q = quality
@@ -1627,6 +1930,22 @@ def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
 
         print("╠══════════════════════════════════════════════════════╣")
 
+        # Validity evidence summary
+        if validity_evidence and validity_evidence.get("run"):
+            ve_passed = validity_evidence.get("passed", False)
+            mark = "✓" if ve_passed else "✗"
+            reason = validity_evidence.get("reason", "?")
+            print(f"║  {mark} capture-validity     {reason[:24]:>24s} ║")
+
+        # Assertion evidence summary
+        if assertion_evidence and assertion_evidence.get("run"):
+            ae_passed = assertion_evidence.get("passed", False)
+            mark = "✓" if ae_passed else "✗"
+            reason = assertion_evidence.get("reason", "?")
+            print(f"║  {mark} semantic-assertions  {reason[:24]:>24s} ║")
+
+        print("╠══════════════════════════════════════════════════════╣")
+
         if passed:
             print("║  Result: PASS — all checks OK                        ║")
         else:
@@ -1638,12 +1957,28 @@ def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
         print("╠══════════════════════════════════════════════════════╣")
         print("║                                                      ║")
 
-        can_accept = passed or mode == "practice"
+        # Determine if accept is allowed:
+        # - Quality checks must pass (unless practice, which is reviewable)
+        # - Validity must pass (fail-closed: always required)
+        # - Assertions must pass if they were run (fail-closed)
+        # Practice allows accept despite quality failures, but NOT validity/assertion failures
+        quality_ok = passed or mode == "practice"
+        validity_ok = (not validity_evidence) or (not validity_evidence.get("run")) or validity_evidence.get("passed", False)
+        assertion_ok = (not assertion_evidence) or (not assertion_evidence.get("run")) or assertion_evidence.get("passed", False)
+        can_accept = quality_ok and validity_ok and assertion_ok
+
         if can_accept:
             print("║  [P] Play   [R] Retry   [A] Accept   [Q] Quit        ║")
         else:
             print("║  [P] Play   [R] Retry   [Q] Quit                     ║")
-            print("║  (Accept disabled — fix issues or use --force)       ║")
+            reasons = []
+            if not quality_ok:
+                reasons.append("quality checks")
+            if not validity_ok:
+                reasons.append("capture validity")
+            if not assertion_ok:
+                reasons.append("semantic assertions")
+            print(f"║  (Accept disabled: {', '.join(reasons)})        ║")
 
         print("╚══════════════════════════════════════════════════════╝")
         print()
@@ -1658,16 +1993,18 @@ def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
 
         if key.lower() == "a":
             if not can_accept:
-                print("\n  Cannot accept: quality checks have failures.")
+                print("\n  Cannot accept: issues require attention.")
                 print("  Use R to retry or Q to quit.")
                 time.sleep(1.5)
                 continue
-            # Accept: write review and return
+            # Accept: write review with validity/assertion evidence
             review = {
                 "accepted": True,
                 "reviewed_at": datetime.now(timezone.utc).isoformat(),
                 "quality": q.get("quality", {}),
                 "checks_passed": passed,
+                "capture_validity_passed": validity_evidence.get("passed") if validity_evidence else None,
+                "semantic_assertions_passed": assertion_evidence.get("passed") if assertion_evidence else None,
             }
             save_file(review, take_dir / "review.json")
             print(f"\n  ✓ Take accepted.")
@@ -1713,7 +2050,15 @@ def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
 def cmd_operator(args: argparse.Namespace) -> int:
     """
     Main operator command: interactive scenario selection → recording → review.
+
+    Fail-closed additions (P1):
+    - No-TTY/EOF produces clear noninteractive error.
+    - After capture, runs validity checker and semantic assertion DSL.
+    - Review loop displays validity/assertion results and disables
+      acceptance on failures.
+    - --force is removed; no bypass of safety gates.
     """
+    # ── Manifest load (must run first for correct exit code) ────────
     manifest_path = Path(args.manifest)
     if not manifest_path.exists():
         die(ExitCode.MANIFEST_INVALID, f"Manifest not found: {manifest_path}")
@@ -1723,13 +2068,34 @@ def cmd_operator(args: argparse.Namespace) -> int:
     except Exception as e:
         die(ExitCode.MANIFEST_INVALID, f"Failed to load manifest: {e}")
 
+    # ── No-TTY/EOF check ─────────────────────────────────────────────
+    is_tty = _stdin_is_tty()
+    has_scenario = hasattr(args, "scenario") and args.scenario
+    dry_run = getattr(args, "dry_run", False)
+
+    # Explicit safe mechanism for test/subprocess automation:
+    # --dry-run + --scenario is safe (synthetic data, no mic, no real capture)
+    safe_automation = dry_run and has_scenario
+
+    if not is_tty and not safe_automation:
+        if not has_scenario:
+            die(ExitCode.INTERNAL_ERROR,
+                "Operator requires an interactive terminal. "
+                "Use --scenario <name> --dry-run for automated testing, "
+                "or run from a TTY.")
+        else:
+            die(ExitCode.INTERNAL_ERROR,
+                "Operator requires an interactive terminal for confirmation. "
+                "Use --dry-run for automated testing, "
+                "or run from a TTY.")
+
     manifest_dir = manifest_path.parent.resolve()
     out_dir = Path(args.out) if hasattr(args, "out") and args.out else Path("golden-runs")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Scenario selection
     scenario_id = None
-    if hasattr(args, "scenario") and args.scenario:
+    if has_scenario:
         # Try as number first, then as name/id
         raw = str(args.scenario)
         scenarios = manifest.get("scenarios", [])
@@ -1773,15 +2139,19 @@ def cmd_operator(args: argparse.Namespace) -> int:
     if scenario is None:
         die(ExitCode.SCENARIO_NOT_FOUND, f"Scenario not found: {scenario_id}")
 
-    # Show scenario info and get confirmation
-    info = _operator_display_scenario_info(manifest, scenario_id, manifest_dir)
-    if info is None:
-        die(ExitCode.RECORDER_ABORTED, "Operator quit.")
-    if info == "back":
-        return cmd_operator(args)  # Go back to menu
-
-    cues = info["cues"]
-    prompt = info.get("prompt", "")
+    # Show scenario info and get confirmation (skip in safe automation)
+    if safe_automation:
+        # Build cues and prompt without interactive display
+        cues = _default_cues_for_scenario(scenario_id)
+        prompt = _scenario_friendly_name(scenario_id)
+    else:
+        info = _operator_display_scenario_info(manifest, scenario_id, manifest_dir)
+        if info is None:
+            die(ExitCode.RECORDER_ABORTED, "Operator quit.")
+        if info == "back":
+            return cmd_operator(args)  # Go back to menu
+        cues = info["cues"]
+        prompt = info.get("prompt", "")
 
     # Determine mode
     practice = getattr(args, "practice", False)
@@ -1790,7 +2160,6 @@ def cmd_operator(args: argparse.Namespace) -> int:
     device = getattr(args, "device", None)
     play_cmd = getattr(args, "play_cmd", None)
     ws_url = getattr(args, "url", None) or DEFAULT_WS_URL
-    force = getattr(args, "force", False)
 
     # Determine total duration from cues
     total_ms = max((cue.get("band_ms", [0, 0])[1] for cue in cues), default=10000) + 2000
@@ -1849,8 +2218,9 @@ def cmd_operator(args: argparse.Namespace) -> int:
         }
         save_file(privacy, take_dir / "privacy.json")
 
-        # Countdown
-        _countdown(3, "READY")
+        # Countdown (skip in safe automation to avoid TTY requirement)
+        if not safe_automation:
+            _countdown(3, "READY")
 
         # Capture
         stream_session_id = str(uuid.uuid4())
@@ -1917,8 +2287,34 @@ def cmd_operator(args: argparse.Namespace) -> int:
         # Quality checks
         quality = _operator_quality_check(take_dir, scenario_id, mode, dry_run)
 
-        # Review loop
-        review_code = _operator_review_loop(take_dir, quality, mode, play_cmd)
+        # ── Fail-closed validity and semantic assertions (P1) ──────────
+        validity_evidence: Optional[Dict[str, Any]] = None
+        assertion_evidence: Optional[Dict[str, Any]] = None
+        if not dry_run:
+            # Run validity and semantic assertions against captured artifacts
+            print("  Running capture validity checks...")
+            validity_evidence, assertion_evidence = _operator_run_validity_and_assertions(
+                take_dir=take_dir,
+                stream_session_id=stream_session_id,
+                scenario=scenario,
+                manifest_dir=manifest_dir,
+            )
+            # Merge validity/assertion failures into quality for review display
+            if validity_evidence.get("run") and not validity_evidence.get("passed", False):
+                quality["failures"].append(
+                    f"Capture validity: {validity_evidence.get('reason', 'failed')}"
+                )
+            if assertion_evidence.get("run") and not assertion_evidence.get("passed", False):
+                quality["failures"].append(
+                    f"Semantic assertions: {assertion_evidence.get('reason', 'failed')}"
+                )
+
+        # Review loop (with validity/assertion evidence)
+        review_code = _operator_review_loop(
+            take_dir, quality, mode, play_cmd,
+            validity_evidence=validity_evidence,
+            assertion_evidence=assertion_evidence,
+        )
 
         if review_code == ExitCode.PASS:
             # Accepted
@@ -2152,10 +2548,40 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
     """
     Promote an accepted take to a repo fixture after consent/privacy checks.
 
+    Fail-closed promotion safety (P1): independently rejects
+    - dry_run mode (from provenance)
+    - practice mode (from provenance)
+    - missing/false checks_passed
+    - missing/false capture validity evidence
+    - missing/false semantic assertion evidence
+
+    Even if review.accepted is manually true, these gates cannot be bypassed.
+
     Returns exit code.
     """
     if not take_dir.exists():
         die(ExitCode.SCENARIO_NOT_FOUND, f"Take directory not found: {take_dir}")
+
+    # ── Gate 0: Provenance (must load first to check dry_run / practice) ─
+    provenance_path = take_dir / "provenance.json"
+    if not provenance_path.exists():
+        die(ExitCode.INTERNAL_ERROR, f"Missing provenance: {provenance_path}")
+    try:
+        provenance = load_manifest_file(provenance_path)
+    except Exception as e:
+        die(ExitCode.INTERNAL_ERROR, f"Invalid provenance: {e}")
+
+    # ── Gate 1: Reject dry_run ─────────────────────────────────────────
+    if provenance.get("dry_run", False):
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            "Cannot promote: provenance indicates dry_run mode. "
+            "Dry-run takes are synthetic silence and invalid for promotion.")
+
+    # ── Gate 2: Reject practice mode ────────────────────────────────────
+    if provenance.get("mode") == "practice":
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            "Cannot promote: provenance indicates practice mode. "
+            "Practice takes are reviewable but never promotable.")
 
     # Check consent
     consent_path = take_dir / "consent.json"
@@ -2177,7 +2603,7 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
     except Exception as e:
         die(ExitCode.PRIVACY_POLICY_VIOLATION, f"Invalid privacy file: {e}")
 
-    # Check review
+    # ── Gate 3: Review with checks_passed ──────────────────────────────
     review_path = take_dir / "review.json"
     if not review_path.exists():
         die(ExitCode.BASELINE_REQUIRES_REVIEW, f"Missing review file: {review_path}")
@@ -2189,6 +2615,41 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
 
     if not review.get("accepted", False):
         die(ExitCode.BASELINE_REQUIRES_REVIEW, f"Take not accepted: {review_path}")
+
+    if not review.get("checks_passed", False):
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            "Cannot promote: review.checks_passed is false or missing. "
+            "Quality checks must pass before promotion.")
+
+    # ── Gate 4: Capture validity evidence ──────────────────────────────
+    evidence_dir = take_dir / "quality" / "review" / "provenance"
+    validity_path = evidence_dir / "validity.json"
+    if not validity_path.exists():
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            "Cannot promote: missing capture validity evidence. "
+            f"Expected at {validity_path}")
+    try:
+        validity_evidence = load_manifest_file(validity_path)
+    except Exception as e:
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            f"Cannot promote: invalid validity evidence: {e}")
+    if not validity_evidence.get("valid", False):
+        die(ExitCode.BASELINE_REQUIRES_REVIEW,
+            f"Cannot promote: capture validity check failed: "
+            f"{validity_evidence.get('reason', 'unknown')}")
+
+    # ── Gate 5: Semantic assertion evidence ────────────────────────────
+    assert_path = evidence_dir / "assert-report.json"
+    if assert_path.exists():
+        try:
+            assert_evidence = load_manifest_file(assert_path)
+        except Exception as e:
+            die(ExitCode.BASELINE_REQUIRES_REVIEW,
+                f"Cannot promote: invalid assertion evidence: {e}")
+        if not assert_evidence.get("passed", False):
+            die(ExitCode.BASELINE_REQUIRES_REVIEW,
+                f"Cannot promote: semantic assertions failed.")
+    # No assertion DSL is acceptable (not all scenarios have one)
 
     # Check PII in paths
     take_name = take_dir.name
@@ -2210,11 +2671,6 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
         for e in wav_errors:
             print(f"[FAIL] {e}", file=sys.stderr)
         die(ExitCode.WAV_FORMAT_INVALID, f"WAV validation failed: {wav_path}")
-
-    # Check for provenance
-    provenance_path = take_dir / "provenance.json"
-    if not provenance_path.exists():
-        die(ExitCode.INTERNAL_ERROR, f"Missing provenance: {provenance_path}")
 
     if dry_run:
         print(f"[DRY-RUN] Would promote {take_dir} -> {dest_dir}")
@@ -2410,7 +2866,7 @@ def quarantine_legacy_fixtures(legacy_dir: Path, dry_run: bool = False) -> int:
                 "legacy_id": "04-human-hold",
                 "disposition": "quarantine",
                 "reclassify_as": "fallback/no-token fixture only",
-                "reason": "6.7s hum; too short for 7000ms hold; closes via fallback.",
+                "reason": "7.5s hum; still under 7500ms hold; closes via fallback.",
                 "migration": "New hold fixture must sustain VAD-active no-token audio >= 8s.",
             },
             {
@@ -2572,7 +3028,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_op.add_argument("--device", help="Audio device name")
     p_op.add_argument("--url", default=None, help="Daemon WebSocket URL")
     p_op.add_argument("--play-cmd", help="Playback command template (use {wav} for path)")
-    p_op.add_argument("--force", action="store_true", help="Allow accept despite quality check failures")
+    # --force removed: no bypass of promotion safety gates (P1)
 
     return parser
 

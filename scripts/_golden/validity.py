@@ -107,11 +107,9 @@ def validate_capture_artifacts(
 
     # ── 5. check terminal markers ────────────────────────────────────────
     if required_markers:
-        observed_types = {(e.get("event") or e.get("type")) for e in events}
         missing = []
         for marker in required_markers:
-            event_name = marker.get("event")
-            if event_name and event_name not in observed_types:
+            if not _marker_satisfied(marker, events):
                 missing.append(marker)
         if missing:
             record["reason"] = f"Missing terminal markers: {missing}"
@@ -173,6 +171,32 @@ def _load_and_validate_jsonl(path: Path) -> Tuple[EventStream, Optional[str]]:
                 return [], f"Event at line {line_no} is not a JSON object"
             events.append(event)
     return events, None
+
+
+def _marker_satisfied(marker: Dict[str, Any], events: EventStream) -> bool:
+    """Check if a required terminal marker is satisfied by any event in the stream.
+
+    Marker format:
+        {"event": "event_type_name"}  — simple event name match
+        {"event": "event_type_name", "where": {"field": "value", ...}}
+            — event name match + all where predicates hold
+
+    Returns True if at least one event matches the marker specification.
+    """
+    event_name = marker.get("event")
+    where_pred = marker.get("where")
+
+    for event in events:
+        evt_type = event.get("event") or event.get("type")
+        if evt_type != event_name:
+            continue
+        if where_pred:
+            # All where predicates must be satisfied
+            if all(event.get(k) == v for k, v in where_pred.items()):
+                return True
+        else:
+            return True
+    return False
 
 
 def _sha256_file(path: Path) -> str:
