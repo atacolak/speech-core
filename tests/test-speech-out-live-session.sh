@@ -508,6 +508,28 @@ fi
 
 echo ""
 
+# ── T10: authoritative transcript dispatch seam ────────────────────────
+
+echo "=== T10: transcript_committed is authoritative dispatch seam ==="
+
+if grep -q 'transcript_committed|turn_transcript_committed)' "$HARNESS"; then
+  pass "T10: harness handles transcript_committed"
+else
+  fail "T10: transcript_committed handler" "authoritative commit event not handled"
+fi
+if grep -q 'dispatch_turn_response transcript_committed' "$HARNESS"; then
+  pass "T10: transcript_committed dispatches response"
+else
+  fail "T10: transcript_committed dispatch" "authoritative event does not call dispatch"
+fi
+if grep -q 'turn_committed_seen.*!=.*1' "$HARNESS"; then
+  pass "T10: turn_closed is legacy-only fallback after commit"
+else
+  fail "T10: duplicate dispatch guard" "turn_closed lacks committed-event guard"
+fi
+
+echo ""
+
 # ── T9: run_play signal handling (Rust side) ────────────────────────────
 
 echo "=== T9: run_play signal → Cancel (Rust) ==="

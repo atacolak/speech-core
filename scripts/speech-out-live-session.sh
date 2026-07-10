@@ -662,7 +662,24 @@ run_speech_out() {
 
 
 
+dispatch_turn_response() {
+  local dispatch_source="${1:-turn_closed_legacy}"
+  if [[ -z "${turn_text//[[:space:]]/}" ]]; then
+    echo "[$(date --iso-8601=seconds)] $dispatch_source with empty transcript -> skip speech-out" >>"$trigger_log"
+    emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"empty_transcript","dispatch_source":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$dispatch_source")"
+  elif suppress_self_echo_if_needed "$turn_text" "$dispatch_source"; then
+    echo "[$(date --iso-8601=seconds)] $dispatch_source self-echo -> skip speech-out" >>"$trigger_log"
+    emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"self_echo","dispatch_source":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$dispatch_source")"
+  else
+    cancel_speech_out new_response
+    run_speech_out &
+    tts_pid=$!
+    printf '%s\n' "$tts_pid" >"$tts_pid_file"
+  fi
+}
+
 turn_text=""
+turn_committed_seen=0
 barge_vad_seen=0
 "$bin_dir/speech-core-watch" \
   --url "$core_ws_url" \
@@ -676,6 +693,7 @@ barge_vad_seen=0
       case "$event" in
         turn_started)
           turn_text=""
+          turn_committed_seen=0
           ;;
         transcript_token_committed)
           token="$(printf '%s
@@ -700,21 +718,22 @@ barge_vad_seen=0
         vad_speech_start)
           barge_vad_seen=1
           ;;
+        transcript_committed|turn_transcript_committed)
+          # Authoritative controller dispatch seam. Closed-turn text is immutable;
+          # do not infer it from cumulative updates or revise it after this event.
+          turn_text="$(printf '%s\n' "$line" | json_get_string text)"
+          turn_committed_seen=1
+          dispatch_turn_response transcript_committed
+          ;;
         turn_closed)
           barge_vad_seen=0
-          if [[ -z "${turn_text//[[:space:]]/}" ]]; then
-            echo "[$(date --iso-8601=seconds)] turn_closed with empty transcript -> skip speech-out" >>"$trigger_log"
-            emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"empty_transcript"}' "$(diagnostic_mono_ns)" "$session_id")"
-          elif suppress_self_echo_if_needed "$turn_text" turn_closed; then
-            echo "[$(date --iso-8601=seconds)] turn_closed self-echo -> skip speech-out" >>"$trigger_log"
-            emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"self_echo"}' "$(diagnostic_mono_ns)" "$session_id")"
-          else
-            cancel_speech_out new_response
-            run_speech_out &
-            tts_pid=$!
-            printf '%s\n' "$tts_pid" >"$tts_pid_file"
+          # Backward compatibility for older daemons that do not emit
+          # transcript_committed. New daemons dispatch exactly once above.
+          if [[ "$turn_committed_seen" != "1" ]]; then
+            dispatch_turn_response turn_closed_legacy
           fi
           turn_text=""
+          turn_committed_seen=0
           ;;
       esac
     done &
