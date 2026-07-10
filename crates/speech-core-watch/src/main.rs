@@ -190,6 +190,7 @@ struct TuiModel {
     speech_out_ui: bool,
     turns: Vec<TuiTurn>,
     current: Option<usize>,
+    last_closed: Option<usize>,
     next_turn_number: u64,
     notes: VecDeque<String>,
     live_vad_bar: String,
@@ -197,12 +198,30 @@ struct TuiModel {
     live_hold_bar: String,
     speech_out_params: Option<String>,
     first_mono_ns: Option<u64>,
-    last_transcript_display: String,
+    transcript: TuiTranscriptState,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TuiTranscriptState {
+    /// Last full transcript payload seen from the daemon. The daemon currently
+    /// sends cumulative transcript text, not turn-local deltas.
+    display: String,
+    /// Last processed transcript revision. Older revisions are ignored so replay
+    /// and live mode behave deterministically under out-of-order delivery.
+    revision: Option<i64>,
+    /// Authoritative owner for the current transcript stream, inferred from
+    /// turn_id when present or conservatively from currently-open/last-closed
+    /// turns when transcript_update lacks turn_id.
+    owner: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 struct TuiTurn {
     number: u64,
+    turn_id: Option<String>,
+    /// Full transcript prefix at the moment this TUI turn was opened. Used to
+    /// derive a turn-local segment from cumulative transcript_update payloads.
+    transcript_prefix: String,
     sections: Vec<TuiSection>,
     text: String,
     glyphs: Vec<String>,
@@ -260,7 +279,13 @@ impl TuiModel {
                     self.note(format!("runtime provenance: {id}"));
                 }
             }
-            "vad_session_start" => {
+            "turn_session_start" | "vad_session_start" => {
+                self.clear_live_timers();
+                if event == "turn_session_start" {
+                    self.note("turn session reset".to_owned());
+                    return;
+                }
+
                 let frame_ms = value.get("frame_ms").and_then(|v| v.as_u64()).unwrap_or(20);
                 let threshold = value
                     .get("threshold")
@@ -311,31 +336,34 @@ impl TuiModel {
                 self.note(format!("smart-turn ready: rechecks {offsets}"));
             }
             "transcript_token_committed" => {}
-            "transcript_update" => {
-                let committed = value
-                    .get("committed_text")
+            "transcript_update" => self.handle_transcript_update(value),
+            "turn_started" => {
+                let start_sample = value
+                    .get("start_sample")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let source = value
+                    .get("source")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let tentative = value
-                    .get("tentative_text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let display = format!("{committed}{tentative}");
-                if !display.is_empty() {
-                    let delta = display
-                        .strip_prefix(&self.last_transcript_display)
-                        .unwrap_or(&display);
-                    if !delta.is_empty() {
-                        let idx = self.turn_for_text();
-                        self.turns[idx].text.push_str(delta);
-                    }
-                }
-                self.last_transcript_display = display;
+                    .unwrap_or("turn");
+                let idx = self
+                    .turn_for_event(value)
+                    .or_else(|| self.current_open_turn())
+                    .unwrap_or_else(|| self.new_turn());
+                self.set_turn_id(idx, value);
+                self.note_event(
+                    value,
+                    format!(
+                        "turn started by {source} at {}",
+                        format_ms(samples_to_ms(start_sample))
+                    ),
+                );
             }
             "model_chunk_processed" if self.speech_out_ui => {
                 self.handle_model_chunk_processed(value);
             }
             "vad_speech_start" => {
+                self.clear_live_timers();
                 if let Some(idx) = self.current_open_turn() {
                     if self.turns[idx].paused {
                         self.push_glyph(idx, "↺");
@@ -480,7 +508,9 @@ impl TuiModel {
                 self.note_event(value, format!("no eou: {source}/{reason}"));
             }
             "turn_closed" => {
-                let idx = self.ensure_turn();
+                let idx = self
+                    .turn_for_event(value)
+                    .unwrap_or_else(|| self.ensure_turn());
                 let source = value.get("source").and_then(|v| v.as_str()).unwrap_or("?");
                 if matches!(source, "smart_turn" | "vad_acoustic_fallback") {
                     self.push_glyph(idx, "◆");
@@ -489,7 +519,10 @@ impl TuiModel {
                 }
                 self.turns[idx].closed = true;
                 self.turns[idx].paused = false;
+                self.set_turn_id(idx, value);
+                self.last_closed = Some(idx);
                 self.current = None;
+                self.clear_live_timers();
                 self.note_event(value, format!("turn closed by {source}"));
             }
             "speech_out_request_received" if self.speech_out_ui => {
@@ -683,6 +716,20 @@ impl TuiModel {
                     format!("speech-out tuning: selected={selected} speed={speed} steps={steps} voice={voice}"),
                 );
             }
+            "turn_session_end"
+            | "vad_session_end"
+            | "smart_turn_session_end"
+            | "eou_session_end" => {
+                self.clear_live_timers();
+                if event == "turn_session_end" {
+                    self.current = None;
+                    self.note_event(value, "turn session ended".to_owned());
+                }
+            }
+            "eou_state_reset" => {
+                self.clear_live_timers();
+                self.note_event(value, "endpointing state reset".to_owned());
+            }
             "vad_state" | "vad_meter" | "vad_frame" => {
                 let probability = value
                     .get("probability")
@@ -710,7 +757,11 @@ impl TuiModel {
                     .get("fallback_target_ms")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3500);
-                self.push_fallback_bar(fallback_progress, fallback_target);
+                if self.current_open_turn().is_some() && fallback_progress > 0 {
+                    self.push_fallback_bar(fallback_progress, fallback_target);
+                } else {
+                    self.live_fallback_bar.clear();
+                }
             }
             "turn_hold" => {
                 let hold_progress = value
@@ -721,7 +772,11 @@ impl TuiModel {
                     .get("hold_target_ms")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(7000);
-                self.push_hold_bar(hold_progress, hold_target);
+                if self.turn_for_event(value).is_some() && hold_progress > 0 {
+                    self.push_hold_bar(hold_progress, hold_target);
+                } else {
+                    self.live_hold_bar.clear();
+                }
             }
             "vad_acoustic_fallback" => {
                 let idx = self.ensure_turn();
@@ -817,13 +872,100 @@ impl TuiModel {
         self.current_open_turn().unwrap_or_else(|| self.new_turn())
     }
 
-    fn turn_for_text(&mut self) -> usize {
-        self.current_open_turn().unwrap_or_else(|| self.new_turn())
+    fn handle_transcript_update(&mut self, value: &Value) {
+        let revision = value.get("revision").and_then(|v| v.as_i64());
+        if let (Some(previous), Some(next)) = (self.transcript.revision, revision) {
+            if next < previous {
+                self.note_event(
+                    value,
+                    format!("ignored stale transcript revision {next} < {previous}"),
+                );
+                return;
+            }
+        }
+
+        let committed = value
+            .get("committed_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tentative = value
+            .get("tentative_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let display = format!("{committed}{tentative}");
+        self.transcript.revision = revision.or(self.transcript.revision);
+        self.transcript.display = display.clone();
+        if display.is_empty() {
+            return;
+        }
+
+        let idx = self.transcript_turn(value);
+        let local = if display.starts_with(&self.turns[idx].transcript_prefix) {
+            display[self.turns[idx].transcript_prefix.len()..].to_owned()
+        } else {
+            // Backward-compatible fallback for streams where the daemon/model resets
+            // cumulative transcript text between turns. Without a transcript turn_id,
+            // this is necessarily conservative: once a new acoustic turn is open it
+            // owns non-prefix updates; otherwise late updates remain attributed to
+            // the last transcript owner/closed turn to avoid ghost turns.
+            display
+        };
+        self.turns[idx].text = local;
+    }
+
+    fn transcript_turn(&mut self, value: &Value) -> usize {
+        if let Some(turn_id) = value.get("turn_id").and_then(|v| v.as_str()) {
+            if let Some(idx) = self.turns.iter().position(|turn| {
+                turn.turn_id.as_deref() == Some(turn_id) || (turn.turn_id.is_none() && !turn.closed)
+            }) {
+                if self.turns[idx].turn_id.is_none() {
+                    self.turns[idx].turn_id = Some(turn_id.to_owned());
+                }
+                self.transcript.owner = Some(idx);
+                return idx;
+            }
+            let idx = self.new_turn();
+            self.turns[idx].turn_id = Some(turn_id.to_owned());
+            self.transcript.owner = Some(idx);
+            return idx;
+        }
+
+        if let Some(idx) = self.current_open_turn() {
+            self.transcript.owner = Some(idx);
+            return idx;
+        }
+        if let Some(idx) = self
+            .transcript
+            .owner
+            .filter(|idx| self.turns.get(*idx).is_some())
+        {
+            return idx;
+        }
+        if let Some(idx) = self
+            .last_closed
+            .filter(|idx| self.turns.get(*idx).is_some())
+        {
+            self.transcript.owner = Some(idx);
+            return idx;
+        }
+        let idx = self.new_turn();
+        self.transcript.owner = Some(idx);
+        idx
     }
 
     fn current_open_turn(&self) -> Option<usize> {
         self.current
             .filter(|idx| self.turns.get(*idx).is_some_and(|turn| !turn.closed))
+    }
+
+    fn turn_for_event(&self, value: &Value) -> Option<usize> {
+        if let Some(turn_id) = value.get("turn_id").and_then(|v| v.as_str()) {
+            return self
+                .turns
+                .iter()
+                .position(|turn| turn.turn_id.as_deref() == Some(turn_id));
+        }
+        self.current_open_turn()
     }
 
     fn last_turn_for_output(&mut self) -> usize {
@@ -840,6 +982,8 @@ impl TuiModel {
         self.next_turn_number = self.next_turn_number.saturating_add(1);
         self.turns.push(TuiTurn {
             number: self.next_turn_number,
+            turn_id: None,
+            transcript_prefix: self.transcript.display.clone(),
             sections: Vec::new(),
             text: String::new(),
             glyphs: Vec::new(),
@@ -850,6 +994,7 @@ impl TuiModel {
         });
         let idx = self.turns.len() - 1;
         self.current = Some(idx);
+        self.transcript.owner = Some(idx);
         idx
     }
 
@@ -932,6 +1077,19 @@ impl TuiModel {
             progress_ms as f64 / 1000.0,
             target_ms as f64 / 1000.0
         );
+    }
+
+    fn clear_live_timers(&mut self) {
+        self.live_fallback_bar.clear();
+        self.live_hold_bar.clear();
+    }
+
+    fn set_turn_id(&mut self, idx: usize, value: &Value) {
+        if let Some(turn_id) = value.get("turn_id").and_then(|v| v.as_str()) {
+            if self.turns[idx].turn_id.is_none() {
+                self.turns[idx].turn_id = Some(turn_id.to_owned());
+            }
+        }
     }
 
     fn finalize_section(&mut self, idx: usize) {
@@ -1863,5 +2021,176 @@ mod tests {
         );
         let rendered = model.render(false);
         assert!(rendered.contains("①.10 ②.20 ③.30 ④.40 ◇"));
+    }
+
+    #[test]
+    fn tui_applies_punctuation_revision_after_close_without_ghost_turn() {
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","start_sample":0,"decision_sample":320}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"hello there","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"hello there.","tentative_text":""}),
+        );
+
+        assert_eq!(
+            model.turns.len(),
+            1,
+            "late punctuation must not create a ghost turn"
+        );
+        let rendered = model.render(false);
+        assert!(
+            rendered.contains("#01\n  ◖ \"hello there.\" ◆"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn tui_replaces_non_prefix_transcript_revision_instead_of_appending() {
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"i went there","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"I went there","tentative_text":""}),
+        );
+
+        assert_eq!(model.turns.len(), 1);
+        assert_eq!(model.turns[0].text, "I went there");
+        assert!(!model.render(false).contains("i went thereI went there"));
+    }
+
+    #[test]
+    fn tui_attaches_delayed_final_update_to_prior_closed_turn() {
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"almost final","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"vad","turn_id":"s:turn:0"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"almost final now","tentative_text":""}),
+        );
+
+        assert_eq!(model.turns.len(), 1);
+        assert_eq!(model.turns[0].text, "almost final now");
+        assert!(model.turns[0].closed);
+    }
+
+    #[test]
+    fn tui_opens_actual_new_turn_after_late_closed_turn_revision() {
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"first turn","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"first turn.","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":3,"committed_text":"first turn. second turn","tentative_text":""}),
+        );
+
+        assert_eq!(model.turns.len(), 2);
+        assert_eq!(model.turns[0].text, "first turn.");
+        assert_eq!(model.turns[1].text, " second turn");
+        let rendered = model.render(false);
+        assert!(
+            rendered.contains("#01\n  ◖ \"first turn.\" ◆"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("#02\n  ◖ \"second turn\""), "{rendered}");
+    }
+
+    #[test]
+    fn tui_clears_hold_and_fallback_bars_on_close_and_session_reset() {
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_started","stream_session_id":"s","turn_id":"s:turn:0","source":"vad","start_sample":0}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_frame","stream_session_id":"s","probability":0.9,"smoothed_probability":0.8,"silence_counter":1,"hangover_frames":5,"fallback_progress_ms":1200,"fallback_target_ms":3500}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_hold","stream_session_id":"s","turn_id":"s:turn:0","hold_progress_ms":2200,"hold_target_ms":7000}),
+        );
+        assert!(!model.live_fallback_bar.is_empty());
+        assert!(!model.live_hold_bar.is_empty());
+
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"vad","turn_id":"s:turn:0"}),
+        );
+        assert!(model.live_fallback_bar.is_empty());
+        assert!(model.live_hold_bar.is_empty());
+        let rendered_after_close = model.render(false);
+        assert!(
+            !rendered_after_close.contains("⏲ fallback"),
+            "{rendered_after_close}"
+        );
+        assert!(
+            !rendered_after_close.contains("⏸ hold"),
+            "{rendered_after_close}"
+        );
+
+        apply(
+            &mut model,
+            json!({"event":"vad_frame","stream_session_id":"s","probability":0.2,"smoothed_probability":0.2,"silence_counter":0,"hangover_frames":5,"fallback_progress_ms":700,"fallback_target_ms":3500}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_hold","stream_session_id":"s","turn_id":"s:turn:0","hold_progress_ms":800,"hold_target_ms":7000}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_session_start","stream_session_id":"s"}),
+        );
+        assert!(model.live_fallback_bar.is_empty());
+        assert!(model.live_hold_bar.is_empty());
     }
 }
