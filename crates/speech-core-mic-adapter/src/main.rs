@@ -15,7 +15,7 @@ use std::f32::consts::TAU;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -281,13 +281,14 @@ async fn run_cpal(
         .as_ref()
         .map(|path| WavRecorder::create(path, args.sample_rate_hz, args.channels))
         .transpose()?;
-    let (sender, receiver) = mpsc::sync_channel::<CapturedBuffer>(128);
-    let capture = start_capture_thread(
+    let (sender, receiver) = mpsc::sync_channel::<CapturedBuffer>(CAPTURE_CHANNEL_CAPACITY);
+    let buffer_pool = AudioBufferPool::default();
+    let capture = start_capture(
         args.device.clone(),
         args.sample_rate_hz,
         args.channels,
         sender,
-        recorder.clone(),
+        buffer_pool.clone(),
     )?;
 
     let mut ws = connect_ws(&args.url).await?;
@@ -319,26 +320,30 @@ async fn run_cpal(
 
         if captured.total_dropped_samples > last_total_dropped_samples {
             let buffered_to_discard = chunker.discard_buffered_sample_frames() as u64;
-            let dropped_samples = captured
-                .total_dropped_samples
-                .saturating_sub(last_total_dropped_samples)
-                .saturating_add(buffered_to_discard);
-            source_sample_start = source_sample_start.saturating_add(dropped_samples);
-            pending_gap = Some(SourceSampleGap {
-                dropped_samples,
-                dropped_frames_estimate: dropped_samples.div_ceil(sample_count as u64),
-                adapter_total_dropped_samples: captured.total_dropped_samples,
-                adapter_total_dropped_buffers: captured.total_dropped_buffers,
-                reason: "adapter_capture_channel_full".into(),
-            });
-            last_total_dropped_samples = captured.total_dropped_samples;
+            if let Some(gap) = source_gap_from_drop_totals(
+                captured.total_dropped_samples,
+                captured.total_dropped_buffers,
+                &mut last_total_dropped_samples,
+                buffered_to_discard,
+                sample_count as u64,
+            ) {
+                source_sample_start = source_sample_start.saturating_add(gap.dropped_samples);
+                pending_gap = Some(match pending_gap.take() {
+                    Some(existing) => merge_source_gaps(existing, gap, sample_count as u64),
+                    None => gap,
+                });
+            }
         }
 
-        for (samples, source_capture_mono_ns, timestamp_quality) in chunker.push(
-            captured.samples,
+        record_samples(&recorder, &captured.samples);
+        let frame_chunks = chunker.push(
+            &captured.samples,
             captured.first_sample_capture_mono_ns,
             captured.timestamp_quality,
-        ) {
+        );
+        buffer_pool.recycle(captured.samples);
+
+        for (samples, source_capture_mono_ns, timestamp_quality) in frame_chunks {
             let payload = encode_payload(&samples, args.format.into());
             let frame = build_frame(
                 &args.stream_id,
@@ -510,12 +515,12 @@ fn encode_payload(samples: &[f32], format: PcmFormat) -> Vec<u8> {
 
 struct CaptureHandle {
     _stream: cpal::Stream,
-    _thread: thread::JoinHandle<()>,
 }
 
-#[derive(Clone)]
 struct WavRecorder {
-    state: Arc<Mutex<Option<WavRecorderState>>>,
+    sender: Option<SyncSender<Vec<u8>>>,
+    worker: Option<thread::JoinHandle<()>>,
+    dropped_chunks: Arc<AtomicU64>,
 }
 
 struct WavRecorderState {
@@ -526,6 +531,8 @@ struct WavRecorderState {
 }
 
 impl WavRecorder {
+    const CHANNEL_CAPACITY: usize = 128;
+
     fn create(path: &PathBuf, sample_rate_hz: u32, channels: u16) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -535,62 +542,91 @@ impl WavRecorder {
             .with_context(|| format!("creating recorder wav {}", path.display()))?;
         write_wav_header(&mut file, channels, sample_rate_hz, 0)?;
         eprintln!("recording captured audio to {}", path.display());
+
+        let (sender, receiver) = mpsc::sync_channel(Self::CHANNEL_CAPACITY);
+        let dropped_chunks = Arc::new(AtomicU64::new(0));
+        let worker_dropped_chunks = Arc::clone(&dropped_chunks);
+        let worker = thread::Builder::new()
+            .name("speech-core-wav-recorder".to_owned())
+            .spawn(move || {
+                let mut state = WavRecorderState {
+                    file,
+                    sample_rate_hz,
+                    channels,
+                    data_bytes: 0,
+                };
+                if let Err(err) = run_wav_recorder_worker(&mut state, receiver) {
+                    eprintln!("recording wav worker failed: {err}");
+                }
+                let dropped = worker_dropped_chunks.load(Ordering::Relaxed);
+                if dropped > 0 {
+                    eprintln!(
+                        "recording wav dropped {dropped} chunks because recorder queue was full"
+                    );
+                }
+            })
+            .context("starting wav recorder worker")?;
+
         Ok(Self {
-            state: Arc::new(Mutex::new(Some(WavRecorderState {
-                file,
-                sample_rate_hz,
-                channels,
-                data_bytes: 0,
-            }))),
+            sender: Some(sender),
+            worker: Some(worker),
+            dropped_chunks,
         })
     }
 
     fn write_samples(&self, samples: &[f32]) {
-        let Ok(mut guard) = self.state.lock() else {
+        let Some(sender) = self.sender.as_ref() else {
             return;
         };
-        let Some(state) = guard.as_mut() else {
-            return;
-        };
-        let mut payload = Vec::with_capacity(samples.len() * 2);
-        for sample in samples {
-            let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-            payload.extend_from_slice(&scaled.to_le_bytes());
+        let payload = encode_wav_payload(samples);
+        match sender.try_send(payload) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_returned)) => {
+                self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_returned)) => {}
         }
-        if let Err(err) = state.file.seek(SeekFrom::End(0)) {
-            eprintln!("recording wav seek failed: {err}");
-            return;
-        }
-        if let Err(err) = state.file.write_all(&payload) {
-            eprintln!("recording wav sample failed: {err}");
-            return;
-        }
-        state.data_bytes = state
-            .data_bytes
-            .saturating_add(payload.len().min(u32::MAX as usize) as u32);
-        if let Err(err) = refresh_wav_header(state) {
-            eprintln!("recording wav header refresh failed: {err}");
-        }
+    }
+
+    #[cfg(test)]
+    fn dropped_chunks(&self) -> u64 {
+        self.dropped_chunks.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for WavRecorder {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.state) != 1 {
-            return;
-        }
-        let Ok(mut guard) = self.state.lock() else {
-            return;
-        };
-        if let Some(mut state) = guard.take() {
-            if let Err(err) = refresh_wav_header(&mut state) {
-                eprintln!("recording wav finalize failed: {err}");
-            }
-            if let Err(err) = state.file.flush() {
-                eprintln!("recording wav flush failed: {err}");
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("recording wav worker panicked");
             }
         }
     }
+}
+
+fn encode_wav_payload(samples: &[f32]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        payload.extend_from_slice(&scaled.to_le_bytes());
+    }
+    payload
+}
+
+fn run_wav_recorder_worker(
+    state: &mut WavRecorderState,
+    receiver: Receiver<Vec<u8>>,
+) -> Result<()> {
+    for payload in receiver {
+        state.file.write_all(&payload)?;
+        state.data_bytes = state
+            .data_bytes
+            .saturating_add(payload.len().min(u32::MAX as usize) as u32);
+    }
+    refresh_wav_header(state)?;
+    state.file.flush()?;
+    Ok(())
 }
 
 fn refresh_wav_header(state: &mut WavRecorderState) -> Result<()> {
@@ -647,18 +683,161 @@ struct CapturedBuffer {
     total_dropped_buffers: u64,
 }
 
+const CAPTURE_CHANNEL_CAPACITY: usize = 128;
+
 #[derive(Default)]
 struct DropCounters {
     samples: AtomicU64,
     buffers: AtomicU64,
 }
 
-fn start_capture_thread(
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DropTotals {
+    samples: u64,
+    buffers: u64,
+}
+
+#[derive(Clone, Default)]
+struct AudioBufferPool {
+    buffers: Arc<Mutex<Vec<Vec<f32>>>>,
+}
+
+impl AudioBufferPool {
+    const MAX_RETAINED_BUFFERS: usize = CAPTURE_CHANNEL_CAPACITY;
+
+    fn take(&self, minimum_capacity: usize) -> Vec<f32> {
+        let Ok(mut buffers) = self.buffers.try_lock() else {
+            return Vec::with_capacity(minimum_capacity);
+        };
+        let Some(mut buffer) = buffers.pop() else {
+            return Vec::with_capacity(minimum_capacity);
+        };
+        buffer.clear();
+        if buffer.capacity() < minimum_capacity {
+            buffer.reserve(minimum_capacity - buffer.capacity());
+        }
+        buffer
+    }
+
+    fn recycle(&self, buffer: Vec<f32>) {
+        self.recycle_with(buffer, LockMode::MayBlock);
+    }
+
+    fn try_recycle(&self, buffer: Vec<f32>) {
+        self.recycle_with(buffer, LockMode::NonBlocking);
+    }
+
+    fn recycle_with(&self, mut buffer: Vec<f32>, lock_mode: LockMode) {
+        buffer.clear();
+        match lock_mode {
+            LockMode::MayBlock => {
+                let Ok(mut buffers) = self.buffers.lock() else {
+                    return;
+                };
+                if buffers.len() < Self::MAX_RETAINED_BUFFERS {
+                    buffers.push(buffer);
+                }
+            }
+            LockMode::NonBlocking => {
+                let Ok(mut buffers) = self.buffers.try_lock() else {
+                    return;
+                };
+                if buffers.len() < Self::MAX_RETAINED_BUFFERS {
+                    buffers.push(buffer);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    MayBlock,
+    NonBlocking,
+}
+
+#[derive(Clone)]
+struct CaptureBridge {
+    sender: SyncSender<CapturedBuffer>,
+    channels: u16,
+    drop_counters: Arc<DropCounters>,
+    buffer_pool: AudioBufferPool,
+}
+
+impl CaptureBridge {
+    fn new(
+        sender: SyncSender<CapturedBuffer>,
+        channels: u16,
+        buffer_pool: AudioBufferPool,
+    ) -> Self {
+        Self {
+            sender,
+            channels,
+            drop_counters: Arc::new(DropCounters::default()),
+            buffer_pool,
+        }
+    }
+
+    fn take_buffer(&self, minimum_capacity: usize) -> Vec<f32> {
+        self.buffer_pool.take(minimum_capacity)
+    }
+
+    fn send(&self, samples: Vec<f32>, info: &cpal::InputCallbackInfo) {
+        let callback_receive_ns = now_mono_ns();
+        let (first_sample_capture_mono_ns, timestamp_quality) =
+            cpal_first_sample_timestamp(info, callback_receive_ns);
+        self.send_with_metadata(samples, first_sample_capture_mono_ns, timestamp_quality);
+    }
+
+    fn send_with_metadata(
+        &self,
+        samples: Vec<f32>,
+        first_sample_capture_mono_ns: u64,
+        timestamp_quality: TimestampQuality,
+    ) {
+        let total_dropped_samples = self.drop_counters.samples.load(Ordering::Relaxed);
+        let total_dropped_buffers = self.drop_counters.buffers.load(Ordering::Relaxed);
+        let sample_frames = samples.len() as u64 / u64::from(self.channels);
+
+        let captured = CapturedBuffer {
+            samples,
+            first_sample_capture_mono_ns,
+            timestamp_quality,
+            total_dropped_samples,
+            total_dropped_buffers,
+        };
+
+        match self.sender.try_send(captured) {
+            Ok(()) => {}
+            Err(TrySendError::Full(returned)) => {
+                self.drop_counters
+                    .samples
+                    .fetch_add(sample_frames, Ordering::Relaxed);
+                self.drop_counters.buffers.fetch_add(1, Ordering::Relaxed);
+                self.buffer_pool.try_recycle(returned.samples);
+            }
+            Err(TrySendError::Disconnected(returned)) => {
+                self.buffer_pool.try_recycle(returned.samples);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn drop_totals(&self) -> DropTotals {
+        DropTotals {
+            samples: self.drop_counters.samples.load(Ordering::Relaxed),
+            buffers: self.drop_counters.buffers.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn start_capture(
     device_filter: Option<String>,
     sample_rate_hz: u32,
     channels: u16,
     sender: SyncSender<CapturedBuffer>,
-    recorder: Option<WavRecorder>,
+    buffer_pool: AudioBufferPool,
 ) -> Result<CaptureHandle> {
     let host = cpal::default_host();
     let device = find_input_device(&host, device_filter.as_deref())?;
@@ -691,50 +870,43 @@ fn start_capture_thread(
         device_name, sample_rate_hz, channels, sample_format
     );
 
-    let drop_counters = Arc::new(DropCounters::default());
+    let bridge = CaptureBridge::new(sender, channels, buffer_pool);
     let err_fn = |err| eprintln!("cpal stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let counters = Arc::clone(&drop_counters);
-            let recorder = recorder.clone();
+            let bridge = bridge.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], info| {
-                    let samples = data.to_vec();
-                    record_samples(&recorder, &samples);
-                    send_captured(samples, info, channels, &sender, &counters)
+                    let mut samples = bridge.take_buffer(data.len());
+                    append_f32_samples(&mut samples, data);
+                    bridge.send(samples, info)
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let counters = Arc::clone(&drop_counters);
-            let recorder = recorder.clone();
+            let bridge = bridge.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], info| {
-                    let samples: Vec<f32> =
-                        data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                    record_samples(&recorder, &samples);
-                    send_captured(samples, info, channels, &sender, &counters)
+                    let mut samples = bridge.take_buffer(data.len());
+                    append_i16_samples(&mut samples, data);
+                    bridge.send(samples, info)
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::U16 => {
-            let counters = Arc::clone(&drop_counters);
-            let recorder = recorder.clone();
+            let bridge = bridge.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], info| {
-                    let samples: Vec<f32> = data
-                        .iter()
-                        .map(|s| (*s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    record_samples(&recorder, &samples);
-                    send_captured(samples, info, channels, &sender, &counters)
+                    let mut samples = bridge.take_buffer(data.len());
+                    append_u16_samples(&mut samples, data);
+                    bridge.send(samples, info)
                 },
                 err_fn,
                 None,
@@ -744,15 +916,7 @@ fn start_capture_thread(
     };
     stream.play().context("starting cpal input stream")?;
 
-    // Keep the stream owned by a handle and park a thread so dropping CaptureHandle stops capture.
-    let thread = thread::spawn(|| loop {
-        thread::park_timeout(Duration::from_secs(3600));
-    });
-
-    Ok(CaptureHandle {
-        _stream: stream,
-        _thread: thread,
-    })
+    Ok(CaptureHandle { _stream: stream })
 }
 
 fn is_capture_sample_format_supported(format: SampleFormat) -> bool {
@@ -771,37 +935,60 @@ fn capture_sample_format_rank(format: SampleFormat) -> u8 {
     }
 }
 
-fn send_captured(
-    samples: Vec<f32>,
-    info: &cpal::InputCallbackInfo,
-    channels: u16,
-    sender: &SyncSender<CapturedBuffer>,
-    drop_counters: &DropCounters,
-) {
-    let callback_receive_ns = now_mono_ns();
-    let (first_sample_capture_mono_ns, timestamp_quality) =
-        cpal_first_sample_timestamp(info, callback_receive_ns);
-    let total_dropped_samples = drop_counters.samples.load(Ordering::Relaxed);
-    let total_dropped_buffers = drop_counters.buffers.load(Ordering::Relaxed);
-    let sample_frames = samples.len() as u64 / u64::from(channels);
+fn append_f32_samples(out: &mut Vec<f32>, data: &[f32]) {
+    out.extend_from_slice(data);
+}
 
-    let captured = CapturedBuffer {
-        samples,
-        first_sample_capture_mono_ns,
-        timestamp_quality,
-        total_dropped_samples,
-        total_dropped_buffers,
-    };
+fn append_i16_samples(out: &mut Vec<f32>, data: &[i16]) {
+    out.extend(data.iter().map(|sample| *sample as f32 / i16::MAX as f32));
+}
 
-    match sender.try_send(captured) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_returned)) => {
-            drop_counters
-                .samples
-                .fetch_add(sample_frames, Ordering::Relaxed);
-            drop_counters.buffers.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TrySendError::Disconnected(_returned)) => {}
+fn append_u16_samples(out: &mut Vec<f32>, data: &[u16]) {
+    out.extend(
+        data.iter()
+            .map(|sample| (*sample as f32 - 32768.0) / 32768.0),
+    );
+}
+
+fn source_gap_from_drop_totals(
+    total_dropped_samples: u64,
+    total_dropped_buffers: u64,
+    last_total_dropped_samples: &mut u64,
+    buffered_discarded_samples: u64,
+    frame_sample_count: u64,
+) -> Option<SourceSampleGap> {
+    if total_dropped_samples <= *last_total_dropped_samples {
+        return None;
+    }
+
+    let dropped_samples = total_dropped_samples
+        .saturating_sub(*last_total_dropped_samples)
+        .saturating_add(buffered_discarded_samples);
+    *last_total_dropped_samples = total_dropped_samples;
+
+    Some(SourceSampleGap {
+        dropped_samples,
+        dropped_frames_estimate: dropped_samples.div_ceil(frame_sample_count),
+        adapter_total_dropped_samples: total_dropped_samples,
+        adapter_total_dropped_buffers: total_dropped_buffers,
+        reason: "adapter_capture_channel_full".into(),
+    })
+}
+
+fn merge_source_gaps(
+    previous: SourceSampleGap,
+    next: SourceSampleGap,
+    frame_sample_count: u64,
+) -> SourceSampleGap {
+    let dropped_samples = previous
+        .dropped_samples
+        .saturating_add(next.dropped_samples);
+    SourceSampleGap {
+        dropped_samples,
+        dropped_frames_estimate: dropped_samples.div_ceil(frame_sample_count),
+        adapter_total_dropped_samples: next.adapter_total_dropped_samples,
+        adapter_total_dropped_buffers: next.adapter_total_dropped_buffers,
+        reason: next.reason,
     }
 }
 
@@ -886,7 +1073,7 @@ impl FrameChunker {
 
     fn push(
         &mut self,
-        samples: Vec<f32>,
+        samples: &[f32],
         first_sample_ns: u64,
         timestamp_quality: TimestampQuality,
     ) -> Vec<(Vec<f32>, u64, TimestampQuality)> {
@@ -894,7 +1081,7 @@ impl FrameChunker {
             self.pending_first_sample_ns = Some(first_sample_ns);
             self.pending_quality = timestamp_quality;
         }
-        self.buffer.extend(samples);
+        self.buffer.extend_from_slice(samples);
         let mut frames = Vec::new();
         while self.buffer.len() >= self.samples_per_frame {
             let frame_samples: Vec<f32> = self.buffer.drain(0..self.samples_per_frame).collect();
@@ -952,9 +1139,9 @@ mod tests {
     fn chunker_derives_frame_timestamps_from_sample_offsets() {
         let mut chunker = FrameChunker::new(320, 1, 16_000);
         assert!(chunker
-            .push(vec![0.0; 100], 1_000_000, TimestampQuality::SourceCapture)
+            .push(&vec![0.0; 100], 1_000_000, TimestampQuality::SourceCapture)
             .is_empty());
-        let frames = chunker.push(vec![0.0; 600], 99_000_000, TimestampQuality::SourceCapture);
+        let frames = chunker.push(&vec![0.0; 600], 99_000_000, TimestampQuality::SourceCapture);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].0.len(), 320);
         assert_eq!(frames[0].1, 1_000_000);
@@ -966,15 +1153,126 @@ mod tests {
     fn chunker_can_discard_partial_buffer_for_drop_gap_accounting() {
         let mut chunker = FrameChunker::new(320, 1, 16_000);
         assert!(chunker
-            .push(vec![0.0; 100], 1_000_000, TimestampQuality::SourceCapture)
+            .push(&vec![0.0; 100], 1_000_000, TimestampQuality::SourceCapture)
             .is_empty());
         assert_eq!(chunker.discard_buffered_sample_frames(), 100);
         assert!(
             chunker
-                .push(vec![0.0; 320], 2_000_000, TimestampQuality::SourceCapture)
+                .push(&vec![0.0; 320], 2_000_000, TimestampQuality::SourceCapture)
                 .len()
                 == 1
         );
+    }
+
+    #[test]
+    fn capture_bridge_drop_counters_are_reported_on_next_delivered_buffer() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let pool = AudioBufferPool::default();
+        let bridge = CaptureBridge::new(sender, 1, pool);
+
+        bridge.send_with_metadata(vec![0.0; 320], 1_000, TimestampQuality::SourceCapture);
+        bridge.send_with_metadata(vec![0.0; 160], 2_000, TimestampQuality::SourceCapture);
+        assert_eq!(
+            bridge.drop_totals(),
+            DropTotals {
+                samples: 160,
+                buffers: 1
+            }
+        );
+
+        let first = receiver.recv().unwrap();
+        assert_eq!(first.total_dropped_samples, 0);
+        assert_eq!(first.total_dropped_buffers, 0);
+
+        bridge.send_with_metadata(vec![0.0; 80], 3_000, TimestampQuality::CallbackReceive);
+        let after_drop = receiver.recv().unwrap();
+        assert_eq!(after_drop.total_dropped_samples, 160);
+        assert_eq!(after_drop.total_dropped_buffers, 1);
+        assert_eq!(after_drop.samples.len(), 80);
+        assert_eq!(
+            after_drop.timestamp_quality,
+            TimestampQuality::CallbackReceive
+        );
+    }
+
+    #[test]
+    fn source_gap_metadata_includes_callback_drops_and_discarded_partial_frame() {
+        let mut last_total = 320;
+        let gap = source_gap_from_drop_totals(960, 3, &mut last_total, 100, 320).unwrap();
+
+        assert_eq!(gap.dropped_samples, 740);
+        assert_eq!(gap.dropped_frames_estimate, 3);
+        assert_eq!(gap.adapter_total_dropped_samples, 960);
+        assert_eq!(gap.adapter_total_dropped_buffers, 3);
+        assert_eq!(gap.reason, "adapter_capture_channel_full");
+        assert_eq!(last_total, 960);
+    }
+
+    #[test]
+    fn pending_source_gaps_merge_without_losing_earlier_evidence() {
+        let previous = SourceSampleGap {
+            dropped_samples: 100,
+            dropped_frames_estimate: 1,
+            adapter_total_dropped_samples: 100,
+            adapter_total_dropped_buffers: 1,
+            reason: "adapter_capture_channel_full".into(),
+        };
+        let next = SourceSampleGap {
+            dropped_samples: 700,
+            dropped_frames_estimate: 3,
+            adapter_total_dropped_samples: 720,
+            adapter_total_dropped_buffers: 4,
+            reason: "adapter_capture_channel_full".into(),
+        };
+
+        let merged = merge_source_gaps(previous, next, 320);
+
+        assert_eq!(merged.dropped_samples, 800);
+        assert_eq!(merged.dropped_frames_estimate, 3);
+        assert_eq!(merged.adapter_total_dropped_samples, 720);
+        assert_eq!(merged.adapter_total_dropped_buffers, 4);
+        assert_eq!(merged.reason, "adapter_capture_channel_full");
+    }
+
+    #[test]
+    fn capture_sample_conversion_preserves_supported_formats() {
+        let mut f32_samples = Vec::new();
+        append_f32_samples(&mut f32_samples, &[-1.0, 0.0, 1.0]);
+        assert_eq!(f32_samples, vec![-1.0, 0.0, 1.0]);
+
+        let mut i16_samples = Vec::new();
+        append_i16_samples(&mut i16_samples, &[i16::MIN, 0, i16::MAX]);
+        assert!((i16_samples[0] - (i16::MIN as f32 / i16::MAX as f32)).abs() < f32::EPSILON);
+        assert_eq!(i16_samples[1], 0.0);
+        assert_eq!(i16_samples[2], 1.0);
+
+        let mut u16_samples = Vec::new();
+        append_u16_samples(&mut u16_samples, &[0, 32768, u16::MAX]);
+        assert_eq!(u16_samples[0], -1.0);
+        assert_eq!(u16_samples[1], 0.0);
+        assert!((u16_samples[2] - 0.9999695).abs() < 0.000001);
+    }
+
+    #[test]
+    fn wav_recorder_offloads_writes_and_finalizes_header_on_drop() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "speech-core-recorder-offload-{}.wav",
+            Uuid::new_v4().simple()
+        ));
+
+        {
+            let recorder = WavRecorder::create(&path, 16_000, 1).unwrap();
+            recorder.write_samples(&[0.0; 320]);
+            assert_eq!(recorder.dropped_chunks(), 0);
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 640);
+        assert_eq!(bytes.len(), 44 + 640);
     }
 
     #[test]
