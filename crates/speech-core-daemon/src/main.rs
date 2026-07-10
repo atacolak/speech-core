@@ -1,8 +1,12 @@
+#![recursion_limit = "256"]
+
 //! speech-in daemon — the ear. Ingests audio over websocket, runs ASR + VAD + turn detection,
 //! emits transcript-update and turn-closed events.
 
 mod detectors;
+mod jsonl_logger;
 mod model;
+mod provenance;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -12,8 +16,10 @@ use detectors::turn::TurnManagerConfig;
 use detectors::vad::SileroVadConfig;
 use detectors::{DetectorConfig, DetectorIngress};
 use futures_util::{SinkExt, StreamExt};
+pub(crate) use jsonl_logger::JsonlLogger;
+use jsonl_logger::{event_type_from_value, JsonlLoggerConfig};
 use model::{ModelConfig, ModelIngress, ModelProgressMap};
-use serde::Serialize;
+use provenance::RuntimeProvenanceEvent;
 use speech_core_protocol::{
     adapter_send_to_ingress_latency, capture_to_ingress_latency, now_mono_ns, AudioFrame,
     AudioFrameIngested, AudioGap, AudioSampleGap, ControlMessage, HelloAck, PcmFormat, ServerEvent,
@@ -24,8 +30,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs::{create_dir_all, OpenOptions};
-use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -45,6 +49,30 @@ struct Args {
     /// Directory for jsonl event logs.
     #[arg(long, default_value = "./logs", env = "SPEECH_CORE_LOG_DIR")]
     log_dir: PathBuf,
+
+    /// Rotate events.jsonl when it reaches this many bytes. Use 0 to disable rotation.
+    #[arg(
+        long,
+        default_value_t = 256 * 1024 * 1024,
+        env = "SPEECH_CORE_LOG_MAX_BYTES"
+    )]
+    log_max_bytes: u64,
+
+    /// Number of JSONL files to retain including the active events.jsonl.
+    #[arg(long, default_value_t = 8, env = "SPEECH_CORE_LOG_MAX_FILES")]
+    log_max_files: usize,
+
+    /// Periodic JSONL flush interval in milliseconds.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        env = "SPEECH_CORE_LOG_FLUSH_INTERVAL_MS"
+    )]
+    log_flush_interval_ms: u64,
+
+    /// Flush JSONL after this many durable events even before the periodic timer.
+    #[arg(long, default_value_t = 256, env = "SPEECH_CORE_LOG_FLUSH_BATCH_LINES")]
+    log_flush_batch_lines: usize,
 
     /// Optional transcribe.cpp GGUF model path. When omitted, daemon stays transport-only.
     #[arg(long, env = "SPEECH_CORE_MODEL_PATH")]
@@ -331,12 +359,31 @@ async fn main() -> Result<()> {
     if args.smart_turn_cpu_count == 0 {
         bail!("--smart-turn-cpu-count must be greater than zero");
     }
-    create_dir_all(&args.log_dir)
-        .await
-        .with_context(|| format!("creating log directory {}", args.log_dir.display()))?;
+    if args.log_max_files == 0 {
+        bail!("--log-max-files must be greater than zero");
+    }
+    if args.log_flush_interval_ms == 0 {
+        bail!("--log-flush-interval-ms must be greater than zero");
+    }
+    if args.log_flush_batch_lines == 0 {
+        bail!("--log-flush-batch-lines must be greater than zero");
+    }
 
+    let runtime_provenance = RuntimeProvenanceEvent::collect(&args);
     let (event_tx, _) = broadcast::channel(1024);
-    let logger = JsonlLogger::open(args.log_dir, event_tx.clone()).await?;
+    let logger = JsonlLogger::open_with_config(
+        JsonlLoggerConfig {
+            log_dir: args.log_dir.clone(),
+            max_bytes: args.log_max_bytes,
+            max_files: args.log_max_files,
+            flush_interval_ms: args.log_flush_interval_ms,
+            flush_batch_lines: args.log_flush_batch_lines,
+        },
+        event_tx.clone(),
+    )
+    .await?;
+    logger.write(&runtime_provenance).await?;
+    info!(runtime_id = %runtime_provenance.runtime_id, build_id = %runtime_provenance.build_id, config_id = %runtime_provenance.config_id, "runtime provenance captured");
     let model_progress: Option<ModelProgressMap> =
         args.model_path.as_ref().map(|_| ModelProgressMap::new());
     let mut detector_config = DetectorConfig {
@@ -449,6 +496,15 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    if let Some(model) = &state.model_ingress {
+        model.shutdown().await;
+    }
+    if let Some(detector) = &state.detector_ingress {
+        detector.shutdown().await;
+    }
+    state.logger.flush().await?;
+    state.logger.shutdown().await?;
 
     Ok(())
 }
@@ -774,46 +830,6 @@ struct IngestOutcome {
     sample_gap: Option<AudioSampleGap>,
 }
 
-#[derive(Clone)]
-struct JsonlLogger {
-    inner: Arc<Mutex<BufWriter<tokio::fs::File>>>,
-    event_tx: broadcast::Sender<String>,
-}
-
-impl JsonlLogger {
-    async fn open(log_dir: PathBuf, event_tx: broadcast::Sender<String>) -> Result<Self> {
-        let path = log_dir.join("events.jsonl");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("opening jsonl log {}", path.display()))?;
-        info!(path = %path.display(), "writing jsonl events");
-        Ok(Self {
-            inner: Arc::new(Mutex::new(BufWriter::new(file))),
-            event_tx,
-        })
-    }
-
-    async fn write<T: Serialize>(&self, event: &T) -> Result<()> {
-        let mut line = serde_json::to_vec(event).context("serializing jsonl event")?;
-        let text = String::from_utf8(line.clone()).context("json event should be utf-8")?;
-        if !is_jsonl_filtered_event(&text) {
-            line.push(b'\n');
-            let mut writer = self.inner.lock().await;
-            writer.write_all(&line).await?;
-            writer.flush().await?;
-        }
-        let _ = self.event_tx.send(text);
-        Ok(())
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<String> {
-        self.event_tx.subscribe()
-    }
-}
-
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1114,13 +1130,6 @@ fn parse_recheck_offsets_ms(value: &str) -> Vec<u32> {
         .collect()
 }
 
-fn is_jsonl_filtered_event(text: &str) -> bool {
-    matches!(
-        event_type_from_text(text).as_deref(),
-        Some("vad_meter") | Some("turn_hold")
-    )
-}
-
 fn event_matches(
     text: &str,
     stream_id: Option<&str>,
@@ -1147,20 +1156,6 @@ fn event_matches(
         }
     }
     true
-}
-
-fn event_type_from_text(text: &str) -> Option<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return None;
-    };
-    event_type_from_value(&value).map(str::to_owned)
-}
-
-fn event_type_from_value(value: &serde_json::Value) -> Option<&str> {
-    value
-        .get("event")
-        .or_else(|| value.get("type"))
-        .and_then(|v| v.as_str())
 }
 
 fn validate_frame_against_hello(hello: &HelloState, frame: &AudioFrame) -> Result<()> {
@@ -1460,6 +1455,44 @@ mod tests {
         assert_eq!(signed_u64_delta(u64::MAX, 0), i64::MAX);
         assert_eq!(signed_u64_delta(0, u64::MAX), i64::MIN);
         assert_eq!(signed_u64_delta(42, 40), 2);
+    }
+
+    #[tokio::test]
+    async fn logger_emits_runtime_provenance_once() {
+        let dir = tempdir().unwrap();
+        let logger = logger(&dir).await;
+        let event = RuntimeProvenanceEvent {
+            event: "runtime_provenance",
+            event_schema_version: provenance::EVENT_SCHEMA_VERSION,
+            runtime_id: "git:test/cfg:test".to_owned(),
+            build_id: "git:test".to_owned(),
+            config_id: "test".to_owned(),
+            binary: provenance::BinaryInfo {
+                name: "speech-core-daemon",
+                version: "0.1.0",
+            },
+            source: provenance::SourceInfo {
+                repository: "https://example.invalid/speech-core",
+            },
+            build: provenance::BuildInfo {
+                git_commit: "unknown",
+                git_dirty: "unknown",
+                target: "unknown",
+                profile: "unknown",
+            },
+            config: provenance::EffectiveConfig {
+                fingerprint: "fnv1a64:test".to_owned(),
+                redacted: serde_json::json!({"log_dir":"./logs"}),
+            },
+            models: Vec::new(),
+        };
+        logger.write(&event).await.unwrap();
+        logger.shutdown().await.unwrap();
+        let jsonl = tokio::fs::read_to_string(dir.path().join("events.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(jsonl.lines().count(), 1);
+        assert!(jsonl.contains("runtime_provenance"));
     }
 
     fn event_type(event: &ServerEvent) -> &'static str {

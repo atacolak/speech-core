@@ -184,6 +184,9 @@ struct TuiModel {
     stream_session_id: Option<String>,
     vad_config: Option<String>,
     smart_turn_config: Option<String>,
+    runtime_id: Option<String>,
+    build_id: Option<String>,
+    config_id: Option<String>,
     speech_out_ui: bool,
     turns: Vec<TuiTurn>,
     current: Option<usize>,
@@ -237,6 +240,26 @@ impl TuiModel {
         }
         let event = event_name(value);
         match event {
+            "runtime_provenance" => {
+                let runtime_id = value
+                    .get("runtime_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let build_id = value
+                    .get("build_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let config_id = value
+                    .get("config_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                self.runtime_id = runtime_id;
+                self.build_id = build_id;
+                self.config_id = config_id;
+                if let Some(id) = &self.runtime_id {
+                    self.note(format!("runtime provenance: {id}"));
+                }
+            }
             "vad_session_start" => {
                 let frame_ms = value.get("frame_ms").and_then(|v| v.as_u64()).unwrap_or(20);
                 let threshold = value
@@ -733,6 +756,9 @@ impl TuiModel {
         out.push_str("speech-core turn tui\n");
         if let Some(session_id) = &self.stream_session_id {
             out.push_str(&format!("session {session_id}\n"));
+        }
+        if let Some(runtime_id) = &self.runtime_id {
+            out.push_str(&format!("runtime {runtime_id}\n"));
         }
         if let Some(vad) = &self.vad_config {
             out.push_str(&format!("{vad}\n"));
@@ -1237,6 +1263,24 @@ fn inject_text(command: &str, text: &str) -> Result<()> {
 fn handle_transcript_value(value: &Value, args: &Args, state: &mut TranscriptState) -> Result<()> {
     let event = event_name(value);
     match event {
+        "runtime_provenance" if args.verbose => {
+            let runtime_id = value
+                .get("runtime_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let build_id = value
+                .get("build_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let config_id = value
+                .get("config_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            diagnostic_line(
+                &mut state.printed_transcript,
+                format_args!("runtime {runtime_id} build={build_id} config={config_id}"),
+            )?;
+        }
         "transcript_update" => {
             let committed = value
                 .get("committed_text")
@@ -1621,6 +1665,7 @@ fn handle_transcript_value(value: &Value, args: &Args, state: &mut TranscriptSta
                 }
             }
         }
+        "runtime_provenance" => {}
         "model_error" => diagnostic_line(
             &mut state.printed_transcript,
             format_args!("model error: {value}"),

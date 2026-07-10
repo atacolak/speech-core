@@ -23,6 +23,10 @@ right now the mature seam is **speech-in**. it listens to live microphone audio,
 | `SPEECH_CORE_MODEL_PATH` | daemon | path to nemotron GGUF model file |
 | `SPEECH_CORE_VAD_MODEL_PATH` | daemon | path to silero VAD ONNX model (bundled in `models/`) |
 | `SPEECH_CORE_SMART_TURN_MODEL_PATH` | daemon | path to smart-turn-v3 ONNX model |
+| `SPEECH_CORE_LOG_MAX_BYTES` | daemon | rotate `events.jsonl` after this many bytes; default 256MiB, `0` disables |
+| `SPEECH_CORE_LOG_MAX_FILES` | daemon | retained JSONL files including active log; default 8 |
+| `SPEECH_CORE_LOG_FLUSH_INTERVAL_MS` | daemon | periodic durable JSONL flush interval; default 1000ms |
+| `SPEECH_CORE_LOG_FLUSH_BATCH_LINES` | daemon | flush after this many durable events; default 256 |
 
 install scripts write these into `~/.config/speech-core/client.env` and `daemon.env`.
 
@@ -169,7 +173,11 @@ Inspect daemon events:
 tail -f ./logs/events.jsonl
 ```
 
-A typical `audio_frame_ingested` event includes raw adapter timestamps, timestamp provenance, null/uncalibrated cross-host latency fields, `sequence_gap`, `sample_gap`, and transport queue depth.
+On startup the daemon emits one `runtime_provenance` event. It includes a concise `runtime_id`, binary version, event schema version, build/git identity when available (`unknown` if the build environment cannot provide it), a stable fingerprint over redacted effective config, and model artifact paths/fingerprints where practical. `speech-core-watch --verbose` and replay/TUI modes preserve and display the concise runtime/build/config IDs.
+
+Durable JSONL writes are buffered through a logger task so websocket broadcast remains immediate and async hot paths do not flush every event. The default log policy flushes every second or 256 durable events, flushes on graceful shutdown, filters very high-volume per-frame ingest/VAD hold diagnostics from durable JSONL while still broadcasting them live, and rotates `events.jsonl` at 256MiB with 8 files retained (`events.1.jsonl`, ...). Very abrupt process termination can still lose the last unflushed batch; use lower `SPEECH_CORE_LOG_FLUSH_INTERVAL_MS` / `SPEECH_CORE_LOG_FLUSH_BATCH_LINES` when that tradeoff matters.
+
+A typical live `audio_frame_ingested` event includes raw adapter timestamps, timestamp provenance, null/uncalibrated cross-host latency fields, `sequence_gap`, `sample_gap`, and transport queue depth.
 
 ## Optional Nemotron streaming model integration
 

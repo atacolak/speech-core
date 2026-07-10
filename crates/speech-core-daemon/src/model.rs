@@ -221,12 +221,15 @@ impl ModelIngress {
             );
             let mut control_closed = false;
             let mut audio_closed = false;
+            let mut graceful_shutdown = false;
             loop {
                 let mut handled = false;
                 loop {
                     match control_receiver.try_recv() {
                         Ok(command) => {
-                            worker.handle(command);
+                            if worker.handle(command) {
+                                graceful_shutdown = true;
+                            }
                             handled = true;
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -236,13 +239,21 @@ impl ModelIngress {
                         }
                     }
                 }
+                if graceful_shutdown {
+                    break;
+                }
                 match audio_receiver.try_recv() {
                     Ok(command) => {
-                        worker.handle(command);
+                        if worker.handle(command) {
+                            graceful_shutdown = true;
+                        }
                         handled = true;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {}
                     Err(mpsc::error::TryRecvError::Disconnected) => audio_closed = true,
+                }
+                if graceful_shutdown {
+                    break;
                 }
                 if control_closed && audio_closed {
                     break;
@@ -251,7 +262,9 @@ impl ModelIngress {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
-            worker.finalize_all("model worker channel closed");
+            if !graceful_shutdown {
+                worker.finalize_all("model worker channel closed");
+            }
         });
         Self {
             control_sender,
@@ -344,6 +357,12 @@ impl ModelIngress {
             .send(ModelCommand::AudioGapReset { gap })
             .map_err(|_| anyhow::anyhow!("model worker control path closed at audio gap reset"))
     }
+
+    pub async fn shutdown(&self) {
+        let (reply, done) = oneshot::channel();
+        let _ = self.control_sender.send(ModelCommand::Shutdown { reply });
+        let _ = done.await;
+    }
 }
 
 async fn log_model_start_error(
@@ -408,6 +427,9 @@ enum ModelCommand {
         request: ModelDrainRequest,
         reply: std::sync::mpsc::Sender<Result<ModelDrainResult>>,
     },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 impl ModelCommand {
@@ -444,6 +466,7 @@ impl ModelCommand {
                 request.stream_session_id.clone(),
                 request.adapter_id.clone(),
             ),
+            ModelCommand::Shutdown { .. } => (String::new(), String::new(), String::new()),
         }
     }
 }
@@ -479,7 +502,8 @@ impl ModelWorker {
         }
     }
 
-    fn handle(&mut self, command: ModelCommand) {
+    fn handle(&mut self, command: ModelCommand) -> bool {
+        let should_stop = matches!(command, ModelCommand::Shutdown { .. });
         let result = match command {
             ModelCommand::StartSession { hello, reply } => {
                 let result = self.start_session(hello);
@@ -509,10 +533,16 @@ impl ModelWorker {
                 let _ = reply.send(result);
                 Ok(())
             }
+            ModelCommand::Shutdown { reply } => {
+                self.finalize_all("model worker shutdown");
+                let _ = reply.send(());
+                Ok(())
+            }
         };
         if let Err(err) = result {
             warn!(error = ?err, "model worker command failed");
         }
+        should_stop
     }
 
     fn start_session(&mut self, hello: HelloState) -> Result<()> {
@@ -982,7 +1012,8 @@ impl ModelWorker {
     }
 
     fn write_blocking<T: Serialize>(&self, event: &T) -> Result<()> {
-        self.runtime.block_on(self.logger.write(event))
+        let _ = &self.runtime;
+        self.logger.blocking_write(event)
     }
 }
 

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
+    emit_build_identity();
     let external = std::env::var("TRANSCRIBE_CPP_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -41,4 +43,53 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=pthread");
     }
+}
+
+fn emit_build_identity() {
+    println!("cargo:rerun-if-env-changed=SPEECH_CORE_BUILD_GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=SPEECH_CORE_BUILD_GIT_DIRTY");
+    let commit = std::env::var("SPEECH_CORE_BUILD_GIT_COMMIT")
+        .ok()
+        .or_else(|| git_output(["rev-parse", "HEAD"]));
+    let dirty = std::env::var("SPEECH_CORE_BUILD_GIT_DIRTY")
+        .ok()
+        .or_else(|| git_dirty().map(|dirty| dirty.to_string()));
+
+    println!(
+        "cargo:rustc-env=SPEECH_CORE_BUILD_GIT_COMMIT={}",
+        commit.unwrap_or_else(|| "unknown".to_owned())
+    );
+    println!(
+        "cargo:rustc-env=SPEECH_CORE_BUILD_GIT_DIRTY={}",
+        dirty.unwrap_or_else(|| "unknown".to_owned())
+    );
+    println!(
+        "cargo:rustc-env=SPEECH_CORE_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_owned())
+    );
+    println!(
+        "cargo:rustc-env=SPEECH_CORE_BUILD_PROFILE={}",
+        std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned())
+    );
+}
+
+fn git_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(!output.stdout.is_empty())
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }

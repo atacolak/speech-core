@@ -50,12 +50,15 @@ impl DetectorIngress {
             let mut worker = DetectorWorker::new(config, logger, runtime);
             let mut control_closed = false;
             let mut audio_closed = false;
+            let mut graceful_shutdown = false;
             loop {
                 let mut handled = false;
                 loop {
                     match control_receiver.try_recv() {
                         Ok(command) => {
-                            worker.handle(command);
+                            if worker.handle(command) {
+                                graceful_shutdown = true;
+                            }
                             handled = true;
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -65,13 +68,21 @@ impl DetectorIngress {
                         }
                     }
                 }
+                if graceful_shutdown {
+                    break;
+                }
                 match audio_receiver.try_recv() {
                     Ok(command) => {
-                        worker.handle(command);
+                        if worker.handle(command) {
+                            graceful_shutdown = true;
+                        }
                         handled = true;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {}
                     Err(mpsc::error::TryRecvError::Disconnected) => audio_closed = true,
+                }
+                if graceful_shutdown {
+                    break;
                 }
                 if control_closed && audio_closed {
                     break;
@@ -80,7 +91,9 @@ impl DetectorIngress {
                     thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
-            worker.finalize_all("detector worker channel closed");
+            if !graceful_shutdown {
+                worker.finalize_all("detector worker channel closed");
+            }
         });
         Self {
             control_sender,
@@ -178,6 +191,12 @@ impl DetectorIngress {
             audio_sender,
         }
     }
+
+    pub async fn shutdown(&self) {
+        let (reply, done) = oneshot::channel();
+        let _ = self.control_sender.send(DetectorCommand::Shutdown { reply });
+        let _ = done.await;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +235,9 @@ enum DetectorCommand {
     AudioGapReset {
         gap: AudioGapReset,
     },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 impl DetectorCommand {
@@ -251,6 +273,7 @@ impl DetectorCommand {
                 gap.stream_session_id.clone(),
                 gap.adapter_id.clone(),
             ),
+            DetectorCommand::Shutdown { .. } => (String::new(), String::new(), String::new()),
         }
     }
 }
@@ -382,7 +405,8 @@ impl DetectorWorker {
         }
     }
 
-    fn handle(&mut self, command: DetectorCommand) {
+    fn handle(&mut self, command: DetectorCommand) -> bool {
+        let should_stop = matches!(command, DetectorCommand::Shutdown { .. });
         let logger = self.logger.clone();
         let runtime = self.runtime.clone();
         let mut writer = DetectorWriter::new(&logger, &runtime);
@@ -473,11 +497,17 @@ impl DetectorWorker {
                     ..
                 } => self.end_session_inner(&stream_session_id, &reason, &mut writer),
                 DetectorCommand::AudioGapReset { gap } => self.audio_gap_reset(gap, &mut writer),
+                DetectorCommand::Shutdown { reply } => {
+                    self.finalize_all("detector worker shutdown");
+                    let _ = reply.send(());
+                    Ok(())
+                }
             }
         })();
         if let Err(err) = result {
             warn!(error = ?err, "detector worker command failed");
         }
+        should_stop
     }
 
     fn end_session_inner(
@@ -883,7 +913,8 @@ impl<'a> DetectorWriter<'a> {
     }
 
     pub fn write<T: Serialize>(&mut self, event: &T) -> Result<()> {
-        self.runtime.block_on(self.logger.write(event))
+        let _ = self.runtime;
+        self.logger.blocking_write(event)
     }
 }
 
