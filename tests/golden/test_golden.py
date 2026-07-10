@@ -619,7 +619,7 @@ class TestFormatting(unittest.TestCase):
         self.assertEqual(golden.ms_samples(500), 8000)
 
     def test_roundtrip(self):
-        for ms in [0, 100, 500, 1000, 1700, 3500, 7000]:
+        for ms in [0, 100, 500, 1000, 2500, 3500, 7500]:
             self.assertEqual(golden.samples_ms(golden.ms_samples(ms)), ms)
 
 

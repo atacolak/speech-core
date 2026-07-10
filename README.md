@@ -41,7 +41,7 @@ docs/seams.md             component boundaries and contracts
 docs/session-handoff.md   compact context for the next assistant session
 ```
 
-short version: speech-in currently turns live audio into `transcript_update`, `turn_closed`, and diagnostic side-channel events. silero vad proposes acoustic boundaries; smart-turn v3 checks whether those boundaries sound semantically complete; tiny vad islands under 400ms are ignored; a longer 1700ms acoustic fallback prevents the turn from hanging forever.
+short version: speech-in currently turns live audio into `transcript_update`, `turn_closed`, and diagnostic side-channel events. silero vad proposes acoustic boundaries; smart-turn v3 checks whether those boundaries sound semantically complete; tiny vad islands under 400ms are ignored; a longer 2500ms acoustic fallback prevents the turn from hanging forever.
 
 ## workspace
 
@@ -247,11 +247,11 @@ SPEECH_CORE_VAD_HANGOVER_FRAMES=3        # 3 native silero frames ≈ 96ms
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=2500
 SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400   # suppress short mic clicks / noise bursts
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
 SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
-SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7500
 SPEECH_CORE_EOU_MODEL_DIR=               # empty: Parakeet realtime EOU worker disabled
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
 ```
@@ -280,7 +280,7 @@ these are offsets after the acoustic end sample.
 
 if smart-turn says the utterance is semantically complete, speech-in closes the turn early. if it says incomplete, the system waits and checks again. this is meant to handle speech where the first pause is not the real end.
 
-there is also an acoustic fallback. if the user stops producing human-like speech and smart-turn still does not confidently close the turn, the system can close after a longer silence window (3000 milliseconds) instead of hanging forever.
+there is also an acoustic fallback. if the user stops producing human-like speech and smart-turn still does not confidently close the turn, the system can close after a longer silence window (2500 milliseconds, installed profile; code-default 3500ms) instead of hanging forever.
 
 ### human hold event
 

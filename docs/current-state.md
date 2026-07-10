@@ -43,7 +43,7 @@ SPEECH_CORE_VAD_HANGOVER_FRAMES=3
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=1700
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=2500
 SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400
 SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
 SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-v3.2-cpu.onnx
@@ -53,7 +53,7 @@ SPEECH_CORE_SMART_TURN_CPU_COUNT=1
 SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
 SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
-SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7000
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7500
 SPEECH_CORE_TURN_TRANSCRIPT_SILENCE_CLOSE_MS=700
 SPEECH_CORE_EOU_MODEL_DIR=
 SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
@@ -91,7 +91,7 @@ smart turn timed out / was unavailable / failed
 turn manager emitted turn_closed source=vad degraded=true
 ```
 
-incomplete semantic decisions suppress immediate vad close. if the delayed recheck still holds and speech does not resume, acoustic fallback can close only after 1700ms of low-probability silence:
+incomplete semantic decisions suppress immediate vad close. if the delayed recheck still holds and speech does not resume, acoustic fallback can close only after 2500ms of low-probability silence (installed profile; code-default is 3500ms):
 
 ```text
 vad_acoustic_fallback

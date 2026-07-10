@@ -93,7 +93,7 @@ turn:
   min_model_eou_speech_ms: 300
   model_eou_refractory_ms: 700
   model_alignment_timeout_ms: 3000
-  human_hold_silence_ms: 7000
+  human_hold_silence_ms: 7500
   transcript_silence_close_ms: 700
 smart_turn:
   threshold: 0.5
@@ -116,7 +116,7 @@ The current installed/live profile described by `docs/current-state.md` and obse
 profile: installed-live
 inherits: code-defaults
 overrides:
-  vad.acoustic_fallback_silence_ms: 1700
+  vad.acoustic_fallback_silence_ms: 2500
   turn.vad_close_enabled: true
   turn.semantic_gate_enabled: true
   turn.semantic_gate_close_enabled: true
@@ -702,9 +702,9 @@ At 16 kHz:
 - VAD hangover default: 3 frames = 96 ms = 1536 samples.
 - Turn min VAD speech default: 400 ms = 6400 samples.
 - Smart Turn rechecks: 96/192/384/768/1536 ms = 1536/3072/6144/12288/24576 samples.
-- Installed acoustic fallback: 1700 ms = 27200 samples.
+- Installed acoustic fallback: 2500 ms = 40000 samples.
 - Code-default acoustic fallback: 3500 ms = 56000 samples.
-- Human hold: 7000 ms = 112000 samples.
+- Human hold: 7500 ms = 120000 samples.
 - Transcript silence close: 700 ms = 11200 samples.
 
 ### Synthetic exact threshold triplets
@@ -720,12 +720,12 @@ Human recordings use coarse cue bands and observed speech timing. Exact threshol
 | VAD stop probability | 0.199999 / 0.200000 / 0.200001 | Deterministic VAD stub only; below is low/silence, at/above remains speech |
 | Configured fallback probability | 0.099999 / 0.100000 / 0.100001 | Config parser/stub verifies configured value; must not be described as effective when stop threshold is higher |
 | Effective fallback probability | 0.199999 / 0.200000 / 0.200001 | VAD stub verifies effective threshold is `max(configured_fallback_threshold, stop_threshold)`; default effective value is 0.2 |
-| Installed fallback silence | 1699 / 1700 / 1701 ms = 27184 / 27200 / 27216 samples | No fallback before threshold; exactly one fallback close at/after; profile hash records installed value |
+| Installed fallback silence | 2499 / 2500 / 2501 ms = 39984 / 40000 / 40016 samples | No fallback before threshold; exactly one fallback close at/after; profile hash records installed value |
 | Code-default fallback silence | 3499 / 3500 / 3501 ms = 55984 / 56000 / 56016 samples | Same assertion under `code-defaults` profile or explicit profile-derived override |
 | Smart Turn completion probability | 0.499999 / 0.500000 / 0.500001 | Deterministic semantic-decision injection; below suppresses/incomplete, at/above completes/closes when close enabled |
 | Smart Turn timeout | 249 / 250 / 251 ms = 3984 / 4000 / 4016 sample-equivalent harness ticks | Controllable inference clock; no timeout classification below, boundary behavior explicitly defined by implementation, timeout/fail-open after boundary |
 | Smart Turn rechecks | 95/96/97, 191/192/193, 383/384/385, 767/768/769, 1535/1536/1537 ms = 1520/1536/1552, 3056/3072/3088, 6128/6144/6160, 12272/12288/12304, 24560/24576/24592 samples after acoustic end | Probe no earlier than target; duplicate/obsolete probes filtered; cancellation on resumed speech; no probe after close |
-| Human hold | 6999 / 7000 / 7001 ms = 111984 / 112000 / 112016 samples of continuous speech-like/no-token input | No hold close before; exactly one `turn_human_hold` and `turn_closed source=human_hold` at/after threshold; continuous high cannot reopen until low release |
+| Human hold | 7499 / 7500 / 7501 ms = 119984 / 120000 / 120016 samples of continuous speech-like/no-token input | No hold close before; exactly one `turn_human_hold` and `turn_closed source=human_hold` at/after threshold; continuous high cannot reopen until low release |
 | Transcript silence close | 699 / 700 / 701 ms = 11184 / 11200 / 11216 samples | Transcript-backed/no-VAD path closes at/after; VAD-backed turns unaffected |
 | Model EOU minimum speech | 299 / 300 / 301 ms = 4784 / 4800 / 4816 samples | EOU suppressed below; eligible at/above if not otherwise refractory/in-speech |
 | Model EOU refractory | 699 / 700 / 701 ms = 11184 / 11200 / 11216 samples | Second EOU suppressed inside refractory; one acceptance at/after boundary as implementation defines equality |
@@ -740,7 +740,7 @@ Exact triplets belong in Rust unit/integration tests or deterministic harness sc
 - Priority: MVP
 - Construction: human-recorded
 - Human audio required: yes
-- Prompt: “The weather looks great today. I think I will go outside.”
+- Prompt: "The weather looks great today. I think I will go outside."
 - Cue timeline: `READY` 0-3000 ms, `SPEAK` 3000-9000 ms, `STOP` after speech plus a comfortable 1000-2000 ms silence. Exact speech timing is not asserted.
 - Assertions: exactly one `turn_closed`, expected preferred source `smart_turn`, `degraded=false`; if current model cannot achieve this, fixture remains `candidate` and cannot be MVP release gate until re-recorded.
 - Purpose: ordinary complete utterance.
@@ -750,7 +750,7 @@ Exact triplets belong in Rust unit/integration tests or deterministic harness sc
 - Priority: MVP
 - Construction: human-recorded
 - Human audio required: yes
-- Prompt: “I was going to say something about the… actually, never mind.” Speak with trailing uncertainty near the ellipsis.
+- Prompt: "I was going to say something about the... actually, never mind." Speak with trailing uncertainty near the ellipsis.
 - Cue timeline: `SPEAK` band 3000-12000 ms, optional trailing low-volume words, `STOP` after 1000-2000 ms silence.
 - Assertions: one `turn_closed`; allow `smart_turn` if complete or `vad_acoustic_fallback` degraded if semantic stays incomplete. Must include a `smart_turn_decision complete=false` or a complete close with clear rationale.
 - Purpose: trailing-off endpointing and conservative fallback.
@@ -760,7 +760,7 @@ Exact triplets belong in Rust unit/integration tests or deterministic harness sc
 - Priority: MVP
 - Construction: human-recorded
 - Human audio required: yes
-- Prompt: “I need to check…” `PAUSE`, then “one more thing before I answer.”
+- Prompt: "I need to check..." `PAUSE`, then "one more thing before I answer."
 - Cue timeline: `SPEAK` 3000-5000 ms, `PAUSE` 5000-6200 ms coarse band, `RESUME` 6200-10000 ms. Human band: pause must be 800-1600 ms by observed speech timing.
 - Assertions: no `turn_closed` before resumed speech starts; at least one `smart_turn_decision complete=false` or `turn_eou_suppressed reason=semantic_incomplete`; final close after resumed speech.
 - Purpose: Smart Turn recheck cancellation and no premature turn split.
@@ -770,7 +770,7 @@ Exact triplets belong in Rust unit/integration tests or deterministic harness sc
 - Priority: MVP
 - Construction: human-recorded
 - Human audio required: yes
-- Prompt: “What time is it right now?” spoken naturally and quickly.
+- Prompt: "What time is it right now?" spoken naturally and quickly.
 - Cue timeline: `SPEAK` 3000-5500 ms; `STOP` after 1000-2000 ms silence.
 - Assertions: one clean close, preferred `smart_turn`, no session-end extra close.
 - Purpose: short complete question.
@@ -830,18 +830,18 @@ The normative min-speech boundary is asserted in the event/harness sample domain
 
 - Priority: exhaustive
 - Construction: human-recorded
-- Prompt: “I need to think…” pause 800-1600 ms, resume “actually continue here.”
+- Prompt: "I need to think..." pause 800-1600 ms, resume "actually continue here."
 - Assertions: at least one `smart_turn_recheck_scheduled`, then `smart_turn_recheck_cancelled reason=speech_resumed|new_speech` before final close.
 
 ### Acoustic fallback scenarios
 
-#### `synthetic-acoustic-fallback-installed-1700`
+#### `synthetic-acoustic-fallback-installed-2500`
 
 - Priority: MVP
 - Profile: `installed-live` or `golden-mvp`
-- Audio: eligible speech-like segment ending at sample `E`, semantic incomplete/unavailable forced if needed, then low silence for 1900 ms.
-- Expected: `vad_acoustic_fallback` after at least 1700 ms low silence; `turn_closed source=vad_acoustic_fallback degraded=true`.
-- Timing assertion: `vad_acoustic_fallback.decision_sample - vad_speech_end.end_sample >= 27200`, tolerance +1024 samples.
+- Audio: eligible speech-like segment ending at sample `E`, semantic incomplete/unavailable forced if needed, then low silence for 2700 ms.
+- Expected: `vad_acoustic_fallback` after at least 2500 ms low silence; `turn_closed source=vad_acoustic_fallback degraded=true`.
+- Timing assertion: `vad_acoustic_fallback.decision_sample - vad_speech_end.end_sample >= 40000`, tolerance +1024 samples.
 
 #### `synthetic-acoustic-fallback-code-default-3500`
 
@@ -852,14 +852,14 @@ The normative min-speech boundary is asserted in the event/harness sample domain
 
 ### Human hold scenario
 
-#### `human-hold-continuous-filler-7000`
+#### `human-hold-continuous-filler-7500`
 
 - Priority: exhaustive until stable, then MVP if product relies on it
 - Construction: human-recorded or generated sustained nonlexical vocalization
 - Human audio required: yes if validating actual microphone/user behavior; synthetic allowed for timer path.
-- Prompt: sustain “uhhhhh” / thinking hum without forming words for 8-10 seconds.
+- Prompt: sustain "uhhhhh" / thinking hum without forming words for 8-10 seconds.
 - Cue timeline: `SPEAK/HOLD` coarse band 3000-11000 ms, `STOP` after hold event or at 12000 ms.
-- Assertions: `turn_human_hold reason=speech_like_audio_without_tokens` with `ms_without_tokens >= 7000`, followed by exactly one `turn_closed source=human_hold degraded=true|false as implemented`. The hardening target is closing behavior; a non-closing human-hold profile is out of scope for this suite.
+- Assertions: `turn_human_hold reason=speech_like_audio_without_tokens` with `ms_without_tokens >= 7500`, followed by exactly one `turn_closed source=human_hold degraded=true|false as implemented`. The hardening target is closing behavior; a non-closing human-hold profile is out of scope for this suite.
 - Rearm assertion: if speech-like input remains continuously high after the human-hold forced close, no new `turn_started` may occur until a low-release interval is observed. After the low release, a later onset may start a new turn.
 - Note: Accepted takes must keep VAD active continuously long enough; old 6.7 s fixture cannot qualify.
 
@@ -965,7 +965,7 @@ cues:
   - {band_ms: [10500, 12500], label: STOP, visual: "Stay quiet."}
 ```
 
-### `human-hold-continuous-filler-7000`
+### `human-hold-continuous-filler-7500`
 
 ```yaml
 prompt: "Sustain a non-word thinking sound, like uhhhh, without saying recognizable words."
@@ -994,7 +994,7 @@ Existing fixture names are retained as legacy IDs only until re-recorded/reclass
 | `01-clean-sentence` | One degraded `vad_acoustic_fallback`, smart-turn incomplete; transcript has intended sentence. | Quarantine as `legacy-clean-fallback-regression`; not MVP. | Re-record as `human-clean-complete` until clean `smart_turn` close is achieved, or rewrite intent to fallback. |
 | `02-trailing-off` | One degraded `vad_acoustic_fallback`, transcript matches trailing-off. | Candidate fallback fixture. | Import with WAV hash and config if fallback intent is explicit; add assertion for semantic incomplete then fallback. |
 | `03-pause-resume` | Two turns; closes on first phrase; does not test resume-without-close. | Quarantine. | Re-record with a deliberate incomplete pre-pause phrase and observed 800-1600 ms pause; require no close before resume. |
-| `04-human-hold` | 6.7 s hum; too short for 7000 ms hold; closes via fallback. | Quarantine as fallback/no-token fixture only. | New hold fixture must sustain VAD-active no-token audio for at least 8 s and assert `turn_human_hold`. |
+| `04-human-hold` | 6.7 s hum; too short for 7500 ms hold; closes via fallback. | Quarantine as fallback/no-token fixture only. | New hold fixture must sustain VAD-active no-token audio for at least 8 s and assert `turn_human_hold`. |
 | `05-short-word` | Short word passes min speech and closes via smart_turn with no tokens. | Reclassify as `human-short-complete-no-transcript` diagnostic, not min-speech boundary. | Add synthetic below/at/above min-speech triplet for actual threshold coverage. |
 | `06-rapid-question` | Smart-turn close plus extra `session_end` close; transcript mismatch. | Candidate after recapture. | Recapture with terminal-marker capture to eliminate session-end artifact; transcript assertion must be tolerant or omitted. |
 | `07-self-interrupt` | Two VAD segments, one smart-turn close on recheck; minor transcript mismatch. | Candidate exhaustive natural scenario. | Import with coarse assertions around interruption/recheck; no exact transcript requirement. |
@@ -1019,7 +1019,7 @@ Required for first implementation:
 3. Direct event subscription and terminal marker waiting.
 4. Semantic assertion runner with `require`, `forbid`, `order`, numeric tolerances, and balanced-turn invariant.
 5. Deterministic synthetic/stub triplets for min-VAD-speech plus the MVP subset of exact threshold contracts: VAD probability, Smart Turn probability, installed fallback, transcript silence, and turn ownership/rearm.
-6. Synthetic acoustic fallback for installed 1700 ms profile.
+6. Synthetic acoustic fallback for installed 2500 ms profile.
 7. Transcript-silence close via deterministic harness.
 8. At least two accepted human fixtures: `human-clean-complete` and `human-rapid-question`, both with WAV hash, consent, cue timeline, observed speech timing, and no session-end extra close.
 9. Quarantine report for all legacy eight fixtures.
@@ -1034,7 +1034,7 @@ Required before declaring endpointing policy stable:
 1. Full natural catalog: clean, trailing off, pause-resume, human hold, rapid question, self-interrupt, slow thoughtful.
 2. VAD onset/hangover/min-speech triplets.
 3. Smart Turn recheck schedule, cancellation, exhaustion, and complete-close cases.
-4. Acoustic fallback under both `installed-live` 1700 ms and `code-defaults` 3500 ms profiles.
+4. Acoustic fallback under both `installed-live` 2500 ms and `code-defaults` 3500 ms profiles.
 5. Lifecycle/gap/drop/late-revision/disconnect/reused-ID suite.
 6. Live diagnostic subscription coverage for `vad_meter` and `turn_hold`.
 7. Three accepted takes for human-natural scenarios across at least two recording sessions.
@@ -1078,7 +1078,7 @@ Builds deterministic synthetic/generated WAVs and cue timelines.
 speech-core-golden capture \
   --manifest tests/golden/manifest.yaml \
   --profile golden-mvp \
-  --scenario synthetic-acoustic-fallback-installed-1700 \
+  --scenario synthetic-acoustic-fallback-installed-2500 \
   --wav tests/golden/fixtures/<scenario>/audio.wav \
   --url ws://127.0.0.1:8765/ws/audio-ingress \
   --out tests/golden-runs/<run_id>

@@ -1,6 +1,6 @@
-# human-hold-continuous-filler-7000
+# human-hold-continuous-filler-7500
 # Sustained non-word vocalization, human-hold close expected.
-scenario_id: human-hold-continuous-filler-7000
+scenario_id: human-hold-continuous-filler-7500
 class: natural_endpoint
 construction: human-recorded
 priority: exhaustive
@@ -44,11 +44,11 @@ assertions:
   sample_window:
     - name: no_close_before_hold
       forbid_event: turn_closed
-      window: [0, 7000]
+      window: [0, 7500]
     - name: force_close_on_hold
       event: turn_closed
       field: decision_sample
-      min_from: 7000ms
+      min_from: 7500ms
   rearm:
     require_low_release_after_forced_close: true
 

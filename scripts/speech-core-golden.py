@@ -993,7 +993,7 @@ def _default_cues_for_scenario(scenario_id: str) -> list:
             {"band_ms": [10500, 12500], "label": "STOP",
              "visual": "Stay quiet."},
         ],
-        "human-hold-continuous-filler-7000": [
+        "human-hold-continuous-filler-7500": [
             {"band_ms": [0, 3000], "label": "READY",
              "visual": "Prepare to sustain a non-word vocalization."},
             {"band_ms": [3000, 11200], "label": "HOLD",
@@ -1127,14 +1127,14 @@ SYNTHETIC_SCENARIO_PLANS: Dict[str, dict] = {
     },
 
     # ── Acoustic fallback ──
-    "synthetic-acoustic-fallback-installed-1700": {
+    "synthetic-acoustic-fallback-installed-2500": {
         "segments": [
             {"type": "silence", "duration_ms": 500},
             {"type": "speech_like", "duration_ms": 600, "base_freq": 200},
-            {"type": "silence", "duration_ms": 1900},
+            {"type": "silence", "duration_ms": 2700},
         ],
         "seed": 80,
-        "description": "Installed acoustic fallback at 1700ms — 1900ms silence to cross threshold",
+        "description": "Installed acoustic fallback at 2500ms — 2700ms silence to cross threshold",
     },
     "synthetic-acoustic-fallback-code-default-3500": {
         "segments": [

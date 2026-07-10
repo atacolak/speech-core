@@ -36,12 +36,12 @@ scenarios:
     description: "Short complete question"
     scenario_file: scenarios/human-rapid-question.yaml
 
-  - id: human-hold-continuous-filler-7000
+  - id: human-hold-continuous-filler-7500
     class: natural_endpoint
     construction: human-recorded
     priority: exhaustive
     description: "Sustained non-word vocalization, human-hold close expected"
-    scenario_file: scenarios/human-hold-continuous-filler-7000.yaml
+    scenario_file: scenarios/human-hold-continuous-filler-7500.yaml
 
   # ── VAD onset triplets ──
   - id: synthetic-vad-onset-below-32ms
@@ -108,11 +108,11 @@ scenarios:
     description: "Smart Turn recheck schedule probing"
 
   # ── Acoustic fallback ──
-  - id: synthetic-acoustic-fallback-installed-1700
+  - id: synthetic-acoustic-fallback-installed-2500
     class: fallback
     construction: synthetic
     priority: mvp
-    description: "Installed acoustic fallback at 1700ms"
+    description: "Installed acoustic fallback at 2500ms"
 
   - id: synthetic-acoustic-fallback-code-default-3500
     class: fallback

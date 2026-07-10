@@ -25,7 +25,7 @@ SPEECH_CORE_VAD_PRE_SPEECH_FRAMES=5     # ~160ms preroll
 SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
 SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
 SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=3000
+SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=2500
 SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400
 ```
 
@@ -34,7 +34,7 @@ meaning:
 1. vad emits speech start after 2 consecutive smoothed speech frames.
 2. vad emits speech end after 3 consecutive smoothed low-probability frames.
 3. tiny vad islands under 400ms are not allowed to become semantic closure candidates.
-4. if smart-turn holds incomplete and speech never resumes, low acoustic probability for 3s can close as degraded fallback.
+4. if smart-turn holds incomplete and speech never resumes, low acoustic probability for 2500ms can close as degraded fallback (installed profile; code-default is 3500ms).
 
 ## smart-turn config
 
@@ -50,7 +50,7 @@ SPEECH_CORE_SMART_TURN_RECHECK_MAX_ATTEMPTS=0
 SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
 SPEECH_CORE_TURN_SEMANTIC_GATE_ENABLED=true
 SPEECH_CORE_TURN_SEMANTIC_GATE_CLOSE_ENABLED=true
-SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=12000
+SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7500
 ```
 
 when vad emits `vad_speech_end`, smart-turn runs on recent audio up to the decision sample. with the default 3-frame hangover, that initial decision is roughly +96ms after the acoustic end sample. if it says complete, the turn closes. if it says incomplete, immediate vad closure is suppressed; delayed semantic probes follow the geometric schedule at +192ms, +384ms, +768ms, and +1536ms unless speech resumes.
