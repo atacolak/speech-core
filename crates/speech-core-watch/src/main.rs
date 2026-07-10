@@ -190,6 +190,8 @@ struct TuiModel {
     next_turn_number: u64,
     notes: VecDeque<String>,
     live_vad_bar: String,
+    live_fallback_bar: String,
+    live_hold_bar: String,
     speech_out_params: Option<String>,
     first_mono_ns: Option<u64>,
     last_transcript_display: String,
@@ -676,6 +678,27 @@ impl TuiModel {
                     .and_then(|v| v.as_u64())
                     .unwrap_or_default();
                 self.push_vad_bar(0, probability, smoothed, silence, hangover);
+                // Update fallback timer bar from vad_meter.
+                let fallback_progress = value
+                    .get("fallback_progress_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let fallback_target = value
+                    .get("fallback_target_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3500);
+                self.push_fallback_bar(fallback_progress, fallback_target);
+            }
+            "turn_hold" => {
+                let hold_progress = value
+                    .get("hold_progress_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let hold_target = value
+                    .get("hold_target_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(7000);
+                self.push_hold_bar(hold_progress, hold_target);
             }
             "vad_acoustic_fallback" => {
                 let idx = self.ensure_turn();
@@ -752,6 +775,14 @@ impl TuiModel {
         } else {
             out.push_str(&self.live_vad_bar);
             out.push('\n');
+            if !self.live_fallback_bar.is_empty() {
+                out.push_str(&self.live_fallback_bar);
+                out.push('\n');
+            }
+            if !self.live_hold_bar.is_empty() {
+                out.push_str(&self.live_hold_bar);
+                out.push('\n');
+            }
         }
         out
     }
@@ -847,6 +878,34 @@ impl TuiModel {
         };
         self.live_vad_bar =
             format!("raw:{raw} {probability:.2}  smooth:{smooth} {smoothed:.2}  stop:{quota}");
+    }
+
+    fn push_fallback_bar(&mut self, progress_ms: u64, target_ms: u64) {
+        let fraction = if target_ms > 0 {
+            (progress_ms as f64 / target_ms as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let bar = bar8(fraction);
+        self.live_fallback_bar = format!(
+            "  ⏲ fallback {bar} {:.1}/{:.1}s",
+            progress_ms as f64 / 1000.0,
+            target_ms as f64 / 1000.0
+        );
+    }
+
+    fn push_hold_bar(&mut self, progress_ms: u64, target_ms: u64) {
+        let fraction = if target_ms > 0 {
+            (progress_ms as f64 / target_ms as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let bar = bar8(fraction);
+        self.live_hold_bar = format!(
+            "  ⏸ hold    {bar} {:.1}/{:.1}s",
+            progress_ms as f64 / 1000.0,
+            target_ms as f64 / 1000.0
+        );
     }
 
     fn finalize_section(&mut self, idx: usize) {
