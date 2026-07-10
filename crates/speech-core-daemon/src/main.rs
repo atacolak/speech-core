@@ -22,6 +22,7 @@ use speech_core_protocol::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -476,6 +477,7 @@ async fn shutdown_signal() -> Result<()> {
 
 struct DaemonState {
     sessions: Mutex<HashMap<String, StreamState>>,
+    next_generation: AtomicU64,
     logger: JsonlLogger,
     model_ingress: Option<ModelIngress>,
     detector_ingress: Option<DetectorIngress>,
@@ -489,36 +491,103 @@ impl DaemonState {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
             logger,
             model_ingress,
             detector_ingress,
         }
     }
 
-    async fn start_session(&self, hello: HelloState, daemon_mono_ns: u64) -> Result<ServerEvent> {
+    async fn start_session(
+        &self,
+        mut hello: HelloState,
+        daemon_mono_ns: u64,
+    ) -> Result<(ServerEvent, HelloState)> {
+        hello.generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&hello.stream_session_id) {
+            bail!(
+                "stream session {} is already active",
+                hello.stream_session_id
+            );
+        }
         sessions.insert(
             hello.stream_session_id.clone(),
             StreamState::new(hello.clone()),
         );
         drop(sessions);
+
         if let Some(model) = &self.model_ingress {
-            model.start_session(&hello, &self.logger).await?;
+            if let Err(err) = model.start_session(&hello, &self.logger).await {
+                self.sessions.lock().await.remove(&hello.stream_session_id);
+                return Err(err);
+            }
         }
         if let Some(detector) = &self.detector_ingress {
-            detector.start_session(&hello, &self.logger).await?;
+            if let Err(err) = detector.start_session(&hello, &self.logger).await {
+                if let Some(model) = &self.model_ingress {
+                    let _ = model
+                        .end_session(&hello, &self.logger, "detector session start failed")
+                        .await;
+                }
+                self.sessions.lock().await.remove(&hello.stream_session_id);
+                return Err(err);
+            }
         }
-        Ok(ServerEvent::StreamStart(StreamStart {
-            stream_id: hello.stream_id,
-            stream_session_id: hello.stream_session_id,
-            adapter_id: hello.adapter_id,
+        let event = ServerEvent::StreamStart(StreamStart {
+            stream_id: hello.stream_id.clone(),
+            stream_session_id: hello.stream_session_id.clone(),
+            adapter_id: hello.adapter_id.clone(),
             source_kind: hello.source_kind,
             sample_rate_hz: hello.sample_rate_hz,
             channels: hello.channels,
             format: hello.format,
-            timestamp_provenance: hello.timestamp_provenance,
+            timestamp_provenance: hello.timestamp_provenance.clone(),
             daemon_mono_ns,
-        }))
+        });
+        Ok((event, hello))
+    }
+
+    async fn end_session(&self, hello: &HelloState, reason: &str) -> Result<()> {
+        let mut result = Ok(());
+        if let Some(model) = &self.model_ingress {
+            if let Err(err) = model
+                .end_session(hello, &self.logger, reason.to_owned())
+                .await
+            {
+                result = Err(err);
+            }
+        }
+        if let Some(detector) = &self.detector_ingress {
+            if let Err(err) = detector
+                .end_session(hello, &self.logger, reason.to_owned())
+                .await
+            {
+                if result.is_ok() {
+                    result = Err(err);
+                }
+            }
+        }
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&hello.stream_session_id)
+                .is_some_and(|stream| stream.hello.generation == hello.generation)
+            {
+                sessions.remove(&hello.stream_session_id)
+            } else {
+                None
+            }
+        };
+        if removed.is_none() && result.is_ok() {
+            debug!(session_id = %hello.stream_session_id, generation = hello.generation, reason, "session cleanup requested for inactive or superseded session");
+        }
+        result
+    }
+
+    #[cfg(test)]
+    async fn session_count(&self) -> usize {
+        self.sessions.lock().await.len()
     }
 
     async fn ingest(
@@ -536,12 +605,17 @@ impl DaemonState {
 
         let mut sessions = self.sessions.lock().await;
         let stream = sessions
-            .entry(frame.header.stream_session_id.clone())
-            .or_insert_with(|| StreamState::new(hello.clone()));
+            .get_mut(&frame.header.stream_session_id)
+            .with_context(|| {
+                format!(
+                    "stream session {} is not active",
+                    frame.header.stream_session_id
+                )
+            })?;
 
         let sequence_gap = match stream.next_seq {
             Some(expected) if frame.header.seq == expected => None,
-            Some(expected) => Some(frame.header.seq as i64 - expected as i64),
+            Some(expected) => Some(signed_u64_delta(frame.header.seq, expected)),
             None => None,
         };
 
@@ -565,7 +639,7 @@ impl DaemonState {
                     adapter_id: frame.header.adapter_id.clone(),
                     expected_sample_start: expected,
                     observed_sample_start: frame.header.source_sample_start,
-                    delta_samples: frame.header.source_sample_start as i64 - expected as i64,
+                    delta_samples: signed_u64_delta(frame.header.source_sample_start, expected),
                     declared_source_gap: frame.header.preceding_source_gap.clone(),
                 })
             }
@@ -633,6 +707,16 @@ impl DaemonState {
         };
         drop(sessions);
 
+        let reset = sample_gap.as_ref().and_then(AudioGapReset::from_sample_gap);
+        if let Some(reset) = reset.clone() {
+            if let Some(model) = &self.model_ingress {
+                model.reset_audio(reset.clone(), &self.logger).await?;
+            }
+            if let Some(detector) = &self.detector_ingress {
+                detector.reset_audio(reset, &self.logger).await?;
+            }
+        }
+
         if let Some(model) = &self.model_ingress {
             model
                 .ingest_frame(&frame, &self.logger, ingress_receive_mono_ns)
@@ -662,11 +746,12 @@ struct HelloState {
     channels: u16,
     format: PcmFormat,
     timestamp_provenance: TimestampProvenance,
+    generation: u64,
 }
 
 #[derive(Clone)]
 struct StreamState {
-    _hello: HelloState,
+    hello: HelloState,
     next_seq: Option<u64>,
     next_sample_start: Option<u64>,
     frames_seen: u64,
@@ -675,7 +760,7 @@ struct StreamState {
 impl StreamState {
     fn new(hello: HelloState) -> Self {
         Self {
-            _hello: hello,
+            hello,
             next_seq: None,
             next_sample_start: None,
             frames_seen: 0,
@@ -742,86 +827,75 @@ async fn handle_connection(
     let mut hello: Option<HelloState> = None;
     info!(peer = %peer, "audio ingress websocket connected");
 
+    let loop_result: Result<()> = async {
     while let Some(msg) = source.next().await {
-        let msg = match msg {
-            Ok(msg) => msg,
-            Err(err) => {
-                warn!(peer = %peer, error = ?err, "websocket receive failed; finalizing session");
-                break;
-            }
-        };
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(err) => {
+                    warn!(peer = %peer, error = ?err, "websocket receive failed; finalizing session");
+                    break;
+                }
+            };
 
-        match msg {
-            Message::Binary(bytes) => {
-                let ingress_receive_mono_ns = now_mono_ns();
-                let Some(hello_state) = hello.as_ref() else {
-                    let event = ServerEvent::Error {
-                        message: "binary audio received before hello".to_owned(),
+            match msg {
+                Message::Binary(bytes) => {
+                    let ingress_receive_mono_ns = now_mono_ns();
+                    let Some(hello_state) = hello.as_ref() else {
+                        let event = ServerEvent::Error {
+                            message: "binary audio received before hello".to_owned(),
+                        };
+                        state.logger.write(&event).await?;
+                        sink.send(Message::Text(serde_json::to_string(&event)?))
+                            .await?;
+                        continue;
                     };
-                    state.logger.write(&event).await?;
-                    sink.send(Message::Text(serde_json::to_string(&event)?))
-                        .await?;
-                    continue;
-                };
 
-                match AudioFrame::decode(&bytes) {
-                    Ok(frame) => match state
-                        .ingest(hello_state, frame, ingress_receive_mono_ns)
-                        .await
-                    {
-                        Ok(outcome) => {
-                            if let Some(gap) = &outcome.seq_gap {
-                                warn!(stream_id = %gap.stream_id, session_id = %gap.stream_session_id, expected_seq = gap.expected_seq, observed_seq = gap.observed_seq, "sequence gap detected");
-                                let event = ServerEvent::AudioGap(gap.clone());
+                    match AudioFrame::decode(&bytes) {
+                        Ok(frame) => match state
+                            .ingest(hello_state, frame, ingress_receive_mono_ns)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if let Some(gap) = &outcome.seq_gap {
+                                    warn!(stream_id = %gap.stream_id, session_id = %gap.stream_session_id, expected_seq = gap.expected_seq, observed_seq = gap.observed_seq, "sequence gap detected");
+                                    let event = ServerEvent::AudioGap(gap.clone());
+                                    state.logger.write(&event).await?;
+                                    sink.send(Message::Text(serde_json::to_string(&event)?))
+                                        .await?;
+                                }
+                                if let Some(gap) = &outcome.sample_gap {
+                                    warn!(stream_id = %gap.stream_id, session_id = %gap.stream_session_id, expected_sample_start = gap.expected_sample_start, observed_sample_start = gap.observed_sample_start, "sample-clock discontinuity detected");
+                                    let event = ServerEvent::AudioSampleGap(gap.clone());
+                                    state.logger.write(&event).await?;
+                                    sink.send(Message::Text(serde_json::to_string(&event)?))
+                                        .await?;
+                                }
+
+                                let _ = outcome.event;
+                            }
+                            Err(err) => {
+                                warn!(peer = %peer, error = ?err, "invalid audio frame metadata");
+                                let event = ServerEvent::Error {
+                                    message: format!("invalid audio frame metadata: {err}"),
+                                };
                                 state.logger.write(&event).await?;
                                 sink.send(Message::Text(serde_json::to_string(&event)?))
                                     .await?;
                             }
-                            if let Some(gap) = &outcome.sample_gap {
-                                warn!(stream_id = %gap.stream_id, session_id = %gap.stream_session_id, expected_sample_start = gap.expected_sample_start, observed_sample_start = gap.observed_sample_start, "sample-clock discontinuity detected");
-                                let event = ServerEvent::AudioSampleGap(gap.clone());
-                                state.logger.write(&event).await?;
-                                sink.send(Message::Text(serde_json::to_string(&event)?))
-                                    .await?;
-                            }
-
-                            let _ = outcome.event;
-                        }
+                        },
                         Err(err) => {
-                            warn!(peer = %peer, error = ?err, "invalid audio frame metadata");
+                            warn!(peer = %peer, error = ?err, "invalid audio frame");
                             let event = ServerEvent::Error {
-                                message: format!("invalid audio frame metadata: {err}"),
+                                message: format!("invalid audio frame: {err}"),
                             };
                             state.logger.write(&event).await?;
                             sink.send(Message::Text(serde_json::to_string(&event)?))
                                 .await?;
                         }
-                    },
-                    Err(err) => {
-                        warn!(peer = %peer, error = ?err, "invalid audio frame");
-                        let event = ServerEvent::Error {
-                            message: format!("invalid audio frame: {err}"),
-                        };
-                        state.logger.write(&event).await?;
-                        sink.send(Message::Text(serde_json::to_string(&event)?))
-                            .await?;
                     }
                 }
-            }
-            Message::Text(text) => match serde_json::from_str::<ControlMessage>(&text) {
-                Ok(ControlMessage::Hello {
-                    adapter_id,
-                    stream_id,
-                    stream_session_id,
-                    source_kind,
-                    sample_rate_hz,
-                    channels,
-                    format,
-                    timestamp_provenance,
-                    adapter_hello_send_mono_ns,
-                }) => {
-                    let daemon_receive_mono_ns = now_mono_ns();
-                    let hello_state = HelloState {
+                Message::Text(text) => match serde_json::from_str::<ControlMessage>(&text) {
+                    Ok(ControlMessage::Hello {
                         adapter_id,
                         stream_id,
                         stream_session_id,
@@ -830,85 +904,168 @@ async fn handle_connection(
                         channels,
                         format,
                         timestamp_provenance,
-                    };
-                    info!(peer = %peer, adapter_id = %hello_state.adapter_id, stream_id = %hello_state.stream_id, session_id = %hello_state.stream_session_id, source_kind = %hello_state.source_kind, sample_rate_hz, channels, format = %hello_state.format, "adapter hello");
-
-                    let stream_start = state
-                        .start_session(hello_state.clone(), daemon_receive_mono_ns)
-                        .await?;
-                    state.logger.write(&stream_start).await?;
-                    sink.send(Message::Text(serde_json::to_string(&stream_start)?))
-                        .await?;
-
-                    let daemon_send_mono_ns = now_mono_ns();
-                    let ack = ServerEvent::HelloAck(HelloAck {
-                        stream_id: hello_state.stream_id.clone(),
-                        stream_session_id: hello_state.stream_session_id.clone(),
-                        adapter_id: hello_state.adapter_id.clone(),
-                        daemon_receive_mono_ns,
-                        daemon_send_mono_ns,
                         adapter_hello_send_mono_ns,
-                        clock_comparability: hello_state.timestamp_provenance.clock_comparability,
-                        estimated_offset_uncertainty_ns: hello_state
-                            .timestamp_provenance
-                            .estimated_offset_uncertainty_ns,
-                    });
-                    state.logger.write(&ack).await?;
-                    sink.send(Message::Text(serde_json::to_string(&ack)?))
-                        .await?;
-                    hello = Some(hello_state);
-                }
-                Ok(ControlMessage::SubscribeEvents {
-                    stream_id,
-                    stream_session_id,
-                    event,
-                }) => {
-                    info!(peer = %peer, ?stream_id, ?stream_session_id, ?event, "event subscriber connected");
-                    stream_events_to_subscriber(
-                        &mut sink,
-                        state.logger.subscribe(),
+                    }) => {
+                        if hello.is_some() {
+                            let event = ServerEvent::Error {
+                                message: "hello already accepted for this connection".to_owned(),
+                            };
+                            state.logger.write(&event).await?;
+                            sink.send(Message::Text(serde_json::to_string(&event)?))
+                                .await?;
+                            continue;
+                        }
+                        let daemon_receive_mono_ns = now_mono_ns();
+                        let hello_state = HelloState {
+                            adapter_id,
+                            stream_id,
+                            stream_session_id,
+                            source_kind,
+                            sample_rate_hz,
+                            channels,
+                            format,
+                            timestamp_provenance,
+                            generation: 0,
+                        };
+                        info!(peer = %peer, adapter_id = %hello_state.adapter_id, stream_id = %hello_state.stream_id, session_id = %hello_state.stream_session_id, source_kind = %hello_state.source_kind, sample_rate_hz, channels, format = %hello_state.format, "adapter hello");
+
+                        let (stream_start, accepted_hello_state) = state
+                            .start_session(hello_state.clone(), daemon_receive_mono_ns)
+                            .await?;
+                        hello = Some(accepted_hello_state.clone());
+                        state.logger.write(&stream_start).await?;
+                        sink.send(Message::Text(serde_json::to_string(&stream_start)?))
+                            .await?;
+
+                        let daemon_send_mono_ns = now_mono_ns();
+                        let ack = ServerEvent::HelloAck(HelloAck {
+                            stream_id: accepted_hello_state.stream_id.clone(),
+                            stream_session_id: accepted_hello_state.stream_session_id.clone(),
+                            adapter_id: accepted_hello_state.adapter_id.clone(),
+                            daemon_receive_mono_ns,
+                            daemon_send_mono_ns,
+                            adapter_hello_send_mono_ns,
+                            clock_comparability: accepted_hello_state
+                                .timestamp_provenance
+                                .clock_comparability,
+                            estimated_offset_uncertainty_ns: accepted_hello_state
+                                .timestamp_provenance
+                                .estimated_offset_uncertainty_ns,
+                        });
+                        state.logger.write(&ack).await?;
+                        sink.send(Message::Text(serde_json::to_string(&ack)?))
+                            .await?;
+                    }
+                    Ok(ControlMessage::SubscribeEvents {
                         stream_id,
                         stream_session_id,
                         event,
-                    )
-                    .await?;
+                    }) => {
+                        info!(peer = %peer, ?stream_id, ?stream_session_id, ?event, "event subscriber connected");
+                        stream_events_to_subscriber(
+                            &mut sink,
+                            state.logger.subscribe(),
+                            stream_id,
+                            stream_session_id,
+                            event,
+                        )
+                        .await?;
+                        break;
+                    }
+                    Ok(control) => {
+                        debug!(?control, "control message");
+                    }
+                    Err(err) => {
+                        warn!(peer = %peer, error = ?err, "invalid control json");
+                        let event = ServerEvent::Error {
+                            message: format!("invalid control json: {err}"),
+                        };
+                        state.logger.write(&event).await?;
+                        sink.send(Message::Text(serde_json::to_string(&event)?))
+                            .await?;
+                    }
+                },
+                Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
+                Message::Pong(_) => {}
+                Message::Close(close) => {
+                    info!(peer = %peer, ?close, "websocket closed");
                     break;
                 }
-                Ok(control) => {
-                    debug!(?control, "control message");
-                }
-                Err(err) => {
-                    warn!(peer = %peer, error = ?err, "invalid control json");
-                    let event = ServerEvent::Error {
-                        message: format!("invalid control json: {err}"),
-                    };
-                    state.logger.write(&event).await?;
-                    sink.send(Message::Text(serde_json::to_string(&event)?))
-                        .await?;
-                }
-            },
-            Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
-            Message::Pong(_) => {}
-            Message::Close(close) => {
-                info!(peer = %peer, ?close, "websocket closed");
-                break;
+                Message::Frame(_) => {}
             }
-            Message::Frame(_) => {}
+        }
+
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(hello_state) = hello.as_ref() {
+        if let Err(cleanup_err) = state
+            .end_session(hello_state, "websocket connection ended")
+            .await
+        {
+            warn!(peer = %peer, error = ?cleanup_err, "session cleanup failed");
+            if loop_result.is_ok() {
+                return Err(cleanup_err);
+            }
         }
     }
 
-    if let (Some(model), Some(hello_state)) = (&state.model_ingress, hello.as_ref()) {
-        model
-            .end_session(hello_state, &state.logger, "websocket connection ended")
-            .await?;
-    }
-    if let (Some(detector), Some(hello_state)) = (&state.detector_ingress, hello.as_ref()) {
-        detector
-            .end_session(hello_state, &state.logger, "websocket connection ended")
-            .await?;
+    loop_result
+}
+
+fn signed_u64_delta(observed: u64, expected: u64) -> i64 {
+    let delta = i128::from(observed) - i128::from(expected);
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AudioGapReset {
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    expected_sample_start: u64,
+    observed_sample_start: u64,
+    delta_samples: i64,
+    reason: String,
+}
+
+impl AudioGapReset {
+    pub(crate) fn from_dropped_frame(frame: &AudioFrame, reason: impl Into<String>) -> Self {
+        let expected_sample_start = frame.header.source_sample_start;
+        let observed_sample_start =
+            expected_sample_start.saturating_add(frame.header.sample_count.into());
+        Self {
+            stream_id: frame.header.stream_id.clone(),
+            stream_session_id: frame.header.stream_session_id.clone(),
+            adapter_id: frame.header.adapter_id.clone(),
+            expected_sample_start,
+            observed_sample_start,
+            delta_samples: signed_u64_delta(observed_sample_start, expected_sample_start),
+            reason: reason.into(),
+        }
     }
 
-    Ok(())
+    fn from_sample_gap(gap: &AudioSampleGap) -> Option<Self> {
+        let reason = gap
+            .declared_source_gap
+            .as_ref()
+            .map(|source_gap| source_gap.reason.clone())
+            .unwrap_or_else(|| "sample_clock_discontinuity".to_owned());
+        if gap.delta_samples == 0 && gap.declared_source_gap.is_none() {
+            return None;
+        }
+        Some(Self {
+            stream_id: gap.stream_id.clone(),
+            stream_session_id: gap.stream_session_id.clone(),
+            adapter_id: gap.adapter_id.clone(),
+            expected_sample_start: gap.expected_sample_start,
+            observed_sample_start: gap.observed_sample_start,
+            delta_samples: gap.delta_samples,
+            reason,
+        })
+    }
 }
 
 async fn stream_events_to_subscriber(
@@ -1086,6 +1243,7 @@ mod tests {
             channels: 1,
             format: PcmFormat::PcmS16Le,
             timestamp_provenance: provenance(),
+            generation: 0,
         }
     }
 
@@ -1124,7 +1282,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = DaemonState::new(logger(&dir).await, None, None);
         let hello = hello("session-a");
-        state.start_session(hello.clone(), 1).await.unwrap();
+        let (_, hello) = state.start_session(hello, 1).await.unwrap();
 
         let outcome = state
             .ingest(&hello, frame("session-a", 0, 0), 3_000)
@@ -1146,12 +1304,12 @@ mod tests {
         let state = DaemonState::new(logger(&dir).await, None, None);
         let first = hello("session-a");
         let second = hello("session-b");
-        state.start_session(first.clone(), 1).await.unwrap();
+        let (_, first) = state.start_session(first, 1).await.unwrap();
         state
             .ingest(&first, frame("session-a", 10, 3200), 3_000)
             .await
             .unwrap();
-        state.start_session(second.clone(), 2).await.unwrap();
+        let (_, second) = state.start_session(second, 2).await.unwrap();
 
         let outcome = state
             .ingest(&second, frame("session-b", 0, 0), 4_000)
@@ -1226,6 +1384,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn duplicate_hello_is_rejected_and_original_session_cleaned_up() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(DaemonState::new(logger(&dir).await, None, None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer, server_state).await.unwrap();
+        });
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let control = ControlMessage::Hello {
+            adapter_id: "test.adapter".into(),
+            stream_id: "test.stream".into(),
+            stream_session_id: "session-a".into(),
+            source_kind: SourceKind::Synthetic,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            format: PcmFormat::PcmS16Le,
+            timestamp_provenance: provenance(),
+            adapter_hello_send_mono_ns: 1,
+        };
+        let text = serde_json::to_string(&control).unwrap();
+        ws.send(ClientMessage::Text(text.clone())).await.unwrap();
+        let _ = ws.next().await.unwrap().unwrap();
+        let _ = ws.next().await.unwrap().unwrap();
+        ws.send(ClientMessage::Text(text)).await.unwrap();
+        let msg = ws.next().await.unwrap().unwrap();
+        let ClientMessage::Text(text) = msg else {
+            panic!("expected duplicate hello error text, got {msg:?}");
+        };
+        assert!(text.contains("hello already accepted"));
+        ws.close(None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(state.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_startup_failure_rolls_back_registry() {
+        let dir = tempdir().unwrap();
+        let state = DaemonState::new(
+            logger(&dir).await,
+            None,
+            Some(DetectorIngress::failing_start_for_test(
+                "detector start failed",
+            )),
+        );
+        let result = state.start_session(hello("session-a"), 1).await;
+        assert!(result.is_err());
+        assert_eq!(state.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_does_not_recreate_after_cleanup() {
+        let dir = tempdir().unwrap();
+        let state = DaemonState::new(logger(&dir).await, None, None);
+        let hello = hello("session-a");
+        let (_, hello) = state.start_session(hello, 1).await.unwrap();
+        state.end_session(&hello, "test cleanup").await.unwrap();
+
+        let result = state.ingest(&hello, frame("session-a", 0, 0), 3_000).await;
+        let err = match result {
+            Ok(_) => panic!("ingest unexpectedly recreated an inactive session"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("is not active"));
+        assert_eq!(state.session_count().await, 0);
+    }
+
+    #[test]
+    fn signed_delta_clamps_extreme_u64_gap_arithmetic() {
+        assert_eq!(signed_u64_delta(u64::MAX, 0), i64::MAX);
+        assert_eq!(signed_u64_delta(0, u64::MAX), i64::MIN);
+        assert_eq!(signed_u64_delta(42, 40), 2);
+    }
+
     fn event_type(event: &ServerEvent) -> &'static str {
         match event {
             ServerEvent::StreamStart(_) => "stream_start",
@@ -1243,7 +1479,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = DaemonState::new(logger(&dir).await, None, None);
         let hello = hello("session-a");
-        state.start_session(hello.clone(), 1).await.unwrap();
+        let (_, hello) = state.start_session(hello, 1).await.unwrap();
         state
             .ingest(&hello, frame("session-a", 0, 0), 3_000)
             .await
@@ -1291,7 +1527,7 @@ mod tests {
         let mut frame = frame("session-a", 0, 0);
         frame.header.timestamp_provenance = hello.timestamp_provenance.clone();
         assert!(validate_frame_against_hello(&hello, &frame).is_ok());
-        state.start_session(hello.clone(), 1).await.unwrap();
+        let (_, hello) = state.start_session(hello, 1).await.unwrap();
 
         let outcome = state.ingest(&hello, frame, 11_000_000).await.unwrap();
         assert_eq!(outcome.event.capture_to_ingress.value_ms, None);

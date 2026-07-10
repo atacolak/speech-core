@@ -4,10 +4,10 @@ use speech_core_protocol::{now_mono_ns, AudioFrame, PcmFormat};
 use std::collections::VecDeque;
 use std::thread;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::{HelloState, JsonlLogger};
+use crate::{AudioGapReset, HelloState, JsonlLogger};
 
 pub mod parakeet_eou;
 pub mod smart_turn;
@@ -36,39 +36,77 @@ impl DetectorConfig {
 
 #[derive(Clone)]
 pub struct DetectorIngress {
-    sender: mpsc::Sender<DetectorCommand>,
+    control_sender: mpsc::UnboundedSender<DetectorCommand>,
+    audio_sender: mpsc::Sender<DetectorCommand>,
 }
 
 impl DetectorIngress {
     pub fn start(config: DetectorConfig, logger: JsonlLogger) -> Self {
-        let (sender, mut receiver) = mpsc::channel(config.queue_frames.max(1));
+        let (control_sender, mut control_receiver) = mpsc::unbounded_channel();
+        let (audio_sender, mut audio_receiver) = mpsc::channel(config.queue_frames.max(1));
         let runtime = Handle::current();
         thread::spawn(move || {
             info!(?config, "starting detector worker");
             let mut worker = DetectorWorker::new(config, logger, runtime);
-            while let Some(command) = receiver.blocking_recv() {
-                worker.handle(command);
+            let mut control_closed = false;
+            let mut audio_closed = false;
+            loop {
+                let mut handled = false;
+                loop {
+                    match control_receiver.try_recv() {
+                        Ok(command) => {
+                            worker.handle(command);
+                            handled = true;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            control_closed = true;
+                            break;
+                        }
+                    }
+                }
+                match audio_receiver.try_recv() {
+                    Ok(command) => {
+                        worker.handle(command);
+                        handled = true;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => audio_closed = true,
+                }
+                if control_closed && audio_closed {
+                    break;
+                }
+                if !handled {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             worker.finalize_all("detector worker channel closed");
         });
-        Self { sender }
+        Self {
+            control_sender,
+            audio_sender,
+        }
     }
 
     pub async fn start_session(&self, hello: &HelloState, logger: &JsonlLogger) -> Result<()> {
-        match self.sender.try_send(DetectorCommand::StartSession {
-            hello: hello.clone(),
-        }) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                log_detector_enqueue_error(
-                    logger,
-                    &command,
-                    "detector queue full at session start",
-                )
-                .await?;
-                bail!("detector queue full at session start")
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control_sender
+            .send(DetectorCommand::StartSession {
+                hello: hello.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("detector control path closed at session start"))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                log_detector_start_error(logger, hello, &err.to_string()).await?;
+                Err(err)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => bail!("detector channel closed"),
+            Err(_) => {
+                let err = anyhow::anyhow!("detector worker dropped session start acknowledgement");
+                log_detector_start_error(logger, hello, &err.to_string()).await?;
+                Err(err)
+            }
         }
     }
 
@@ -78,7 +116,7 @@ impl DetectorIngress {
         logger: &JsonlLogger,
         ingress_receive_mono_ns: u64,
     ) -> Result<()> {
-        match self.sender.try_send(DetectorCommand::AudioFrame {
+        match self.audio_sender.try_send(DetectorCommand::AudioFrame {
             frame: frame.clone(),
             ingress_receive_mono_ns,
         }) {
@@ -86,6 +124,9 @@ impl DetectorIngress {
             Err(mpsc::error::TrySendError::Full(command)) => {
                 log_detector_enqueue_error(logger, &command, "detector queue full; dropping frame")
                     .await?;
+                let gap =
+                    AudioGapReset::from_dropped_frame(frame, "detector_worker_audio_queue_full");
+                self.reset_audio(gap, logger).await?;
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => bail!("detector channel closed"),
@@ -93,15 +134,15 @@ impl DetectorIngress {
     }
 
     pub fn transcript_token_committed(&self, token: TranscriptTokenSignal) -> Result<()> {
-        self.sender
-            .try_send(DetectorCommand::TranscriptTokenCommitted { token })
+        self.control_sender
+            .send(DetectorCommand::TranscriptTokenCommitted { token })
             .map_err(|err| anyhow::anyhow!("detector queue rejected transcript token: {err}"))
     }
 
     pub async fn end_session(
         &self,
         hello: &HelloState,
-        logger: &JsonlLogger,
+        _logger: &JsonlLogger,
         reason: impl Into<String>,
     ) -> Result<()> {
         let command = DetectorCommand::EndSession {
@@ -110,14 +151,31 @@ impl DetectorIngress {
             adapter_id: hello.adapter_id.clone(),
             reason: reason.into(),
         };
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                log_detector_enqueue_error(logger, &command, "detector queue full at session end")
-                    .await?;
-                Ok(())
+        self.control_sender
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("detector control path closed at session end"))
+    }
+
+    pub async fn reset_audio(&self, gap: AudioGapReset, _logger: &JsonlLogger) -> Result<()> {
+        self.control_sender
+            .send(DetectorCommand::AudioGapReset { gap })
+            .map_err(|_| anyhow::anyhow!("detector control path closed at audio gap reset"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failing_start_for_test(message: &'static str) -> Self {
+        let (control_sender, mut control_receiver) = mpsc::unbounded_channel();
+        let (audio_sender, _audio_receiver) = mpsc::channel(1);
+        thread::spawn(move || {
+            while let Some(command) = control_receiver.blocking_recv() {
+                if let DetectorCommand::StartSession { reply, .. } = command {
+                    let _ = reply.send(Err(anyhow::anyhow!(message)));
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        });
+        Self {
+            control_sender,
+            audio_sender,
         }
     }
 }
@@ -140,6 +198,7 @@ pub struct TranscriptTokenSignal {
 enum DetectorCommand {
     StartSession {
         hello: HelloState,
+        reply: oneshot::Sender<Result<()>>,
     },
     AudioFrame {
         frame: AudioFrame,
@@ -154,12 +213,15 @@ enum DetectorCommand {
         adapter_id: String,
         reason: String,
     },
+    AudioGapReset {
+        gap: AudioGapReset,
+    },
 }
 
 impl DetectorCommand {
     fn ids(&self) -> (String, String, String) {
         match self {
-            DetectorCommand::StartSession { hello } => (
+            DetectorCommand::StartSession { hello, .. } => (
                 hello.stream_id.clone(),
                 hello.stream_session_id.clone(),
                 hello.adapter_id.clone(),
@@ -184,8 +246,31 @@ impl DetectorCommand {
                 stream_session_id.clone(),
                 adapter_id.clone(),
             ),
+            DetectorCommand::AudioGapReset { gap } => (
+                gap.stream_id.clone(),
+                gap.stream_session_id.clone(),
+                gap.adapter_id.clone(),
+            ),
         }
     }
+}
+
+async fn log_detector_start_error(
+    logger: &JsonlLogger,
+    hello: &HelloState,
+    message: &str,
+) -> Result<()> {
+    logger
+        .write(&DetectorErrorEvent {
+            event: "detector_error",
+            stream_id: hello.stream_id.clone(),
+            stream_session_id: hello.stream_session_id.clone(),
+            adapter_id: hello.adapter_id.clone(),
+            detector: "detector_worker",
+            message: message.to_owned(),
+            daemon_mono_ns: now_mono_ns(),
+        })
+        .await
 }
 
 async fn log_detector_enqueue_error(
@@ -303,17 +388,32 @@ impl DetectorWorker {
         let mut writer = DetectorWriter::new(&logger, &runtime);
         let result = (|| -> Result<()> {
             match command {
-                DetectorCommand::StartSession { hello } => {
+                DetectorCommand::StartSession { hello, reply } => {
                     self.semantic_rechecks
                         .retain(|state| state.stream_session_id != hello.stream_session_id);
-                    self.turn_manager.start_session(&hello, &mut writer)?;
-                    if let Some(smart_turn) = &mut self.smart_turn {
-                        smart_turn.start_session(&hello, &mut writer)?;
+                    let result = (|| -> Result<()> {
+                        self.turn_manager.start_session(&hello, &mut writer)?;
+                        if let Some(smart_turn) = &mut self.smart_turn {
+                            smart_turn.start_session(&hello, &mut writer)?;
+                        }
+                        for detector in &mut self.detectors {
+                            detector.start_session(&hello, &mut writer)?;
+                        }
+                        Ok(())
+                    })();
+                    if result.is_err() {
+                        let _ = self.end_session_inner(
+                            &hello.stream_session_id,
+                            "detector session start failed",
+                            &mut writer,
+                        );
                     }
-                    for detector in &mut self.detectors {
-                        detector.start_session(&hello, &mut writer)?;
-                    }
-                    Ok(())
+                    let reply_result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+                    };
+                    let _ = reply.send(reply_result);
+                    result
                 }
                 DetectorCommand::AudioFrame {
                     frame,
@@ -371,27 +471,62 @@ impl DetectorWorker {
                     stream_session_id,
                     reason,
                     ..
-                } => {
-                    self.semantic_rechecks
-                        .retain(|state| state.stream_session_id != stream_session_id);
-                    for detector_idx in 0..self.detectors.len() {
-                        let signals = {
-                            let detector = &mut self.detectors[detector_idx];
-                            detector.end_session(&stream_session_id, &reason, &mut writer)?
-                        };
-                        self.handle_signals(signals, &mut writer)?;
-                    }
-                    if let Some(smart_turn) = &mut self.smart_turn {
-                        smart_turn.end_session(&stream_session_id, &reason, &mut writer)?;
-                    }
-                    self.turn_manager
-                        .end_session(&stream_session_id, &reason, &mut writer)
-                }
+                } => self.end_session_inner(&stream_session_id, &reason, &mut writer),
+                DetectorCommand::AudioGapReset { gap } => self.audio_gap_reset(gap, &mut writer),
             }
         })();
         if let Err(err) = result {
             warn!(error = ?err, "detector worker command failed");
         }
+    }
+
+    fn end_session_inner(
+        &mut self,
+        stream_session_id: &str,
+        reason: &str,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        self.semantic_rechecks
+            .retain(|state| state.stream_session_id != stream_session_id);
+        for detector_idx in 0..self.detectors.len() {
+            let signals = {
+                let detector = &mut self.detectors[detector_idx];
+                detector.end_session(stream_session_id, reason, writer)?
+            };
+            self.handle_signals(signals, writer)?;
+        }
+        if let Some(smart_turn) = &mut self.smart_turn {
+            smart_turn.end_session(stream_session_id, reason, writer)?;
+        }
+        self.turn_manager
+            .end_session(stream_session_id, reason, writer)
+    }
+
+    fn audio_gap_reset(
+        &mut self,
+        gap: AudioGapReset,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        self.semantic_rechecks
+            .retain(|state| state.stream_session_id != gap.stream_session_id);
+        self.turn_manager.audio_gap_reset(&gap, writer)?;
+        if let Some(smart_turn) = &mut self.smart_turn {
+            smart_turn.audio_gap_reset(&gap, writer)?;
+        }
+        for detector in &mut self.detectors {
+            detector.audio_gap_reset(&gap, writer)?;
+        }
+        writer.write(&DetectorAudioGapResetEvent {
+            event: "detector_audio_gap_reset",
+            stream_id: gap.stream_id,
+            stream_session_id: gap.stream_session_id,
+            adapter_id: gap.adapter_id,
+            expected_sample_start: gap.expected_sample_start,
+            observed_sample_start: gap.observed_sample_start,
+            delta_samples: gap.delta_samples,
+            reason: gap.reason,
+            daemon_mono_ns: now_mono_ns(),
+        })
     }
 
     fn upsert_semantic_recheck(
@@ -778,6 +913,14 @@ pub trait AudioDetector: Send {
     ) -> Result<()> {
         Ok(())
     }
+
+    fn audio_gap_reset(
+        &mut self,
+        _gap: &AudioGapReset,
+        _writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +1043,19 @@ pub enum DetectorSignal {
         silence_samples: u64,
         confidence: Option<f32>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct DetectorAudioGapResetEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    expected_sample_start: u64,
+    observed_sample_start: u64,
+    delta_samples: i64,
+    reason: String,
+    daemon_mono_ns: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1273,6 +1429,75 @@ mod tests {
     }
 
     #[test]
+    fn audio_gap_reset_reaches_turn_and_detector_state() {
+        with_worker(
+            TurnManagerConfig {
+                vad_close_enabled: true,
+                ..Default::default()
+            },
+            |worker, runtime, actions, _signal_batches| {
+                let logger = worker.logger.clone();
+                let mut writer = DetectorWriter::new(&logger, runtime.handle());
+                worker
+                    .handle_signals(
+                        vec![DetectorSignal::VadSegmentStart {
+                            detector: "silero_vad",
+                            stream_id: "test.stream".into(),
+                            stream_session_id: "test.session".into(),
+                            adapter_id: "test.adapter".into(),
+                            start_sample: 0,
+                            decision_sample: 512,
+                            confidence: Some(0.9),
+                        }],
+                        &mut writer,
+                    )
+                    .unwrap();
+                worker
+                    .audio_gap_reset(
+                        AudioGapReset {
+                            stream_id: "test.stream".into(),
+                            stream_session_id: "test.session".into(),
+                            adapter_id: "test.adapter".into(),
+                            expected_sample_start: 320,
+                            observed_sample_start: 960,
+                            delta_samples: 640,
+                            reason: "test_gap".into(),
+                        },
+                        &mut writer,
+                    )
+                    .unwrap();
+                let actions = actions.lock().unwrap();
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    DetectorAction::ResetEouState {
+                        reason: "vad_speech_start",
+                        ..
+                    }
+                )));
+                // No second reset is emitted for a VAD end after the gap because the
+                // active turn/speech state was closed and cleared by audio_gap_reset.
+                let after_gap = worker
+                    .turn_manager
+                    .handle_signal(
+                        DetectorSignal::VadSegmentEnd {
+                            detector: "silero_vad",
+                            stream_id: "test.stream".into(),
+                            stream_session_id: "test.session".into(),
+                            adapter_id: "test.adapter".into(),
+                            start_sample: 0,
+                            end_sample: 320,
+                            decision_sample: 960,
+                            confidence: Some(0.1),
+                        },
+                        &mut writer,
+                    )
+                    .unwrap();
+                assert!(after_gap.is_empty());
+            },
+        );
+    }
+
+    #[test]
     fn semantic_incomplete_suppresses_vad_close_without_reset() {
         with_worker(
             TurnManagerConfig {
@@ -1337,6 +1562,7 @@ mod tests {
     #[test]
     fn semantic_complete_closes_with_smart_turn_source() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test("test.session");
         progress.record_token("test.session", 3_200);
         with_worker(
             TurnManagerConfig {

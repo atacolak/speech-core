@@ -9,16 +9,17 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::detectors::{DetectorIngress, TranscriptTokenSignal};
-use crate::{HelloState, JsonlLogger};
+use crate::{AudioGapReset, HelloState, JsonlLogger};
 
 /// Shared model progress tracker: stream_session_id → latest committed audio sample.
 /// The TurnManager reads this to ensure the model has caught up before emitting turn_closed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ModelProgressState {
+    pub generation: u64,
     pub audio_committed_samples: u64,
     pub last_token_end_sample: Option<u64>,
 }
@@ -58,7 +59,7 @@ impl std::fmt::Debug for ModelDrainHandle {
 
 #[derive(Clone)]
 enum ModelDrainHandleInner {
-    Worker(mpsc::Sender<ModelCommand>),
+    Worker(mpsc::UnboundedSender<ModelCommand>),
     #[cfg(test)]
     Pending,
     #[cfg(test)]
@@ -66,7 +67,7 @@ enum ModelDrainHandleInner {
 }
 
 impl ModelDrainHandle {
-    fn new(sender: mpsc::Sender<ModelCommand>) -> Self {
+    fn new(sender: mpsc::UnboundedSender<ModelCommand>) -> Self {
         Self {
             inner: ModelDrainHandleInner::Worker(sender),
         }
@@ -78,12 +79,12 @@ impl ModelDrainHandle {
                 let timeout = Duration::from_millis(request.timeout_ms as u64);
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 sender
-                    .try_send(ModelCommand::DrainSession {
+                    .send(ModelCommand::DrainSession {
                         request,
                         reply: reply_tx,
                     })
                     .map_err(|err| {
-                        anyhow::anyhow!("model worker queue rejected drain request: {err}")
+                        anyhow::anyhow!("model worker control path rejected drain request: {err}")
                     })?;
                 reply_rx
                     .recv_timeout(timeout)
@@ -123,17 +124,32 @@ impl ModelProgressMap {
         }
     }
 
+    pub fn start_session(&self, session_id: &str, generation: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(
+                session_id.to_owned(),
+                ModelProgressState {
+                    generation,
+                    audio_committed_samples: 0,
+                    last_token_end_sample: None,
+                },
+            );
+        }
+    }
+
     pub fn update(&self, session_id: &str, committed_samples: u64) {
         if let Ok(mut map) = self.inner.lock() {
-            let state = map.entry(session_id.to_owned()).or_default();
-            state.audio_committed_samples = committed_samples;
+            if let Some(state) = map.get_mut(session_id) {
+                state.audio_committed_samples = committed_samples;
+            }
         }
     }
 
     pub fn record_token(&self, session_id: &str, token_end_sample: u64) {
         if let Ok(mut map) = self.inner.lock() {
-            let state = map.entry(session_id.to_owned()).or_default();
-            state.last_token_end_sample = Some(token_end_sample);
+            if let Some(state) = map.get_mut(session_id) {
+                state.last_token_end_sample = Some(token_end_sample);
+            }
         }
     }
 
@@ -151,10 +167,20 @@ impl ModelProgressMap {
         })
     }
 
-    pub fn remove(&self, session_id: &str) {
+    pub fn remove_generation(&self, session_id: &str, generation: u64) {
         if let Ok(mut map) = self.inner.lock() {
-            map.remove(session_id);
+            if map
+                .get(session_id)
+                .is_some_and(|state| state.generation == generation)
+            {
+                map.remove(session_id);
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub fn start_session_for_test(&self, session_id: &str) {
+        self.start_session(session_id, 1);
     }
 }
 
@@ -175,13 +201,15 @@ pub struct ModelConfig {
 
 #[derive(Clone)]
 pub struct ModelIngress {
-    sender: mpsc::Sender<ModelCommand>,
+    control_sender: mpsc::UnboundedSender<ModelCommand>,
+    audio_sender: mpsc::Sender<ModelCommand>,
 }
 
 impl ModelIngress {
     pub fn start(config: ModelConfig, logger: JsonlLogger) -> Self {
-        let (sender, mut receiver) = mpsc::channel(config.queue_frames.max(1));
-        let worker_sender = sender.clone();
+        let (control_sender, mut control_receiver) = mpsc::unbounded_channel();
+        let (audio_sender, mut audio_receiver) = mpsc::channel(config.queue_frames.max(1));
+        let worker_sender = control_sender.clone();
         let runtime = tokio::runtime::Handle::current();
         thread::spawn(move || {
             info!(model_path = %config.model_path.display(), stream_chunk_ms = config.stream_chunk_ms, att_context_right = config.att_context_right, "starting nemotron model worker");
@@ -191,34 +219,69 @@ impl ModelIngress {
                 runtime,
                 ModelDrainHandle::new(worker_sender),
             );
-            while let Some(command) = receiver.blocking_recv() {
-                worker.handle(command);
+            let mut control_closed = false;
+            let mut audio_closed = false;
+            loop {
+                let mut handled = false;
+                loop {
+                    match control_receiver.try_recv() {
+                        Ok(command) => {
+                            worker.handle(command);
+                            handled = true;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            control_closed = true;
+                            break;
+                        }
+                    }
+                }
+                match audio_receiver.try_recv() {
+                    Ok(command) => {
+                        worker.handle(command);
+                        handled = true;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => audio_closed = true,
+                }
+                if control_closed && audio_closed {
+                    break;
+                }
+                if !handled {
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
             worker.finalize_all("model worker channel closed");
         });
-        Self { sender }
+        Self {
+            control_sender,
+            audio_sender,
+        }
     }
 
     pub fn drain_handle(&self) -> ModelDrainHandle {
-        ModelDrainHandle::new(self.sender.clone())
+        ModelDrainHandle::new(self.control_sender.clone())
     }
 
     pub async fn start_session(&self, hello: &HelloState, logger: &JsonlLogger) -> Result<()> {
-        match self.sender.try_send(ModelCommand::StartSession {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command = ModelCommand::StartSession {
             hello: hello.clone(),
-        }) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                log_model_enqueue_error(
-                    logger,
-                    &command,
-                    "model worker queue full at session start",
-                )
-                .await?;
-                bail!("model worker queue full at session start")
+            reply: reply_tx,
+        };
+        self.control_sender
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("model worker control path closed at session start"))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                log_model_start_error(logger, hello, &err.to_string()).await?;
+                Err(err)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                bail!("model worker channel closed")
+            Err(_) => {
+                let err = anyhow::anyhow!("model worker dropped session start acknowledgement");
+                log_model_start_error(logger, hello, &err.to_string()).await?;
+                Err(err)
             }
         }
     }
@@ -229,7 +292,7 @@ impl ModelIngress {
         logger: &JsonlLogger,
         ingress_receive_mono_ns: u64,
     ) -> Result<()> {
-        match self.sender.try_send(ModelCommand::AudioFrame {
+        match self.audio_sender.try_send(ModelCommand::AudioFrame {
             frame: frame.clone(),
             ingress_receive_mono_ns,
         }) {
@@ -241,6 +304,8 @@ impl ModelIngress {
                     "model worker queue full; dropping frame",
                 )
                 .await?;
+                let gap = AudioGapReset::from_dropped_frame(frame, "model_worker_audio_queue_full");
+                self.reset_audio(gap, logger).await?;
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -250,8 +315,8 @@ impl ModelIngress {
     }
 
     pub fn set_transcript_sink(&self, sink: Option<DetectorIngress>) -> Result<()> {
-        self.sender
-            .try_send(ModelCommand::SetTranscriptSink { sink })
+        self.control_sender
+            .send(ModelCommand::SetTranscriptSink { sink })
             .map_err(|err| {
                 anyhow::anyhow!("model worker queue rejected transcript sink update: {err}")
             })
@@ -260,7 +325,7 @@ impl ModelIngress {
     pub async fn end_session(
         &self,
         hello: &HelloState,
-        logger: &JsonlLogger,
+        _logger: &JsonlLogger,
         reason: impl Into<String>,
     ) -> Result<()> {
         let command = ModelCommand::EndSession {
@@ -269,16 +334,34 @@ impl ModelIngress {
             adapter_id: hello.adapter_id.clone(),
             reason: reason.into(),
         };
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                log_model_enqueue_error(logger, &command, "model worker queue full at session end")
-                    .await?;
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
-        }
+        self.control_sender
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("model worker control path closed at session end"))
     }
+
+    pub async fn reset_audio(&self, gap: AudioGapReset, _logger: &JsonlLogger) -> Result<()> {
+        self.control_sender
+            .send(ModelCommand::AudioGapReset { gap })
+            .map_err(|_| anyhow::anyhow!("model worker control path closed at audio gap reset"))
+    }
+}
+
+async fn log_model_start_error(
+    logger: &JsonlLogger,
+    hello: &HelloState,
+    message: &str,
+) -> Result<()> {
+    logger
+        .write(&ModelErrorEvent {
+            event: "model_error",
+            stream_id: hello.stream_id.clone(),
+            stream_session_id: hello.stream_session_id.clone(),
+            adapter_id: hello.adapter_id.clone(),
+            message: message.to_owned(),
+            status: None,
+            daemon_mono_ns: now_mono_ns(),
+        })
+        .await
 }
 
 async fn log_model_enqueue_error(
@@ -303,6 +386,7 @@ async fn log_model_enqueue_error(
 enum ModelCommand {
     StartSession {
         hello: HelloState,
+        reply: oneshot::Sender<Result<()>>,
     },
     AudioFrame {
         frame: AudioFrame,
@@ -313,6 +397,9 @@ enum ModelCommand {
         stream_session_id: String,
         adapter_id: String,
         reason: String,
+    },
+    AudioGapReset {
+        gap: AudioGapReset,
     },
     SetTranscriptSink {
         sink: Option<DetectorIngress>,
@@ -326,7 +413,7 @@ enum ModelCommand {
 impl ModelCommand {
     fn ids(&self) -> (String, String, String) {
         match self {
-            ModelCommand::StartSession { hello } => (
+            ModelCommand::StartSession { hello, .. } => (
                 hello.stream_id.clone(),
                 hello.stream_session_id.clone(),
                 hello.adapter_id.clone(),
@@ -347,6 +434,11 @@ impl ModelCommand {
                 adapter_id.clone(),
             ),
             ModelCommand::SetTranscriptSink { .. } => (String::new(), String::new(), String::new()),
+            ModelCommand::AudioGapReset { gap } => (
+                gap.stream_id.clone(),
+                gap.stream_session_id.clone(),
+                gap.adapter_id.clone(),
+            ),
             ModelCommand::DrainSession { request, .. } => (
                 request.stream_id.clone(),
                 request.stream_session_id.clone(),
@@ -389,7 +481,15 @@ impl ModelWorker {
 
     fn handle(&mut self, command: ModelCommand) {
         let result = match command {
-            ModelCommand::StartSession { hello } => self.start_session(hello),
+            ModelCommand::StartSession { hello, reply } => {
+                let result = self.start_session(hello);
+                let reply_result = match &result {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(anyhow::anyhow!(err.to_string())),
+                };
+                let _ = reply.send(reply_result);
+                result
+            }
             ModelCommand::AudioFrame {
                 frame,
                 ingress_receive_mono_ns,
@@ -399,6 +499,7 @@ impl ModelWorker {
                 reason,
                 ..
             } => self.end_session(&stream_session_id, &reason),
+            ModelCommand::AudioGapReset { gap } => self.audio_gap_reset(gap),
             ModelCommand::SetTranscriptSink { sink } => {
                 self.config.transcript_sink = sink;
                 Ok(())
@@ -425,7 +526,7 @@ impl ModelWorker {
                 status: None,
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("nemotron v1 only supports 16 kHz mono PCM");
         }
         if !matches!(hello.format, PcmFormat::PcmF32Le | PcmFormat::PcmS16Le) {
             self.write_blocking(&ModelErrorEvent {
@@ -437,7 +538,7 @@ impl ModelWorker {
                 status: None,
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("unsupported PCM format for nemotron v1");
         }
 
         self.sessions.remove(&hello.stream_session_id);
@@ -461,7 +562,10 @@ impl ModelWorker {
                 status: Some(status_string(status)),
                 daemon_mono_ns: open_end_mono_ns,
             })?;
-            return Ok(());
+            bail!(
+                "failed to open nemotron streaming session: {}",
+                status_string(status)
+            );
         }
         if raw.is_null() {
             bail!("transcribe shim returned null session with OK status");
@@ -484,6 +588,9 @@ impl ModelWorker {
             open_duration_ms: ns_to_ms(open_end_mono_ns.saturating_sub(open_start_mono_ns)),
         };
         self.write_blocking(&event)?;
+        if let Some(ref progress) = self.model_progress {
+            progress.start_session(&hello.stream_session_id, hello.generation);
+        }
 
         self.sessions.insert(
             hello.stream_session_id.clone(),
@@ -575,6 +682,25 @@ impl ModelWorker {
         // state; dropping it here makes close-time transcript alignment less stable.
         drop(session);
         Ok(())
+    }
+
+    fn audio_gap_reset(&mut self, gap: AudioGapReset) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&gap.stream_session_id) else {
+            return Ok(());
+        };
+        session.buffer.clear();
+        session.next_chunk_sample_start = gap.observed_sample_start;
+        self.write_blocking(&ModelAudioGapResetEvent {
+            event: "model_audio_gap_reset",
+            stream_id: gap.stream_id,
+            stream_session_id: gap.stream_session_id,
+            adapter_id: gap.adapter_id,
+            expected_sample_start: gap.expected_sample_start,
+            observed_sample_start: gap.observed_sample_start,
+            delta_samples: gap.delta_samples,
+            reason: gap.reason,
+            daemon_mono_ns: now_mono_ns(),
+        })
     }
 
     fn finalize_all(&mut self, reason: &str) {
@@ -970,6 +1096,19 @@ fn ms_to_sample(ms: i64) -> u64 {
     } else {
         (ms as u64).saturating_mul(16_000) / 1_000
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ModelAudioGapResetEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    expected_sample_start: u64,
+    observed_sample_start: u64,
+    delta_samples: i64,
+    reason: String,
+    daemon_mono_ns: u64,
 }
 
 #[derive(Debug, Serialize)]

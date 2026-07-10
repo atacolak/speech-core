@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::{AudioDetector, DetectorAction, DetectorSignal, DetectorWriter};
-use crate::HelloState;
+use crate::{AudioGapReset, HelloState};
 
 const DETECTOR: &str = "silero_vad";
 const SAMPLE_RATE: u32 = 16_000;
@@ -107,7 +107,7 @@ impl AudioDetector for SileroVadDetector {
                 message: "Silero VAD requires 16 kHz mono PCM".to_owned(),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("Silero VAD requires 16 kHz mono PCM");
         }
         if !matches!(hello.format, PcmFormat::PcmF32Le | PcmFormat::PcmS16Le) {
             writer.write(&VadErrorEvent {
@@ -119,7 +119,7 @@ impl AudioDetector for SileroVadDetector {
                 message: format!("unsupported PCM format for Silero VAD: {}", hello.format),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("unsupported PCM format for Silero VAD: {}", hello.format);
         }
 
         let open_start_mono_ns = now_mono_ns();
@@ -280,6 +280,29 @@ impl AudioDetector for SileroVadDetector {
                 // resurrects the just-closed segment.
                 session.reset_after_forced_close();
             }
+        }
+        Ok(())
+    }
+
+    fn audio_gap_reset(
+        &mut self,
+        gap: &AudioGapReset,
+        _writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        if let Some(session) = self.sessions.get_mut(&gap.stream_session_id) {
+            session.buffer.clear();
+            session.next_vad_frame_sample_start = gap.observed_sample_start;
+            session.in_speech = false;
+            session.onset_counter = 0;
+            session.candidate_start_sample = None;
+            session.silence_start_sample = None;
+            session.silence_counter = 0;
+            session.current_segment_start_sample = None;
+            session.last_voice_sample_end = None;
+            session.last_raw_is_speech = None;
+            session.last_smoothed_in_speech = None;
+            session.low_silence_start_sample = None;
+            session.acoustic_fallback_emitted = true;
         }
         Ok(())
     }

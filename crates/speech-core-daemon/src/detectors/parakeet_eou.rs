@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use super::{AudioDetector, DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
-use crate::HelloState;
+use crate::{AudioGapReset, HelloState};
 
 const DETECTOR: &str = "parakeet_realtime_eou_120m_v1";
 const MODEL_NAME: &str = "parakeet_realtime_eou_120m-v1";
@@ -81,7 +81,7 @@ impl AudioDetector for ParakeetEouDetector {
                 message: "Parakeet EOU requires 16 kHz mono PCM".to_owned(),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("Parakeet EOU requires 16 kHz mono PCM");
         }
         if !matches!(hello.format, PcmFormat::PcmF32Le | PcmFormat::PcmS16Le) {
             writer.write(&EouErrorEvent {
@@ -93,7 +93,7 @@ impl AudioDetector for ParakeetEouDetector {
                 message: format!("unsupported PCM format for Parakeet EOU: {}", hello.format),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("unsupported PCM format for Parakeet EOU: {}", hello.format);
         }
 
         let open_start_mono_ns = now_mono_ns();
@@ -281,6 +281,41 @@ impl AudioDetector for ParakeetEouDetector {
                 Ok(())
             }
         }
+    }
+
+    fn audio_gap_reset(
+        &mut self,
+        gap: &AudioGapReset,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&gap.stream_session_id) else {
+            return Ok(());
+        };
+        session.model.reset_stream_state();
+        session.buffer.clear();
+        session.recent_audio.clear();
+        session.recent_audio_start_sample = gap.observed_sample_start;
+        session.last_replay = None;
+        session.next_chunk_sample_start = gap.observed_sample_start;
+        session.samples_since_stream_reset = 0;
+        session.stream_resets = session.stream_resets.saturating_add(1);
+        writer.write(&EouStateResetEvent {
+            event: "eou_state_reset",
+            stream_id: gap.stream_id.clone(),
+            stream_session_id: gap.stream_session_id.clone(),
+            adapter_id: gap.adapter_id.clone(),
+            detector: DETECTOR,
+            reset_index: session.decoder_resets.saturating_add(session.stream_resets),
+            mode: EouResetMode::Stream.as_str(),
+            anchor_sample: gap.observed_sample_start,
+            replay_start_sample: None,
+            replay_sample_count: 0,
+            replay_anchor_available: false,
+            source: "audio_gap",
+            reason: "audio_gap",
+            decision_sample: gap.observed_sample_start,
+            daemon_mono_ns: now_mono_ns(),
+        })
     }
 }
 

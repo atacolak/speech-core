@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{AudioDetector, DetectorAction, DetectorSignal, DetectorWriter};
-use crate::HelloState;
+use crate::{AudioGapReset, HelloState};
 
 pub const DETECTOR: &str = "pipecat_smart_turn_v3";
 const MODEL_NAME: &str = "pipecat-ai/smart-turn-v3.2-cpu";
@@ -168,7 +168,7 @@ impl AudioDetector for SmartTurnDetector {
                 message: "Smart Turn v3 requires 16 kHz mono PCM".to_owned(),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("Smart Turn v3 requires 16 kHz mono PCM");
         }
         if !matches!(hello.format, PcmFormat::PcmF32Le | PcmFormat::PcmS16Le) {
             writer.write(&SmartTurnErrorEvent {
@@ -180,7 +180,7 @@ impl AudioDetector for SmartTurnDetector {
                 message: format!("unsupported PCM format for Smart Turn v3: {}", hello.format),
                 daemon_mono_ns: now_mono_ns(),
             })?;
-            return Ok(());
+            bail!("unsupported PCM format for Smart Turn v3: {}", hello.format);
         }
 
         self.sessions.insert(
@@ -413,6 +413,18 @@ impl SmartTurnDetector {
             if let Some(session) = self.sessions.get_mut(stream_session_id) {
                 session.clear_through(*decision_sample);
             }
+        }
+        Ok(())
+    }
+
+    pub fn audio_gap_reset(
+        &mut self,
+        gap: &AudioGapReset,
+        _writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        if let Some(session) = self.sessions.get_mut(&gap.stream_session_id) {
+            session.audio.clear();
+            session.first_sample = gap.observed_sample_start;
         }
         Ok(())
     }
@@ -1006,6 +1018,7 @@ mod tests {
                 speech_core_protocol::ClockDomain::HostMonotonic,
                 speech_core_protocol::TimestampQuality::SyntheticScheduled,
             ),
+            generation: 0,
         }
     }
 

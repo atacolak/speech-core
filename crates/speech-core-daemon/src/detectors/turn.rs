@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::{DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
 use crate::model::{ModelDrainHandle, ModelDrainRequest, ModelProgressMap};
-use crate::HelloState;
+use crate::{AudioGapReset, HelloState};
 
 #[derive(Debug, Clone)]
 pub struct TurnManagerConfig {
@@ -851,6 +851,48 @@ impl TurnManager {
         }
     }
 
+    pub fn audio_gap_reset(
+        &mut self,
+        gap: &AudioGapReset,
+        writer: &mut DetectorWriter<'_>,
+    ) -> Result<()> {
+        if let Some(mut session) = self.sessions.remove(&gap.stream_session_id) {
+            if let Some(turn) = session.open_turn.take() {
+                session.close_specific_turn(
+                    turn.turn_id,
+                    "audio_gap",
+                    true,
+                    "audio_gap",
+                    None,
+                    gap.expected_sample_start,
+                    gap.observed_sample_start,
+                    &gap.reason,
+                    writer,
+                )?;
+            }
+            session.in_speech = false;
+            session.saw_vad_signal = false;
+            session.last_vad_start_sample = None;
+            session.last_vad_end_sample = None;
+            session.last_vad_end_decision_sample = None;
+            session.last_semantic_decision = None;
+            session.last_human_hold_token_anchor = None;
+            writer.write(&TurnAudioGapResetEvent {
+                event: "turn_audio_gap_reset",
+                stream_id: gap.stream_id.clone(),
+                stream_session_id: gap.stream_session_id.clone(),
+                adapter_id: gap.adapter_id.clone(),
+                expected_sample_start: gap.expected_sample_start,
+                observed_sample_start: gap.observed_sample_start,
+                delta_samples: gap.delta_samples,
+                reason: gap.reason.clone(),
+                daemon_mono_ns: now_mono_ns(),
+            })?;
+            self.sessions.insert(gap.stream_session_id.clone(), session);
+        }
+        Ok(())
+    }
+
     pub fn end_session(
         &mut self,
         stream_session_id: &str,
@@ -984,6 +1026,7 @@ impl TurnManager {
                         speech_core_protocol::ClockDomain::Unknown,
                         speech_core_protocol::TimestampQuality::Unknown,
                     ),
+                    generation: 0,
                 })
             })
     }
@@ -1217,6 +1260,19 @@ struct TurnSessionStartEvent {
     semantic_gate_close_enabled: bool,
     human_hold_silence_ms: u32,
     transcript_silence_close_ms: u32,
+    daemon_mono_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnAudioGapResetEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    expected_sample_start: u64,
+    observed_sample_start: u64,
+    delta_samples: i64,
+    reason: String,
     daemon_mono_ns: u64,
 }
 
@@ -1709,6 +1765,7 @@ mod tests {
                 speech_core_protocol::ClockDomain::HostMonotonic,
                 speech_core_protocol::TimestampQuality::SyntheticScheduled,
             ),
+            generation: 0,
         }
     }
 
@@ -1968,7 +2025,8 @@ mod tests {
     #[test]
     fn smart_turn_complete_closes_non_degraded_turn() {
         let progress = ModelProgressMap::new();
-        progress.update(SESSION_ID, 17_920);
+        progress.start_session_for_test("test.session");
+        progress.record_token(SESSION_ID, 3_200);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
@@ -2054,6 +2112,7 @@ mod tests {
     #[test]
     fn vad_close_drains_trailing_model_audio_before_turn_closed() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test("test.session");
         progress.update(SESSION_ID, 16_000);
         let drain_progress = progress.clone();
         let drain_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2106,6 +2165,7 @@ mod tests {
     #[test]
     fn vad_close_with_model_caught_up_closes_immediately() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test("test.session");
         progress.update(SESSION_ID, 17_920);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
@@ -2261,6 +2321,7 @@ mod tests {
     #[test]
     fn transcript_silence_closes_transcript_backed_turn() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test("test.session");
         progress.update(SESSION_ID, 3_200);
         progress.record_token(SESSION_ID, 3_200);
         let mut harness = TurnHarness::new(TurnManagerConfig {
