@@ -110,10 +110,22 @@ impl TurnManager {
                 decision_sample,
                 confidence,
             } => {
+                let mp_baseline = self.config.model_progress.clone();
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 let started_new_turn = session.open_turn.is_none();
                 if started_new_turn {
                     session.start_turn(start_sample, "vad", writer)?;
+                    if let Some(ref progress) = mp_baseline {
+                        session.current_turn_start_token_count = progress
+                            .snapshot_token_count_at_turn_start(&stream_session_id)
+                            .unwrap_or(0);
+                        if let Some(turn) = session.open_turn.as_ref() {
+                            progress.set_current_turn_id(
+                                &stream_session_id,
+                                Some(turn.turn_id.clone()),
+                            );
+                        }
+                    }
                 }
                 session.saw_vad_signal = true;
                 session.last_vad_start_sample = Some(start_sample);
@@ -176,6 +188,17 @@ impl TurnManager {
                 }
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "vad", writer)?;
+                    if let Some(ref progress) = model_progress {
+                        session.current_turn_start_token_count = progress
+                            .snapshot_token_count_at_turn_start(&stream_session_id)
+                            .unwrap_or(0);
+                        if let Some(turn) = session.open_turn.as_ref() {
+                            progress.set_current_turn_id(
+                                &stream_session_id,
+                                Some(turn.turn_id.clone()),
+                            );
+                        }
+                    }
                 }
                 session.saw_vad_signal = true;
                 session.in_speech = false;
@@ -352,6 +375,12 @@ impl TurnManager {
                     writer.write(&alignment.event(&stream_id, &stream_session_id, &adapter_id))?;
                     let effective_end_sample = alignment.effective_end_sample;
                     let effective_decision_sample = alignment.effective_decision_sample;
+                    let turn_start_sample = session
+                        .open_turn
+                        .as_ref()
+                        .map(|t| t.start_sample)
+                        .unwrap_or(start_sample);
+                    let model_progress_ref = model_progress.as_ref();
                     session.close_turn(
                         turn_id,
                         close_source,
@@ -361,6 +390,8 @@ impl TurnManager {
                         effective_end_sample,
                         effective_decision_sample,
                         close_reason,
+                        turn_start_sample,
+                        model_progress_ref,
                         writer,
                     )?;
                     actions.push(DetectorAction::ResetEouState {
@@ -452,6 +483,7 @@ impl TurnManager {
                 if self.config.model_drain.is_none() {
                     self.config.model_drain = Some(drain_handle);
                 }
+                let mp_baseline = self.config.model_progress.clone();
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 if !is_speech_evidence_text(&text) {
                     return Ok(Vec::new());
@@ -480,6 +512,17 @@ impl TurnManager {
                 }
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "transcript", writer)?;
+                    if let Some(ref progress) = mp_baseline {
+                        session.current_turn_start_token_count = progress
+                            .snapshot_token_count_at_turn_start(&stream_session_id)
+                            .unwrap_or(0);
+                        if let Some(turn) = session.open_turn.as_ref() {
+                            progress.set_current_turn_id(
+                                &stream_session_id,
+                                Some(turn.turn_id.clone()),
+                            );
+                        }
+                    }
                 }
                 session.in_speech = true;
                 // A new token resets the hold timer naturally: ModelProgressMap now
@@ -547,6 +590,8 @@ impl TurnManager {
                         model_alignment_timeout_ms,
                     );
                 }
+                let turn_start_sample = open_turn.start_sample;
+                let mp_ref = model_progress.as_ref();
                 session.close_turn(
                     turn_id,
                     "transcript_silence",
@@ -556,6 +601,8 @@ impl TurnManager {
                     end_sample,
                     decision_sample,
                     "transcript_backed_turn_low_vad_silence",
+                    turn_start_sample,
+                    mp_ref,
                     writer,
                 )?;
                 Ok(vec![DetectorAction::ResetEouState {
@@ -584,6 +631,7 @@ impl TurnManager {
                     ms_to_samples(self.config.min_model_eou_speech_ms);
                 let model_eou_refractory_samples =
                     ms_to_samples(self.config.model_eou_refractory_ms);
+                let mp_for_close = self.config.model_progress.clone();
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 let provisional_start = session
                     .last_vad_start_sample
@@ -628,6 +676,17 @@ impl TurnManager {
                 }
                 if session.open_turn.is_none() {
                     session.start_turn(provisional_start, "model", writer)?;
+                    if let Some(ref progress) = mp_for_close {
+                        session.current_turn_start_token_count = progress
+                            .snapshot_token_count_at_turn_start(&stream_session_id)
+                            .unwrap_or(0);
+                        if let Some(turn) = session.open_turn.as_ref() {
+                            progress.set_current_turn_id(
+                                &stream_session_id,
+                                Some(turn.turn_id.clone()),
+                            );
+                        }
+                    }
                 }
                 let effective_end_sample = session
                     .last_vad_end_sample
@@ -666,6 +725,12 @@ impl TurnManager {
                 })?;
                 let mut actions = Vec::new();
                 if model_eou_close_enabled {
+                    let turn_start_sample = session
+                        .open_turn
+                        .as_ref()
+                        .map(|t| t.start_sample)
+                        .unwrap_or(provisional_start);
+                    let mp_ref = mp_for_close.as_ref();
                     session.close_turn(
                         turn_id,
                         "model_eou",
@@ -675,6 +740,8 @@ impl TurnManager {
                         effective_end_sample,
                         decision_sample,
                         "eou_token_detected",
+                        turn_start_sample,
+                        mp_ref,
                         writer,
                     )?;
                     actions.push(DetectorAction::ResetEouState {
@@ -770,6 +837,15 @@ impl TurnManager {
                 let model_progress = self.config.model_progress.clone();
                 let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                // Stale guard: if a turn was already closed at or past this
+                // fallback's decision_sample, don't resurrect it.
+                if session.open_turn.is_none()
+                    && session
+                        .last_closed_decision_sample
+                        .is_some_and(|closed| closed >= decision_sample)
+                {
+                    return Ok(Vec::new());
+                }
                 let observed_speech_samples = end_sample.saturating_sub(start_sample);
                 if session.open_turn.is_none() {
                     return Ok(Vec::new());
@@ -823,6 +899,12 @@ impl TurnManager {
                             model_alignment_timeout_ms,
                         );
                     }
+                    let turn_start_sample = session
+                        .open_turn
+                        .as_ref()
+                        .map(|t| t.start_sample)
+                        .unwrap_or(start_sample);
+                    let mp_ref = model_progress.as_ref();
                     session.close_turn(
                         turn_id,
                         "vad_acoustic_fallback",
@@ -832,6 +914,8 @@ impl TurnManager {
                         end_sample,
                         decision_sample,
                         "vad_acoustic_fallback_low_probability_silence",
+                        turn_start_sample,
+                        mp_ref,
                         writer,
                     )?;
                     Ok(vec![DetectorAction::ResetEouState {
@@ -858,6 +942,8 @@ impl TurnManager {
     ) -> Result<()> {
         if let Some(mut session) = self.sessions.remove(&gap.stream_session_id) {
             if let Some(turn) = session.open_turn.take() {
+                let turn_start_sample = turn.start_sample;
+                let mp_ref = self.config.model_progress.as_ref();
                 session.close_specific_turn(
                     turn.turn_id,
                     "audio_gap",
@@ -867,6 +953,8 @@ impl TurnManager {
                     gap.expected_sample_start,
                     gap.observed_sample_start,
                     &gap.reason,
+                    turn_start_sample,
+                    mp_ref,
                     writer,
                 )?;
             }
@@ -902,6 +990,8 @@ impl TurnManager {
         if let Some(mut session) = self.sessions.remove(stream_session_id) {
             if let Some(turn) = session.open_turn.take() {
                 let end_sample = session.last_vad_end_sample.unwrap_or(turn.start_sample);
+                let turn_start_sample = turn.start_sample;
+                let mp_ref = self.config.model_progress.as_ref();
                 session.close_specific_turn(
                     turn.turn_id,
                     "session_end",
@@ -911,6 +1001,8 @@ impl TurnManager {
                     end_sample,
                     end_sample,
                     reason,
+                    turn_start_sample,
+                    mp_ref,
                     writer,
                 )?;
             }
@@ -981,6 +1073,12 @@ impl TurnManager {
         writer.write(&alignment.event(stream_id, stream_session_id, adapter_id))?;
         let effective_end_sample = alignment.effective_end_sample;
         let effective_decision_sample = alignment.effective_decision_sample;
+        let turn_start_sample = session
+            .open_turn
+            .as_ref()
+            .map(|t| t.start_sample)
+            .unwrap_or(end_sample);
+        let mp_ref = model_progress.as_ref();
         session.close_turn(
             turn_id,
             "smart_turn",
@@ -990,6 +1088,8 @@ impl TurnManager {
             effective_end_sample,
             effective_decision_sample,
             "smart_turn_complete_direct",
+            turn_start_sample,
+            mp_ref,
             writer,
         )?;
         Ok(vec![DetectorAction::ResetEouState {
@@ -1047,6 +1147,9 @@ struct TurnSession {
     last_closed_decision_sample: Option<u64>,
     last_semantic_decision: Option<SemanticDecisionState>,
     last_human_hold_token_anchor: Option<u64>,
+    /// Committed token count at the start of the current turn. Used as baseline
+    /// for per-turn text slicing in close_specific_turn.
+    current_turn_start_token_count: u32,
 }
 
 impl TurnSession {
@@ -1066,6 +1169,7 @@ impl TurnSession {
             last_closed_decision_sample: None,
             last_semantic_decision: None,
             last_human_hold_token_anchor: None,
+            current_turn_start_token_count: 0,
         }
     }
 
@@ -1112,6 +1216,8 @@ impl TurnSession {
         end_sample: u64,
         decision_sample: u64,
         reason: &'static str,
+        turn_start_sample: u64,
+        model_progress: Option<&ModelProgressMap>,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
         self.open_turn.take();
@@ -1124,6 +1230,8 @@ impl TurnSession {
             end_sample,
             decision_sample,
             reason,
+            turn_start_sample,
+            model_progress,
             writer,
         )
     }
@@ -1139,6 +1247,8 @@ impl TurnSession {
         end_sample: u64,
         decision_sample: u64,
         reason: &str,
+        turn_start_sample: u64,
+        model_progress: Option<&ModelProgressMap>,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
         self.turns_closed = self.turns_closed.saturating_add(1);
@@ -1161,6 +1271,49 @@ impl TurnSession {
             reason: reason.to_owned(),
             daemon_mono_ns: now_mono_ns(),
         })?;
+        // Emit transcript_committed before turn_closed — this is the controller
+        // dispatch trigger. It constructs per-turn committed text from shared model
+        // state, sliced by the turn-start token-count baseline and sample boundaries.
+        let session_id = &self.hello.stream_session_id;
+        let baseline_token_count = self.current_turn_start_token_count;
+        let (committed_text, committed_token_count, committed_revision) = model_progress
+            .and_then(|progress| {
+                progress.per_turn_committed_snapshot(
+                    session_id,
+                    baseline_token_count,
+                    turn_start_sample,
+                    end_sample,
+                )
+            })
+            .unwrap_or_default();
+        // Record the dispatch using the full cumulative committed text at this
+        // point so transcript_finalized (diagnostic-only) can detect late
+        // session-end revisions.
+        if let Some(progress) = model_progress {
+            let full_text = progress
+                .committed_text_snapshot(session_id)
+                .map(|(text, _, _)| text)
+                .unwrap_or_default();
+            progress.record_dispatch(session_id, &turn_id, &full_text);
+            // Clear turn_id from shared state so subsequent transcript_updates
+            // carry turn_id: null.
+            progress.set_current_turn_id(session_id, None);
+        }
+        writer.write(&TranscriptCommittedEvent {
+            event: "transcript_committed",
+            stream_id: self.hello.stream_id.clone(),
+            stream_session_id: self.hello.stream_session_id.clone(),
+            adapter_id: self.hello.adapter_id.clone(),
+            turn_id: turn_id.clone(),
+            text: committed_text,
+            revision: committed_revision,
+            committed_token_count,
+            end_sample,
+            decision_sample,
+            is_degraded: degraded,
+            close_source: source,
+            daemon_mono_ns: now_mono_ns(),
+        })?;
         writer.write(&TurnClosedEvent {
             event: "turn_closed",
             stream_id: self.hello.stream_id.clone(),
@@ -1181,6 +1334,25 @@ impl TurnSession {
 struct OpenTurn {
     turn_id: String,
     start_sample: u64,
+}
+
+/// Authoritative per-turn committed transcript snapshot, emitted during turn close
+/// after model drain and before turn_closed. This is the controller dispatch trigger.
+#[derive(Debug, Serialize)]
+struct TranscriptCommittedEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    turn_id: String,
+    text: String,
+    revision: i32,
+    committed_token_count: u32,
+    end_sample: u64,
+    decision_sample: u64,
+    is_degraded: bool,
+    close_source: &'static str,
+    daemon_mono_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -2348,6 +2520,138 @@ mod tests {
             "transcript_silence",
             true,
             "transcript_backed_turn_low_vad_silence",
+        );
+    }
+
+    #[test]
+    fn stale_vad_acoustic_fallback_does_not_reclose_completed_segment() {
+        // Regression: smart-turn close at decision_sample 17_920. A later
+        // vad_acoustic_fallback for the same segment (or earlier) must not
+        // resurrect the closed turn.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 17_920);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            model_progress: Some(progress),
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        // Smart turn completes and closes the turn at 17_920.
+        let _actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
+        let _events = harness.drain_events();
+        assert_eq!(event_count(&_events, "turn_closed"), 1);
+
+        // Now simulate a stale vad_acoustic_fallback arriving for the same or
+        // earlier decision sample (e.g. from a low-silence timeout on the old
+        // segment). It must be silently ignored.
+        let stale_fallback = DetectorSignal::VadAcousticFallback {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample: 0,
+            end_sample: 16_000,
+            decision_sample: 17_920,
+            silence_samples: 2_500,
+            confidence: Some(0.01),
+        };
+        let stale_actions = harness.send(stale_fallback);
+        let stale_events = harness.drain_events();
+
+        assert!(
+            stale_actions.is_empty(),
+            "stale vad_acoustic_fallback should not emit reset actions: {stale_actions:#?}"
+        );
+        assert_no_event(&stale_events, "turn_closed");
+        assert!(
+            !stale_events
+                .iter()
+                .any(|e| e.get("event").and_then(Value::as_str) == Some("turn_eou_candidate")),
+            "stale fallback should not emit eou candidate: {stale_events:#?}"
+        );
+    }
+
+    #[test]
+    fn transcript_committed_emitted_before_turn_closed_in_vad_path() {
+        // Verifies the ordering invariant: model drain -> transcript_committed -> turn_closed.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 17_920);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress),
+            model_alignment_timeout_ms: 100,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let _actions = harness.send(vad_end(0, 16_000, 17_920));
+        let events = harness.drain_events();
+
+        // Must contain both transcript_committed and turn_closed in order.
+        let committed_idx = events
+            .iter()
+            .position(|e| e.get("event").and_then(Value::as_str) == Some("transcript_committed"))
+            .expect("transcript_committed event must be present");
+        let closed_idx = events
+            .iter()
+            .position(|e| e.get("event").and_then(Value::as_str) == Some("turn_closed"))
+            .expect("turn_closed event must be present");
+        let alignment_idx = events
+            .iter()
+            .position(|e| e.get("event").and_then(Value::as_str) == Some("turn_close_alignment"))
+            .expect("turn_close_alignment event must be present");
+
+        assert!(
+            alignment_idx < committed_idx,
+            "turn_close_alignment ({alignment_idx}) must come before transcript_committed ({committed_idx})"
+        );
+        assert!(
+            committed_idx < closed_idx,
+            "transcript_committed ({committed_idx}) must come before turn_closed ({closed_idx})"
+        );
+
+        // transcript_committed should carry the expected metadata.
+        let committed = &events[committed_idx];
+        assert!(
+            committed.get("turn_id").and_then(Value::as_str).is_some(),
+            "transcript_committed must have turn_id"
+        );
+        assert_eq!(
+            committed.get("close_source").and_then(Value::as_str),
+            Some("vad")
+        );
+        assert_eq!(
+            committed.get("is_degraded").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            committed
+                .get("end_sample")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "transcript_committed must have end_sample"
+        );
+        assert!(
+            committed
+                .get("decision_sample")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "transcript_committed must have decision_sample"
+        );
+        assert!(
+            committed.get("text").is_some(),
+            "transcript_committed must have text field"
+        );
+        assert!(
+            committed.get("revision").is_some(),
+            "transcript_committed must have revision"
         );
     }
 }

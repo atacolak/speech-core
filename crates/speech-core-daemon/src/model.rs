@@ -15,13 +15,40 @@ use tracing::{info, warn};
 use crate::detectors::{DetectorIngress, TranscriptTokenSignal};
 use crate::{AudioGapReset, HelloState, JsonlLogger};
 
+/// A lightweight per-token snapshot stored in shared model state so the turn manager
+/// can construct per-turn committed text from token sample boundaries.
+#[derive(Debug, Clone)]
+pub struct CommittedTokenSnapshot {
+    pub index: u32,
+    pub text: String,
+    pub start_sample: u64,
+    pub end_sample: u64,
+}
+
 /// Shared model progress tracker: stream_session_id → latest committed audio sample.
 /// The TurnManager reads this to ensure the model has caught up before emitting turn_closed.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelProgressState {
     pub generation: u64,
     pub audio_committed_samples: u64,
     pub last_token_end_sample: Option<u64>,
+    /// Cumulative committed tokens since session start. Written by the model worker
+    /// every time a token commits. Turn manager slices this at close time.
+    pub committed_tokens: Vec<CommittedTokenSnapshot>,
+    /// Latest committed text from the ASR model (cumulative).
+    pub last_committed_text: String,
+    /// Latest committed token count (len of committed_tokens).
+    pub committed_token_count: u32,
+    /// Latest revision number from the ASR.
+    pub revision: i32,
+    /// The currently open turn_id, set by TurnManager on turn_started and cleared on
+    /// turn_closed. Model worker reads this for transcript_update/token event tagging.
+    pub current_turn_id: Option<String>,
+    /// The text dispatched in the last transcript_committed event. Used by
+    /// transcript_finalized (diagnostic-only) to detect late session-end revisions.
+    pub last_dispatched_text: Option<String>,
+    /// The turn_id of the last dispatched transcript_committed.
+    pub last_dispatched_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,6 +159,13 @@ impl ModelProgressMap {
                     generation,
                     audio_committed_samples: 0,
                     last_token_end_sample: None,
+                    committed_tokens: Vec::new(),
+                    last_committed_text: String::new(),
+                    committed_token_count: 0,
+                    revision: 0,
+                    current_turn_id: None,
+                    last_dispatched_text: None,
+                    last_dispatched_turn_id: None,
                 },
             );
         }
@@ -164,6 +198,150 @@ impl ModelProgressMap {
         self.inner.lock().ok().and_then(|map| {
             map.get(session_id)
                 .and_then(|state| state.last_token_end_sample)
+        })
+    }
+
+    /// Set the current open turn_id for a session. Called by TurnManager on turn_started.
+    pub fn set_current_turn_id(&self, session_id: &str, turn_id: Option<String>) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                state.current_turn_id = turn_id;
+            }
+        }
+    }
+
+    /// Get the current open turn_id for a session, if any.
+    pub fn current_turn_id(&self, session_id: &str) -> Option<String> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id)
+                .and_then(|state| state.current_turn_id.clone())
+        })
+    }
+
+    /// Update the committed text and metadata from an ASR transcript update.
+    pub fn update_committed_text(
+        &self,
+        session_id: &str,
+        text: &str,
+        committed_token_count: u32,
+        revision: i32,
+    ) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                state.last_committed_text = text.to_owned();
+                state.committed_token_count = committed_token_count;
+                state.revision = revision;
+            }
+        }
+    }
+
+    /// Get the latest committed text snapshot (full cumulative text).
+    pub fn committed_text_snapshot(&self, session_id: &str) -> Option<(String, u32, i32)> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id).map(|state| {
+                (
+                    state.last_committed_text.clone(),
+                    state.committed_token_count,
+                    state.revision,
+                )
+            })
+        })
+    }
+
+    /// Record a committed token snapshot. Called from the model worker for every
+    /// committed token (including punctuation).
+    pub fn record_token_snapshot(&self, session_id: &str, snapshot: CommittedTokenSnapshot) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                state.committed_tokens.push(snapshot);
+                state.committed_token_count = state.committed_tokens.len() as u32;
+            }
+        }
+    }
+
+    /// Snapshot the committed token count at turn start. The per-turn committed text
+    /// will include tokens from this index onwards (filtered by sample boundaries).
+    pub fn snapshot_token_count_at_turn_start(&self, session_id: &str) -> Option<u32> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(session_id).map(|state| state.committed_token_count))
+    }
+
+    /// Get the per-turn committed text for the closing turn. Selects tokens whose
+    /// index is >= baseline_token_count AND whose samples fall within the turn
+    /// boundaries. Includes trailing punctuation tokens attached to the last selected
+    /// speech-evidence token.
+    pub fn per_turn_committed_snapshot(
+        &self,
+        session_id: &str,
+        baseline_token_count: u32,
+        turn_start_sample: u64,
+        turn_end_sample: u64,
+    ) -> Option<(String, u32, i32)> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id).map(|state| {
+                let revision = state.revision;
+                // Select tokens: index >= baseline, end_sample > turn_start (token
+                // ends after turn began), and start_sample <= turn_end (token began
+                // before/at close).
+                let mut selected: Vec<&CommittedTokenSnapshot> = state
+                    .committed_tokens
+                    .iter()
+                    .filter(|t| {
+                        t.index >= baseline_token_count
+                            && (t.end_sample > turn_start_sample || baseline_token_count == 0)
+                            && t.start_sample <= turn_end_sample
+                    })
+                    .collect();
+                // Include trailing punctuation tokens: if the last selected token is
+                // speech-evidence, also include any immediately-following punctuation
+                // tokens whose start_sample is at/after the last selected end_sample.
+                if let Some(last_selected) = selected.last() {
+                    let last_end = last_selected.end_sample;
+                    let last_idx = last_selected.index;
+                    let mut extra: Vec<&CommittedTokenSnapshot> = state
+                        .committed_tokens
+                        .iter()
+                        .filter(|t| {
+                            t.index > last_idx
+                                && t.start_sample >= last_end
+                                && !t.text.chars().any(|ch| ch.is_alphanumeric())
+                        })
+                        .collect();
+                    selected.append(&mut extra);
+                }
+                let token_count = selected.len() as u32;
+                let text: String = selected
+                    .iter()
+                    .map(|t| t.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
+                (text, token_count, revision)
+            })
+        })
+    }
+
+    /// Record a dispatch (transcript_committed) for a session. Stores the dispatched text
+    /// and turn_id so transcript_finalized can detect late revisions.
+    pub fn record_dispatch(&self, session_id: &str, turn_id: &str, text: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                state.last_dispatched_text = Some(text.to_owned());
+                state.last_dispatched_turn_id = Some(turn_id.to_owned());
+            }
+        }
+    }
+
+    /// Get the last dispatched (transcript_committed) state for a session.
+    pub fn dispatched_snapshot(&self, session_id: &str) -> Option<(String, String)> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id).and_then(|state| {
+                Some((
+                    state.last_dispatched_text.clone()?,
+                    state.last_dispatched_turn_id.clone()?,
+                ))
+            })
         })
     }
 
@@ -672,15 +850,16 @@ impl ModelWorker {
         let Some(mut session) = self.sessions.remove(stream_session_id) else {
             return Ok(());
         };
+        let session_id = session.hello.stream_session_id.clone();
         if !session.buffer.is_empty() {
             let chunk = std::mem::take(&mut session.buffer);
             let chunk_source_sample_start = session.next_chunk_sample_start;
             session.next_chunk_sample_start = session
                 .next_chunk_sample_start
                 .saturating_add(chunk.len() as u64);
-            self.sessions.insert(stream_session_id.to_owned(), session);
+            self.sessions.insert(session_id.clone(), session);
             self.feed_chunk(
-                stream_session_id,
+                &session_id,
                 chunk,
                 chunk_source_sample_start,
                 now_mono_ns(),
@@ -688,7 +867,7 @@ impl ModelWorker {
             )?;
             session = self
                 .sessions
-                .remove(stream_session_id)
+                .remove(&session_id)
                 .expect("session reinserted");
         }
 
@@ -707,6 +886,33 @@ impl ModelWorker {
             true,
             Some(reason),
         )?;
+
+        // Emit transcript_finalized if the final text differs from the last dispatched text.
+        if let Some(ref progress) = self.model_progress {
+            if let Some((final_text, _, final_revision)) =
+                progress.committed_text_snapshot(&session_id)
+            {
+                if let Some((dispatched_text, dispatched_turn_id)) =
+                    progress.dispatched_snapshot(&session_id)
+                {
+                    if final_text != dispatched_text {
+                        self.write_blocking(&TranscriptFinalizedEvent {
+                            event: "transcript_finalized",
+                            stream_id: session.hello.stream_id.clone(),
+                            stream_session_id: session.hello.stream_session_id.clone(),
+                            adapter_id: session.hello.adapter_id.clone(),
+                            turn_id: dispatched_turn_id,
+                            final_text: final_text.clone(),
+                            committed_text: dispatched_text,
+                            revision: final_revision,
+                            final_reason: reason.to_owned(),
+                            daemon_mono_ns: now_mono_ns(),
+                        })?;
+                    }
+                }
+            }
+        }
+
         // Keep the progress entry alive after finalize. TurnManager close paths may
         // still consult last_token_end_sample while draining/closing the same input
         // state; dropping it here makes close-time transcript alignment less stable.
@@ -880,13 +1086,28 @@ impl ModelWorker {
 
         if update.result_changed || update.committed_changed || update.tentative_changed || is_final
         {
+            let committed_text = cstr_to_string(update.committed_text);
+            let turn_id = self
+                .model_progress
+                .as_ref()
+                .and_then(|progress| progress.current_turn_id(&session.hello.stream_session_id));
+            // Update shared committed-text state for turn-manager dispatch.
+            if let Some(ref progress) = self.model_progress {
+                progress.update_committed_text(
+                    &session.hello.stream_session_id,
+                    &committed_text,
+                    update.committed_tokens.max(0) as u32,
+                    update.revision,
+                );
+            }
             self.write_blocking(&TranscriptUpdateEvent {
                 event: "transcript_update",
                 stream_id: session.hello.stream_id.clone(),
                 stream_session_id: session.hello.stream_session_id.clone(),
                 adapter_id: session.hello.adapter_id.clone(),
+                turn_id,
                 revision: update.revision,
-                committed_text: cstr_to_string(update.committed_text),
+                committed_text,
                 tentative_text: cstr_to_string(update.tentative_text),
                 committed_token_count: update.committed_tokens.max(0) as u32,
                 total_token_count: update.total_tokens.max(0) as u32,
@@ -920,6 +1141,7 @@ impl ModelWorker {
                 })?;
                 continue;
             }
+            let token_text = cstr_to_string(token.text);
             let timestamps_valid = update.returned_timestamp_kind == TRANSCRIBE_TIMESTAMPS_TOKEN
                 && token.t1_ms >= token.t0_ms
                 && token.t0_ms >= 0;
@@ -929,9 +1151,23 @@ impl ModelWorker {
                 } else {
                     (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
                 };
+                let token_start_sample = if timestamps_valid {
+                    ms_to_sample(token.t0_ms)
+                } else {
+                    token_end_sample.saturating_sub(160) // ~10ms estimate
+                };
                 progress.record_token(&session.hello.stream_session_id, token_end_sample);
+                // Record the token snapshot for per-turn text construction.
+                progress.record_token_snapshot(
+                    &session.hello.stream_session_id,
+                    CommittedTokenSnapshot {
+                        index: token_index as u32,
+                        text: token_text.clone(),
+                        start_sample: token_start_sample,
+                        end_sample: token_end_sample,
+                    },
+                );
             }
-            let token_text = cstr_to_string(token.text);
             let probability = if token.probability.is_nan() {
                 None
             } else {
@@ -939,11 +1175,16 @@ impl ModelWorker {
             };
             let source_sample_start_estimate = timestamps_valid.then(|| ms_to_sample(token.t0_ms));
             let source_sample_end_estimate = timestamps_valid.then(|| ms_to_sample(token.t1_ms));
+            let token_turn_id = self
+                .model_progress
+                .as_ref()
+                .and_then(|progress| progress.current_turn_id(&session.hello.stream_session_id));
             self.write_blocking(&TranscriptTokenCommittedEvent {
                 event: "transcript_token_committed",
                 stream_id: session.hello.stream_id.clone(),
                 stream_session_id: session.hello.stream_session_id.clone(),
                 adapter_id: session.hello.adapter_id.clone(),
+                turn_id: token_turn_id,
                 token_index: token_index as u32,
                 token_id: token.id,
                 text: token_text.clone(),
@@ -1193,6 +1434,8 @@ struct TranscriptTokenCommittedEvent {
     stream_id: String,
     stream_session_id: String,
     adapter_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
     token_index: u32,
     token_id: i32,
     text: String,
@@ -1217,6 +1460,8 @@ struct TranscriptUpdateEvent {
     stream_id: String,
     stream_session_id: String,
     adapter_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
     revision: i32,
     committed_text: String,
     tentative_text: String,
@@ -1226,6 +1471,24 @@ struct TranscriptUpdateEvent {
     audio_committed_ms: i64,
     buffered_ms: i64,
     model_feed_end_mono_ns: u64,
+}
+
+/// Emitted after sc_transcribe_finalize if the final transcript differs from the
+/// text dispatched in a transcript_committed event. Late revisions (punctuation,
+/// capitalization) appear here. This event is diagnostic-only and must not be used
+/// to revise already-dispatched conversation state.
+#[derive(Debug, Serialize)]
+struct TranscriptFinalizedEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    turn_id: String,
+    final_text: String,
+    committed_text: String,
+    revision: i32,
+    final_reason: String,
+    daemon_mono_ns: u64,
 }
 
 #[derive(Debug, Serialize)]
