@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use speech_core_protocol::now_mono_ns;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::{DetectorAction, DetectorSignal, DetectorWriter, EouResetMode};
@@ -58,6 +58,10 @@ impl Default for TurnManagerConfig {
 pub struct TurnManager {
     config: TurnManagerConfig,
     sessions: HashMap<String, TurnSession>,
+    /// Sessions that have been ended via end_session / finalize_all.
+    /// Late TranscriptTokenCommitted signals for these sessions must not
+    /// re-create a TurnSession or start a new turn.
+    closed_sessions: HashSet<String>,
 }
 
 impl TurnManager {
@@ -65,6 +69,7 @@ impl TurnManager {
         Self {
             config,
             sessions: HashMap::new(),
+            closed_sessions: HashSet::new(),
         }
     }
 
@@ -531,6 +536,13 @@ impl TurnManager {
             } => {
                 if self.config.model_drain.is_none() {
                     self.config.model_drain = Some(drain_handle);
+                }
+                // Late token arriving after the session was ended: discard entirely.
+                // The model worker may emit trailing tokens during finalize after the
+                // controller already called detector.end_session. These must not
+                // recreate a tombstoned session or open a new turn.
+                if self.closed_sessions.contains(&stream_session_id) {
+                    return Ok(Vec::new());
                 }
                 let mp_baseline = self.config.model_progress.clone();
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
@@ -1036,6 +1048,7 @@ impl TurnManager {
         reason: &str,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
+        self.closed_sessions.insert(stream_session_id.to_owned());
         if let Some(mut session) = self.sessions.remove(stream_session_id) {
             if let Some(turn) = session.open_turn.take() {
                 let end_sample = session.last_vad_end_sample.unwrap_or(turn.start_sample);
@@ -1178,6 +1191,40 @@ impl TurnManager {
                     generation: 0,
                 })
             })
+    }
+
+    /// Returns Some(session) if the session exists; None if the session was
+    /// already closed (tombstoned) and must not be re-created.
+    fn session_mut_no_recreate(
+        &mut self,
+        stream_id: &str,
+        stream_session_id: &str,
+        adapter_id: &str,
+    ) -> Option<&mut TurnSession> {
+        if self.closed_sessions.contains(stream_session_id) {
+            return None;
+        }
+        if !self.sessions.contains_key(stream_session_id) {
+            self.sessions.insert(
+                stream_session_id.to_owned(),
+                TurnSession::new(HelloState {
+                    adapter_id: adapter_id.to_owned(),
+                    stream_id: stream_id.to_owned(),
+                    stream_session_id: stream_session_id.to_owned(),
+                    source_kind: speech_core_protocol::SourceKind::Other,
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    format: speech_core_protocol::PcmFormat::PcmF32Le,
+                    timestamp_provenance: speech_core_protocol::TimestampProvenance::uncalibrated(
+                        "unknown",
+                        speech_core_protocol::ClockDomain::Unknown,
+                        speech_core_protocol::TimestampQuality::Unknown,
+                    ),
+                    generation: 0,
+                }),
+            );
+        }
+        self.sessions.get_mut(stream_session_id)
     }
 }
 
@@ -1335,15 +1382,19 @@ impl TurnSession {
                 )
             })
             .unwrap_or_default();
-        // Record the dispatch using the full cumulative committed text at this
-        // point so transcript_finalized (diagnostic-only) can detect late
-        // session-end revisions.
+        // Record the dispatch using the per-turn committed text (not full
+        // cumulative) so transcript_finalized (diagnostic-only) detects late
+        // session-end revisions to this turn without being confused by text
+        // accumulated across multiple turns.
         if let Some(progress) = model_progress {
-            let full_text = progress
-                .committed_text_snapshot(session_id)
-                .map(|(text, _, _)| text)
-                .unwrap_or_default();
-            progress.record_dispatch(session_id, &turn_id, &full_text);
+            progress.record_dispatch(
+                session_id,
+                &turn_id,
+                &committed_text,
+                turn_start_sample,
+                end_sample,
+                baseline_token_count,
+            );
             // Clear turn_id from shared state so subsequent transcript_updates
             // carry turn_id: null.
             progress.set_current_turn_id(session_id, None);
@@ -2682,6 +2733,178 @@ mod tests {
                 .any(|e| e.get("event").and_then(Value::as_str) == Some("turn_eou_candidate")),
             "stale fallback should not emit eou candidate: {stale_events:#?}"
         );
+    }
+
+    #[test]
+    fn end_session_tombstone_prevents_late_token_turn_recreation() {
+        // Regression: after TurnManager::end_session, a late
+        // TranscriptTokenCommitted signal must not re-enter session_mut
+        // and recreate the session + start a new turn.
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let _events = harness.drain_events();
+        assert!(!actions.is_empty(), "vad_end should close a turn");
+
+        // End the session via the manager.
+        {
+            let mut writer = DetectorWriter::new(&harness.logger, harness.runtime.handle());
+            harness
+                .manager
+                .end_session(SESSION_ID, "test_cleanup", &mut writer)
+                .expect("end_session should succeed");
+        }
+        harness.drain_events();
+
+        // Simulate a late token arriving after the session ended.
+        let late_actions = harness.send(transcript_token(0, 3_200, 3_200));
+        let late_events = harness.drain_events();
+
+        assert!(
+            late_actions.is_empty(),
+            "a late token after end_session must not trigger a reset or close; got actions: {late_actions:#?}"
+        );
+        assert_no_event(&late_events, "turn_started");
+        assert_no_event(&late_events, "turn_closed");
+        assert_no_event(&late_events, "transcript_committed");
+    }
+
+    #[test]
+    fn per_turn_committed_snapshot_isolates_punctuation_by_turn_boundaries() {
+        // Verifies that punctuation tokens arriving after a turn close are
+        // included in the correct turn's snapshot and do not leak into the
+        // next turn's committed text.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        // Turn 0: tokens "Hello" (0-8000) and "world" (8000-16000).
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "Hello".into(),
+                start_sample: 0,
+                end_sample: 8_000,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: "world".into(),
+                start_sample: 8_000,
+                end_sample: 16_000,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "Helloworld", 2, 1);
+
+        // Turn 0 closes at end_sample=17_920.
+        let (turn0_text, turn0_count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 0, 17_920)
+            .unwrap();
+        assert_eq!(turn0_text, "Helloworld");
+        assert_eq!(turn0_count, 2);
+
+        // Late punctuation "." for turn 0 arrives (index 2, between turns).
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 2,
+                text: ".".into(),
+                start_sample: 17_000,
+                end_sample: 17_240,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "Helloworld.", 3, 2);
+
+        // Turn 1 starts at sample 32_000. Baseline captured at token count 3.
+        let baseline = progress
+            .snapshot_token_count_at_turn_start(SESSION_ID)
+            .unwrap();
+        assert_eq!(baseline, 3);
+
+        // Turn 1: tokens "Yes" (32_000-40_000).
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 3,
+                text: "Yes".into(),
+                start_sample: 32_000,
+                end_sample: 40_000,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "Helloworld.Yes", 4, 3);
+
+        // Turn 1 closes at end_sample=49_920.
+        let (turn1_text, turn1_count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, baseline, 32_000, 49_920)
+            .unwrap();
+        // Turn 1 must NOT contain the late "." from turn 0 (index 2 < baseline 3).
+        assert_eq!(turn1_text, "Yes");
+        assert_eq!(turn1_count, 1);
+    }
+
+    #[test]
+    fn record_dispatch_stores_per_turn_not_cumulative_text() {
+        // Verifies that record_dispatch stores the per-turn committed text,
+        // not the full cumulative text, so transcript_finalized diagnostics
+        // are per-turn and not confused by text accumulated across turns.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        // Populate two turns worth of tokens.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "Hello".into(),
+                start_sample: 0,
+                end_sample: 8_000,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: "world".into(),
+                start_sample: 8_000,
+                end_sample: 16_000,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "Helloworld", 2, 1);
+
+        // Dispatch turn 0 with per-turn text.
+        progress.record_dispatch(SESSION_ID, "session:turn:0", "Helloworld", 0, 17_920, 0);
+
+        // Turn 1 tokens.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 2,
+                text: "Yes".into(),
+                start_sample: 32_000,
+                end_sample: 40_000,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "HelloworldYes", 3, 2);
+
+        // Dispatch turn 1 with per-turn text (just "Yes").
+        progress.record_dispatch(SESSION_ID, "session:turn:1", "Yes", 32_000, 49_920, 2);
+
+        // The dispatched snapshot should return the LAST turn's per-turn text,
+        // not the full cumulative.
+        let (dispatched_text, dispatched_turn_id, start, end, baseline) =
+            progress.dispatched_snapshot(SESSION_ID).unwrap();
+        assert_eq!(dispatched_text, "Yes");
+        assert_eq!(dispatched_turn_id, "session:turn:1");
+        assert_eq!(start, 32_000);
+        assert_eq!(end, 49_920);
+        assert_eq!(baseline, 2);
     }
 
     #[test]

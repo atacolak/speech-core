@@ -56,6 +56,26 @@ impl DetectorIngress {
                 loop {
                     match control_receiver.try_recv() {
                         Ok(command) => {
+                            // Flush pending audio and transcript tokens before
+                            // processing EndSession so finalize sees all queued
+                            // frames for this session. Transcript tokens arrive
+                            // via the control channel; audio via the audio channel.
+                            // Both must be drained before EndSession.
+                            if matches!(command, DetectorCommand::EndSession { .. }) {
+                                // First drain audio channel (audio frames for this session).
+                                loop {
+                                    match audio_receiver.try_recv() {
+                                        Ok(audio_cmd) => {
+                                            worker.handle(audio_cmd);
+                                        }
+                                        Err(mpsc::error::TryRecvError::Empty) => break,
+                                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                                            audio_closed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                             if worker.handle(command) {
                                 graceful_shutdown = true;
                             }
@@ -158,15 +178,20 @@ impl DetectorIngress {
         _logger: &JsonlLogger,
         reason: impl Into<String>,
     ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let command = DetectorCommand::EndSession {
             stream_id: hello.stream_id.clone(),
             stream_session_id: hello.stream_session_id.clone(),
             adapter_id: hello.adapter_id.clone(),
             reason: reason.into(),
+            reply: reply_tx,
         };
         self.control_sender
             .send(command)
-            .map_err(|_| anyhow::anyhow!("detector control path closed at session end"))
+            .map_err(|_| anyhow::anyhow!("detector control path closed at session end"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("detector worker dropped session end acknowledgement"))?
     }
 
     pub async fn reset_audio(&self, gap: AudioGapReset, _logger: &JsonlLogger) -> Result<()> {
@@ -233,6 +258,7 @@ enum DetectorCommand {
         stream_session_id: String,
         adapter_id: String,
         reason: String,
+        reply: oneshot::Sender<Result<()>>,
     },
     AudioGapReset {
         gap: AudioGapReset,
@@ -496,8 +522,17 @@ impl DetectorWorker {
                 DetectorCommand::EndSession {
                     stream_session_id,
                     reason,
+                    reply,
                     ..
-                } => self.end_session_inner(&stream_session_id, &reason, &mut writer),
+                } => {
+                    let result = self.end_session_inner(&stream_session_id, &reason, &mut writer);
+                    let reply_result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+                    };
+                    let _ = reply.send(reply_result);
+                    result
+                }
                 DetectorCommand::AudioGapReset { gap } => self.audio_gap_reset(gap, &mut writer),
                 DetectorCommand::Shutdown { reply } => {
                     self.finalize_all("detector worker shutdown");

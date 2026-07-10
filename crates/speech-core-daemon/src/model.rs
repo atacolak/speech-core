@@ -44,11 +44,16 @@ pub struct ModelProgressState {
     /// The currently open turn_id, set by TurnManager on turn_started and cleared on
     /// turn_closed. Model worker reads this for transcript_update/token event tagging.
     pub current_turn_id: Option<String>,
-    /// The text dispatched in the last transcript_committed event. Used by
+    /// The per-turn text dispatched in the last transcript_committed event. Used by
     /// transcript_finalized (diagnostic-only) to detect late session-end revisions.
     pub last_dispatched_text: Option<String>,
     /// The turn_id of the last dispatched transcript_committed.
     pub last_dispatched_turn_id: Option<String>,
+    /// Turn boundaries of the last dispatched transcript_committed, used to
+    /// recompute the per-turn text at finalize time for diagnostic comparison.
+    pub last_dispatched_turn_start_sample: Option<u64>,
+    pub last_dispatched_turn_end_sample: Option<u64>,
+    pub last_dispatched_baseline_token_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,6 +171,9 @@ impl ModelProgressMap {
                     current_turn_id: None,
                     last_dispatched_text: None,
                     last_dispatched_turn_id: None,
+                    last_dispatched_turn_start_sample: None,
+                    last_dispatched_turn_end_sample: None,
+                    last_dispatched_baseline_token_count: None,
                 },
             );
         }
@@ -322,24 +330,40 @@ impl ModelProgressMap {
         })
     }
 
-    /// Record a dispatch (transcript_committed) for a session. Stores the dispatched text
-    /// and turn_id so transcript_finalized can detect late revisions.
-    pub fn record_dispatch(&self, session_id: &str, turn_id: &str, text: &str) {
+    /// Record a dispatch (transcript_committed) for a session. Stores the per-turn
+    /// dispatched text, turn_id, and turn boundaries so transcript_finalized can
+    /// recompute the per-turn text at finalize time and detect late revisions.
+    pub fn record_dispatch(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        text: &str,
+        turn_start_sample: u64,
+        turn_end_sample: u64,
+        baseline_token_count: u32,
+    ) {
         if let Ok(mut map) = self.inner.lock() {
             if let Some(state) = map.get_mut(session_id) {
                 state.last_dispatched_text = Some(text.to_owned());
                 state.last_dispatched_turn_id = Some(turn_id.to_owned());
+                state.last_dispatched_turn_start_sample = Some(turn_start_sample);
+                state.last_dispatched_turn_end_sample = Some(turn_end_sample);
+                state.last_dispatched_baseline_token_count = Some(baseline_token_count);
             }
         }
     }
 
-    /// Get the last dispatched (transcript_committed) state for a session.
-    pub fn dispatched_snapshot(&self, session_id: &str) -> Option<(String, String)> {
+    /// Get the last dispatched (transcript_committed) state for a session,
+    /// including turn boundaries for per-turn recomputation at finalize time.
+    pub fn dispatched_snapshot(&self, session_id: &str) -> Option<(String, String, u64, u64, u32)> {
         self.inner.lock().ok().and_then(|map| {
             map.get(session_id).and_then(|state| {
                 Some((
                     state.last_dispatched_text.clone()?,
                     state.last_dispatched_turn_id.clone()?,
+                    state.last_dispatched_turn_start_sample?,
+                    state.last_dispatched_turn_end_sample?,
+                    state.last_dispatched_baseline_token_count?,
                 ))
             })
         })
@@ -405,6 +429,22 @@ impl ModelIngress {
                 loop {
                     match control_receiver.try_recv() {
                         Ok(command) => {
+                            // Flush pending audio before processing EndSession
+                            // so finalize sees all enqueued frames for this session.
+                            if matches!(command, ModelCommand::EndSession { .. }) {
+                                loop {
+                                    match audio_receiver.try_recv() {
+                                        Ok(audio_cmd) => {
+                                            worker.handle(audio_cmd);
+                                        }
+                                        Err(mpsc::error::TryRecvError::Empty) => break,
+                                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                                            audio_closed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                             if worker.handle(command) {
                                 graceful_shutdown = true;
                             }
@@ -519,15 +559,20 @@ impl ModelIngress {
         _logger: &JsonlLogger,
         reason: impl Into<String>,
     ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         let command = ModelCommand::EndSession {
             stream_id: hello.stream_id.clone(),
             stream_session_id: hello.stream_session_id.clone(),
             adapter_id: hello.adapter_id.clone(),
             reason: reason.into(),
+            reply: reply_tx,
         };
         self.control_sender
             .send(command)
-            .map_err(|_| anyhow::anyhow!("model worker control path closed at session end"))
+            .map_err(|_| anyhow::anyhow!("model worker control path closed at session end"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("model worker dropped session end acknowledgement"))?
     }
 
     pub async fn reset_audio(&self, gap: AudioGapReset, _logger: &JsonlLogger) -> Result<()> {
@@ -594,6 +639,7 @@ enum ModelCommand {
         stream_session_id: String,
         adapter_id: String,
         reason: String,
+        reply: oneshot::Sender<Result<()>>,
     },
     AudioGapReset {
         gap: AudioGapReset,
@@ -699,8 +745,17 @@ impl ModelWorker {
             ModelCommand::EndSession {
                 stream_session_id,
                 reason,
+                reply,
                 ..
-            } => self.end_session(&stream_session_id, &reason),
+            } => {
+                let result = self.end_session(&stream_session_id, &reason);
+                let reply_result = match &result {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(anyhow::anyhow!(err.to_string())),
+                };
+                let _ = reply.send(reply_result);
+                result
+            }
             ModelCommand::AudioGapReset { gap } => self.audio_gap_reset(gap),
             ModelCommand::SetTranscriptSink { sink } => {
                 self.config.transcript_sink = sink;
@@ -887,22 +942,25 @@ impl ModelWorker {
             Some(reason),
         )?;
 
-        // Emit transcript_finalized if the final text differs from the last dispatched text.
+        // Emit transcript_finalized if the per-turn text for the last dispatched
+        // turn changed after dispatch (late model revisions: punctuation, capitalization).
+        // Recompute the per-turn text at finalize time using the same boundaries
+        // and baseline, then compare with the stored dispatch text.
         if let Some(ref progress) = self.model_progress {
-            if let Some((final_text, _, final_revision)) =
-                progress.committed_text_snapshot(&session_id)
+            if let Some((dispatched_text, dispatched_turn_id, start_sample, end_sample, baseline)) =
+                progress.dispatched_snapshot(&session_id)
             {
-                if let Some((dispatched_text, dispatched_turn_id)) =
-                    progress.dispatched_snapshot(&session_id)
+                if let Some((final_per_turn, _, final_revision)) = progress
+                    .per_turn_committed_snapshot(&session_id, baseline, start_sample, end_sample)
                 {
-                    if final_text != dispatched_text {
+                    if final_per_turn != dispatched_text {
                         self.write_blocking(&TranscriptFinalizedEvent {
                             event: "transcript_finalized",
                             stream_id: session.hello.stream_id.clone(),
                             stream_session_id: session.hello.stream_session_id.clone(),
                             adapter_id: session.hello.adapter_id.clone(),
                             turn_id: dispatched_turn_id,
-                            final_text: final_text.clone(),
+                            final_text: final_per_turn,
                             committed_text: dispatched_text,
                             revision: final_revision,
                             final_reason: reason.to_owned(),
