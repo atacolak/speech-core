@@ -898,7 +898,7 @@ impl TuiModel {
                 let hold_target = value
                     .get("hold_target_ms")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(7000);
+                    .unwrap_or(7500);
                 if self.turn_for_event(value).is_some() && hold_progress > 0 {
                     self.push_hold_bar(hold_progress, hold_target);
                 } else {

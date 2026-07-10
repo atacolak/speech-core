@@ -290,10 +290,10 @@ struct Args {
     )]
     turn_min_vad_speech_ms: u32,
 
-    /// Emit a non-closing human-presence event after this much speech-like audio without committed tokens.
+    /// Close the current turn as human_hold after this much speech-like audio without committed tokens.
     #[arg(
         long,
-        default_value_t = 7000,
+        default_value_t = 7500,
         env = "SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS"
     )]
     turn_human_hold_silence_ms: u32,

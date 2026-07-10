@@ -419,6 +419,8 @@ impl TurnManager {
                 let human_hold_silence_samples = ms_to_samples(self.config.human_hold_silence_ms);
                 let hold_target_ms = u64::from(self.config.human_hold_silence_ms);
                 let model_progress = self.config.model_progress.clone();
+                let model_drain = self.config.model_drain.clone();
+                let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 if human_hold_silence_samples == 0 || session.open_turn.is_none() {
                     return Ok(Vec::new());
@@ -453,6 +455,46 @@ impl TurnManager {
                         threshold: None,
                         daemon_mono_ns: now_mono_ns(),
                     })?;
+                    // Continuous VadSpeechPresence path: close the turn immediately
+                    // once the no-new-token threshold is reached. Use the established
+                    // close-time model drain / alignment so any trailing ASR tokens
+                    // commit before turn_closed.
+                    let alignment = align_model_for_close(
+                        model_progress.as_ref(),
+                        model_drain.as_ref(),
+                        &stream_id,
+                        &stream_session_id,
+                        &adapter_id,
+                        decision_sample,
+                        decision_sample,
+                        "human_hold",
+                        "human_hold_speech_like_audio_without_tokens",
+                        model_alignment_timeout_ms,
+                    );
+                    writer.write(&alignment.event(&stream_id, &stream_session_id, &adapter_id))?;
+                    let effective_end_sample = alignment.effective_end_sample;
+                    let effective_decision_sample = alignment.effective_decision_sample;
+                    session.close_turn(
+                        turn_id,
+                        "human_hold",
+                        true,
+                        detector,
+                        confidence,
+                        effective_end_sample,
+                        effective_decision_sample,
+                        "human_hold_speech_like_audio_without_tokens",
+                        writer,
+                    )?;
+                    return Ok(vec![DetectorAction::ResetEouState {
+                        stream_id,
+                        stream_session_id,
+                        adapter_id,
+                        mode: EouResetMode::Decoder,
+                        anchor_sample: effective_decision_sample,
+                        source: "human_hold",
+                        reason: "human_hold_speech_like_audio_without_tokens",
+                        decision_sample: effective_decision_sample,
+                    }]);
                 }
                 // Emit hold-timer progress every frame for the TUI bar.
                 writer.write(&TurnHoldProgressEvent {
@@ -1585,7 +1627,7 @@ struct TurnHoldProgressEvent {
     turn_id: String,
     /// Wall-clock ms since the last committed transcript token.
     hold_progress_ms: u64,
-    /// Threshold at which human-hold fires (typically 7000ms).
+    /// Threshold at which human-hold fires (typically 7500ms).
     hold_target_ms: u64,
     daemon_mono_ns: u64,
 }
