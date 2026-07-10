@@ -110,12 +110,14 @@ speech_out_synthesis_started
 speech_out_text_chunk_started
 speech_out_audio_chunk      # followed by one websocket binary chunk containing WAV bytes
 speech_out_text_chunk_completed
-speech_out_completed
-speech_out_failed
+speech_out_completed        # terminal daemon synthesis-stream-delivered outcome
+speech_out_cancelled        # terminal daemon cancellation outcome
+speech_out_failed           # terminal daemon failure outcome
 speech_out_pong
-speech_out_playback_started    # client-side event from speech-out play
-speech_out_playback_completed  # client-side event from speech-out play
-speech_out_playback_failed     # client-side event from speech-out play
+speech_out_playback_started              # client-side event from speech-out play
+speech_out_playback_completed            # client-side event from speech-out play, per WAV chunk
+speech_out_playback_utterance_completed  # client-side terminal playback completion
+speech_out_playback_failed               # client-side terminal playback failure from speech-out play
 ```
 
 The output-only diagnostic supervisor adds local/replay-only events around that stream: `speech_out_request_queued`, `speech_out_playback_ready`, `speech_out_cancel_requested`, `speech_out_cancel_acknowledged`, and `speech_out_diagnostic_terminal`. These are observability events for diagnostics and TUI replay; they do not change the speech-out daemon protocol.
@@ -156,6 +158,12 @@ Useful knobs:
 - `--play-command true` is the default for diagnostics; override with `pw-play` only when intentionally testing local audio playback.
 
 The diagnostic timeline uses this supervisor process' monotonic clock (`diagnostic_mono_ns`) for all displayed deltas. It renders unambiguous state transitions for request queued, request received, synthesis start, first audio, per-text-chunk start/completion, playback start/ready/end, cancel requested/acknowledged, and terminal completed/failed/cancelled outcome. The summary always includes end-to-end and first-audio latency; cancelled runs also include cancel latency.
+
+## terminal outcomes and WAV merge
+
+The daemon's terminal outcomes are mutually exclusive for an active request: `speech_out_completed`, `speech_out_cancelled`, or `speech_out_failed`. `speech_out_completed` means synthesis bytes were delivered on the websocket; when using `speech-out play`, playback completion is separately reported by the client-side `speech_out_playback_utterance_completed` event. Playback command failure is terminal for the client process and is reported as `speech_out_playback_failed`.
+
+When `speech-out play --output file.wav` receives multiple text chunks, it no longer concatenates complete WAV containers. It parses each response as PCM RIFF/WAVE, verifies compatible format fields, and writes a single merged PCM WAV container. Incompatible or non-PCM chunks fail with a precise error rather than producing a corrupt output file.
 
 ## developer live-session harness
 
@@ -221,7 +229,8 @@ cargo run -p speech-out -- say \
 Implemented today:
 
 - bounded one-shot calls: `--timeout-secs` terminates command/http/playback child processes when they overrun.
-- external supervisors can stop the top-level `speech-out` process, but full signal-aware child cleanup is left for `speech-out-daemon`.
+- daemon cancellation while active synthesis is in progress: the websocket read side is observed concurrently with the current Supertonic child stdout. A matching `cancel` control kills and waits the current curl child before emitting terminal `speech_out_cancelled`; client disconnects and send/read errors also terminate the active child before returning.
+- request/resource validation: text is bounded by Unicode scalar count, chunk sizing is clamped/bounded, websocket control messages have a maximum byte size, and `steps` / `speed` must be finite and in range.
 
 Daemon design, not implemented yet:
 
