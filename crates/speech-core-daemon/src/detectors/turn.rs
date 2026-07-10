@@ -2073,6 +2073,7 @@ mod tests {
     #[test]
     fn close_wait_does_not_require_token_to_reach_silence_decision_sample() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
         progress.update(SESSION_ID, 17_920);
         progress.record_token(SESSION_ID, 15_000);
         let mut harness = TurnHarness::new(TurnManagerConfig {
@@ -2256,6 +2257,7 @@ mod tests {
     #[test]
     fn old_segment_end_after_direct_semantic_close_does_not_duplicate_close() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
         progress.update(SESSION_ID, 17_920);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,

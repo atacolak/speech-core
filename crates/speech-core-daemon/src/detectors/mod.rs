@@ -194,7 +194,9 @@ impl DetectorIngress {
 
     pub async fn shutdown(&self) {
         let (reply, done) = oneshot::channel();
-        let _ = self.control_sender.send(DetectorCommand::Shutdown { reply });
+        let _ = self
+            .control_sender
+            .send(DetectorCommand::Shutdown { reply });
         let _ = done.await;
     }
 }

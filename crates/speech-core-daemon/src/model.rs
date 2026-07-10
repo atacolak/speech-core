@@ -1378,13 +1378,14 @@ mod tests {
     #[test]
     fn progress_map_keeps_token_state_until_explicit_remove() {
         let progress = ModelProgressMap::new();
+        progress.start_session_for_test("session");
         progress.update("session", 1_600);
         progress.record_token("session", 1_200);
 
         assert_eq!(progress.get("session"), Some(1_600));
         assert_eq!(progress.last_token_end_sample("session"), Some(1_200));
 
-        progress.remove("session");
+        progress.remove_generation("session", 1);
         assert_eq!(progress.get("session"), None);
         assert_eq!(progress.last_token_end_sample("session"), None);
     }

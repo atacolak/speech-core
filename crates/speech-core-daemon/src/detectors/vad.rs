@@ -970,6 +970,7 @@ mod tests {
                 ClockDomain::HostMonotonic,
                 TimestampQuality::SyntheticScheduled,
             ),
+            generation: 0,
         }
     }
 
