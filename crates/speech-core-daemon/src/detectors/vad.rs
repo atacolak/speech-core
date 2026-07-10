@@ -1000,8 +1000,8 @@ mod tests {
     }
 
     fn writer_fixture() -> (
-        crate::JsonlLogger,
         Runtime,
+        crate::JsonlLogger,
         tempfile::TempDir,
         broadcast::Receiver<String>,
     ) {
@@ -1011,7 +1011,7 @@ mod tests {
         let logger = runtime
             .block_on(crate::JsonlLogger::open(dir.path().to_path_buf(), event_tx))
             .expect("test logger should open");
-        (logger, runtime, dir, events)
+        (runtime, logger, dir, events)
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
             config: SileroVadConfig::default(),
             sessions: HashMap::from([(SESSION_ID.to_owned(), test_session())]),
         };
-        let (logger, runtime, _dir, _events) = writer_fixture();
+        let (runtime, logger, _dir, _events) = writer_fixture();
         let mut writer = DetectorWriter::new(&logger, runtime.handle());
 
         detector
@@ -1118,7 +1118,7 @@ mod tests {
             session.current_segment_start_sample = Some(0);
             session.last_voice_sample_end = Some(16_000);
         }
-        let (logger, runtime, _dir, _events) = writer_fixture();
+        let (runtime, logger, _dir, _events) = writer_fixture();
         let mut writer = DetectorWriter::new(&logger, runtime.handle());
 
         detector
