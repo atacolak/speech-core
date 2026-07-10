@@ -1961,10 +1961,9 @@ async fn run_play(args: PlayArgs) -> Result<()> {
     // harness (scripts/speech-out-live-session.sh) to send a normal
     // SIGTERM instead of resorting to SIGKILL, and gives the daemon a
     // chance to stop synthesis and emit `speech_out_cancelled`.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .ok();
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .ok();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
     let mut cancelled = false;
     let mut done = false;

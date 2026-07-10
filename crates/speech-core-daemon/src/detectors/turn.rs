@@ -474,6 +474,11 @@ impl TurnManager {
                     writer.write(&alignment.event(&stream_id, &stream_session_id, &adapter_id))?;
                     let effective_end_sample = alignment.effective_end_sample;
                     let effective_decision_sample = alignment.effective_decision_sample;
+                    let turn_start_sample = session
+                        .open_turn
+                        .as_ref()
+                        .map(|turn| turn.start_sample)
+                        .unwrap_or(start_sample);
                     session.close_turn(
                         turn_id,
                         "human_hold",
@@ -483,6 +488,8 @@ impl TurnManager {
                         effective_end_sample,
                         effective_decision_sample,
                         "human_hold_speech_like_audio_without_tokens",
+                        turn_start_sample,
+                        model_progress.as_ref(),
                         writer,
                     )?;
                     return Ok(vec![DetectorAction::ResetEouState {
@@ -2008,6 +2015,18 @@ mod tests {
         }
     }
 
+    fn vad_presence(start_sample: u64, decision_sample: u64) -> DetectorSignal {
+        DetectorSignal::VadSpeechPresence {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample,
+            decision_sample,
+            confidence: Some(0.9),
+        }
+    }
+
     fn semantic_decision(
         end_sample: u64,
         decision_sample: u64,
@@ -2466,6 +2485,53 @@ mod tests {
             true,
             "human_hold_speech_like_audio_without_tokens",
         );
+    }
+
+    #[test]
+    fn continuous_presence_human_hold_closes_once_and_stale_segment_cannot_reopen() {
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            human_hold_silence_ms: 1_000,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(vad_presence(0, 16_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "human_hold",
+            "human_hold_speech_like_audio_without_tokens",
+            16_000,
+        );
+        assert_eq!(event_count(&events, "turn_human_hold"), 1);
+        assert_eq!(event_count(&events, "transcript_committed"), 1);
+        assert_turn_closed(
+            &events,
+            "human_hold",
+            true,
+            "human_hold_speech_like_audio_without_tokens",
+        );
+
+        let continued_actions = harness.send(vad_presence(0, 17_000));
+        let continued_events = harness.drain_events();
+        assert!(
+            continued_actions.is_empty(),
+            "continuous high VAD after forced close must not reset again: {continued_actions:#?}"
+        );
+        assert_no_event(&continued_events, "turn_started");
+        assert_no_event(&continued_events, "turn_human_hold");
+        assert_no_event(&continued_events, "turn_closed");
+
+        let stale_actions = harness.send(vad_end(0, 16_000, 16_000));
+        let stale_events = harness.drain_events();
+        assert!(
+            stale_actions.is_empty(),
+            "the old segment end must not close or reset again: {stale_actions:#?}"
+        );
+        assert_no_event(&stale_events, "turn_started");
+        assert_no_event(&stale_events, "turn_closed");
     }
 
     #[test]
