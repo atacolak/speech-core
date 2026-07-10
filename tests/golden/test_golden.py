@@ -421,6 +421,15 @@ class TestPromoteValidation(unittest.TestCase):
         self.take_dir = Path(self.tmp) / "take-001"
         self.take_dir.mkdir(parents=True)
         self.dest_dir = Path(self.tmp) / "fixture"
+        # Create minimal evidence dir and provenance for promotion tests
+        self.evidence_dir = self.take_dir / "quality" / "review" / "provenance"
+        self.evidence_dir.mkdir(parents=True)
+        self._write_json("provenance.json", {
+            "version": "1.0",
+            "dry_run": False,
+            "mode": "take",
+            "stream_session_id": "test-fake-sid",
+        })
 
     def tearDown(self):
         import shutil
@@ -467,7 +476,12 @@ class TestPromoteValidation(unittest.TestCase):
     def test_missing_wav(self):
         self._write_json("consent.json", {"purpose": "test"})
         self._write_json("privacy.json", {"retention_class": "delete-after-run"})
-        self._write_json("review.json", {"accepted": True})
+        self._write_json("review.json", {"accepted": True, "checks_passed": True})
+        # Add validity evidence so we reach the WAV check
+        self._write_json(
+            str(self.evidence_dir / "validity.json"),
+            {"valid": True, "reason": "ok", "stream_session_id": "test-fake-sid"}
+        )
         # No WAV
         with self.assertRaises(SystemExit) as cm:
             golden.promote_take(self.take_dir, self.dest_dir)
@@ -476,11 +490,15 @@ class TestPromoteValidation(unittest.TestCase):
     def test_pii_in_path_rejected(self):
         self._write_json("consent.json", {"purpose": "test"})
         self._write_json("privacy.json", {"retention_class": "delete-after-run"})
-        self._write_json("review.json", {"accepted": True})
+        self._write_json("review.json", {"accepted": True, "checks_passed": True})
         # Write a valid WAV
         samples = golden._generate_silence(1000)
         golden.write_wav(self.take_dir / "audio.wav", samples)
-        self._write_json("provenance.json", {"version": "1.0"})
+        # Add validity evidence so we reach the PII check
+        self._write_json(
+            str(self.evidence_dir / "validity.json"),
+            {"valid": True, "reason": "ok", "stream_session_id": "test-fake-sid"}
+        )
 
         # Path with email-like content — copy valid setup to bad dir
         bad_dir = Path(self.tmp) / "user@email"
@@ -493,10 +511,14 @@ class TestPromoteValidation(unittest.TestCase):
     def test_valid_wav_promote_dry_run(self):
         self._write_json("consent.json", {"purpose": "test"})
         self._write_json("privacy.json", {"retention_class": "repo-fixture-explicit"})
-        self._write_json("review.json", {"accepted": True})
+        self._write_json("review.json", {"accepted": True, "checks_passed": True})
         samples = golden._generate_silence(1000)
         golden.write_wav(self.take_dir / "audio.wav", samples)
-        self._write_json("provenance.json", {"version": "1.0"})
+        # Add validity evidence
+        self._write_json(
+            str(self.evidence_dir / "validity.json"),
+            {"valid": True, "reason": "ok", "stream_session_id": "test-fake-sid"}
+        )
 
         code = golden.promote_take(self.take_dir, self.dest_dir, dry_run=True)
         self.assertEqual(code, golden.ExitCode.PASS)
@@ -504,10 +526,14 @@ class TestPromoteValidation(unittest.TestCase):
     def test_invalid_wav_promote(self):
         self._write_json("consent.json", {"purpose": "test"})
         self._write_json("privacy.json", {"retention_class": "repo-fixture-explicit"})
-        self._write_json("review.json", {"accepted": True})
+        self._write_json("review.json", {"accepted": True, "checks_passed": True})
         # Write a zero-sample WAV
         golden.write_wav(self.take_dir / "audio.wav", [])
-        self._write_json("provenance.json", {"version": "1.0"})
+        # Add validity evidence
+        self._write_json(
+            str(self.evidence_dir / "validity.json"),
+            {"valid": True, "reason": "ok", "stream_session_id": "test-fake-sid"}
+        )
 
         with self.assertRaises(SystemExit) as cm:
             golden.promote_take(self.take_dir, self.dest_dir)

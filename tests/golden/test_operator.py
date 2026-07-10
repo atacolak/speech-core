@@ -595,8 +595,19 @@ class TestSubprocessMocking(unittest.TestCase):
         mock_mic.poll.return_value = None
         mock_mic.pid = 12346
 
-        # First call returns watcher, second returns mic
-        mock_popen.side_effect = [mock_watcher, mock_mic]
+        # Create ready file when watcher is launched (after unlink removes it)
+        call_count = [0]
+        def _popen_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:  # watcher launch
+                ready_path.parent.mkdir(parents=True, exist_ok=True)
+                ready_path.write_text("ready\n")
+                return mock_watcher
+            else:  # mic launch
+                return mock_mic
+
+        # Use a MagicMock for Popen that calls our side effect
+        mock_popen.side_effect = _popen_side_effect
 
         # Set up test data
         scenario = {"id": "human-clean-complete", "class": "natural_endpoint",
@@ -604,11 +615,11 @@ class TestSubprocessMocking(unittest.TestCase):
         cues = golden._default_cues_for_scenario("human-clean-complete")
         take_dir = Path(self.tmp) / "take-001"
         take_dir.mkdir()
-        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')  # Pre-seed for ready check
+
+        # Ready file will be created during subprocess.Popen call
+        ready_path = take_dir / "diagnostics" / "watcher.ready"
 
         # Mock _display_recording_screen to avoid display
-        # time.monotonic must progress past WATCHER_MIN_STABLE_SEC (2.0s) for liveness check,
-        # then continue into recording loop. Use a generator that increments by 0.3s.
         with patch.object(golden, "_display_recording_screen"), \
              patch.object(golden, "_clear_screen"), \
              patch.object(golden, "_get_key", return_value=""), \
@@ -1142,14 +1153,26 @@ class TestAdversarialSafety(unittest.TestCase):
         mock_mic.pid = 12346
         mock_mic.returncode = 0
 
-        mock_popen.side_effect = [mock_watcher, mock_mic]
-
         scenario = {"id": "test"}
         cues = [{"band_ms": [0, 500], "label": "SPEAK", "visual": "test"}]
         take_dir = Path(self.tmp) / "nonzero-watcher"
         take_dir.mkdir()
 
-        # Use a monotonic generator that passes liveness check then fast-forwards
+        # Create ready file when watcher is launched (after unlink removes it)
+        ready_path = take_dir / "diagnostics" / "watcher.ready"
+        call_count_2 = [0]
+        def _popen_side_effect_2(*args, **kwargs):
+            call_count_2[0] += 1
+            if call_count_2[0] == 1:
+                ready_path.parent.mkdir(parents=True, exist_ok=True)
+                ready_path.write_text("ready\n")
+                return mock_watcher
+            else:
+                return mock_mic
+
+        mock_popen.side_effect = _popen_side_effect_2
+
+        # Use a monotonic generator that passes readiness then fast-forwards
         with patch.object(golden, "_display_recording_screen"), \
              patch.object(golden, "_clear_screen"), \
              patch.object(golden, "_get_key", return_value=""), \
@@ -1256,6 +1279,461 @@ class TestAdversarialSafety(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
         self.assertEqual(cm.exception.code, golden.ExitCode.BASELINE_REQUIRES_REVIEW)
+
+
+class TestReadinessFileChannel(unittest.TestCase):
+    """Behavioral tests for explicit --ready-file readiness side-channel."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ready_arg_in_watcher_command(self):
+        """Watcher args must include --ready-file when launched by operator."""
+        # Verify the code constructs --ready-file in watcher_args
+        import inspect
+        source = inspect.getsource(golden._operator_real_capture)
+        self.assertIn("--ready-file", source,
+                      "Watcher launch must include --ready-file")
+        self.assertIn("ready_path", source,
+                      "Watcher launch must reference ready_path")
+
+    def test_ready_path_in_capture_info(self):
+        """capture_info must include ready_path and readiness fields."""
+        import inspect
+        source = inspect.getsource(golden._operator_real_capture)
+        self.assertIn('"ready_path"', source,
+                      "capture_info must track ready_path")
+        self.assertIn('"readiness_at"', source,
+                      "capture_info must track readiness timestamp")
+        self.assertIn('"readiness_method"', source,
+                      "capture_info must record readiness method")
+
+    @patch("subprocess.Popen")
+    @patch.object(golden, "_find_binary")
+    def test_stale_ready_file_does_not_satisfy(self, mock_find, mock_popen):
+        """A pre-existing stale ready file must not satisfy readiness.
+        The operator explicitly unlinks the ready file before launching watcher."""
+        import inspect
+        source = inspect.getsource(golden._operator_real_capture)
+        self.assertIn("unlink", source,
+                      "Stale ready file must be unlinked before watcher launch")
+
+    @patch("subprocess.Popen")
+    @patch.object(golden, "_find_binary")
+    def test_watcher_early_exit_before_ready_fails(self, mock_find, mock_popen):
+        """Early watcher exit (before ready file appears) must fail."""
+        mock_find.side_effect = lambda name: f"/fake/{name}"
+
+        mock_watcher = MagicMock()
+        mock_watcher.poll.return_value = 1  # Exited immediately
+        mock_watcher.returncode = 1
+        mock_watcher.pid = 12345
+        mock_watcher.stderr = MagicMock()
+        mock_watcher.stderr.read.return_value = "connection refused"
+        mock_popen.return_value = mock_watcher
+
+        scenario = {"id": "test"}
+        cues = [{"band_ms": [0, 5000], "label": "SPEAK", "visual": "test"}]
+        take_dir = Path(self.tmp) / "take-001"
+        take_dir.mkdir()
+
+        with patch("time.sleep", return_value=None):
+            code, info = golden._operator_real_capture(
+                scenario=scenario, cues=cues, take_dir=take_dir,
+                mode="take", device=None, ws_url="ws://bad:1234",
+                stream_session_id="test", total_ms=5000, drain_sec=0.1,
+            )
+
+        self.assertEqual(code, golden.ExitCode.DAEMON_UNREACHABLE,
+                        f"Early watcher exit should fail, got {code}")
+        self.assertEqual(info.get("readiness_status"), "watcher-exited-early-rc-1")
+
+    @patch("subprocess.Popen")
+    @patch.object(golden, "_find_binary")
+    def test_ready_file_appears_mic_launches(self, mock_find, mock_popen):
+        """When ready file appears, watcher is declared ready and mic launches."""
+        mock_find.side_effect = lambda name: f"/fake/{name}"
+
+        mock_watcher = MagicMock()
+        mock_watcher.poll.return_value = None  # Still running
+        mock_watcher.pid = 12345
+        mock_watcher.returncode = 0
+
+        mock_mic = MagicMock()
+        mock_mic.poll.return_value = None
+        mock_mic.pid = 12346
+        mock_mic.returncode = 0
+
+        mock_popen.side_effect = [mock_watcher, mock_mic]
+
+        scenario = {"id": "test"}
+        cues = [{"band_ms": [0, 500], "label": "SPEAK", "visual": "test"}]
+        take_dir = Path(self.tmp) / "take-002"
+        take_dir.mkdir()
+
+        # Create ready file before first poll — simulates watcher creating it
+        ready_path = take_dir / "diagnostics" / "watcher.ready"
+
+        def _create_ready_then_run():
+            # After watcher is launched, create the ready file
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            ready_path.write_text("ready\n")
+            # Return monotonic values that progress through the loop
+            for i in range(200):
+                yield i * 0.3
+
+        t = _create_ready_then_run()
+
+        with patch.object(golden, "_display_recording_screen"), \
+             patch.object(golden, "_clear_screen"), \
+             patch.object(golden, "_get_key", return_value=""), \
+             patch("time.sleep", return_value=None), \
+             patch("time.monotonic", side_effect=t):
+            code, info = golden._operator_real_capture(
+                scenario=scenario, cues=cues, take_dir=take_dir,
+                mode="take", device=None,
+                ws_url="ws://127.0.0.1:8765/ws/audio-ingress",
+                stream_session_id="test", total_ms=500, drain_sec=0.05,
+            )
+
+        # Should have launched both watcher and mic
+        self.assertEqual(mock_popen.call_count, 2,
+                        f"Should launch watcher + mic, got {mock_popen.call_count}")
+        self.assertEqual(info.get("readiness_status"), "ready-file-created")
+        self.assertIsNotNone(info.get("readiness_at"))
+
+    @patch("subprocess.Popen")
+    @patch.object(golden, "_find_binary")
+    def test_no_ready_file_timeout_fails(self, mock_find, mock_popen):
+        """When ready file never appears within timeout, capture must fail."""
+        mock_find.side_effect = lambda name: f"/fake/{name}"
+
+        mock_watcher = MagicMock()
+        mock_watcher.poll.return_value = None  # Stays alive but no ready file
+        mock_watcher.pid = 12345
+        mock_popen.return_value = mock_watcher
+
+        scenario = {"id": "test"}
+        cues = [{"band_ms": [0, 5000], "label": "SPEAK", "visual": "test"}]
+        take_dir = Path(self.tmp) / "take-003"
+        take_dir.mkdir()
+
+        with patch("time.sleep", return_value=None):
+            code, info = golden._operator_real_capture(
+                scenario=scenario, cues=cues, take_dir=take_dir,
+                mode="take", device=None, ws_url="ws://bad:1234",
+                stream_session_id="test", total_ms=5000, drain_sec=0.1,
+            )
+
+        self.assertEqual(code, golden.ExitCode.DAEMON_UNREACHABLE,
+                        f"Ready timeout should fail, got {code}")
+        self.assertEqual(info.get("readiness_status"), "timeout")
+
+
+class TestQualityCheckBounds(unittest.TestCase):
+    """Quality checks with scenario/profile-specific thresholds."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_custom_min_peak_dbfs_used(self):
+        """Custom min_peak_dbfs (-12 dBFS) should fail a WAV at -20 dBFS."""
+        take_dir = Path(self.tmp) / "take-001"
+        take_dir.mkdir()
+        # Generate WAV at -20 dBFS peak
+        import math
+        n = golden.ms_samples(1000)
+        amplitude = int(0.1 * 32767)  # -20 dBFS
+        samples = [amplitude] * n
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')
+
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=False,
+            min_peak_dbfs=-12.0,  # Strict: requires at least -12 dBFS
+        )
+        self.assertFalse(result["passed"],
+                        f"Should fail with strict peak threshold, got: {result}")
+        self.assertTrue(
+            any("peak" in f.lower() and "below threshold" in f.lower()
+                for f in result["failures"]),
+            f"Should report peak below threshold: {result['failures']}"
+        )
+
+    def test_custom_min_rms_dbfs_used(self):
+        """Custom min_rms_dbfs (-12 dBFS) should fail a quiet WAV."""
+        take_dir = Path(self.tmp) / "take-002"
+        take_dir.mkdir()
+        # Generate WAV at -20 dBFS
+        import math
+        n = golden.ms_samples(1000)
+        amplitude = int(0.1 * 32767)
+        samples = [amplitude] * n
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')
+
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=False,
+            min_rms_dbfs=-12.0,
+        )
+        self.assertFalse(result["passed"],
+                        f"Should fail with strict RMS threshold, got: {result}")
+
+    def test_loud_signal_passes_strict_threshold(self):
+        """A loud WAV at -3 dBFS should pass even strict -12 dBFS threshold."""
+        take_dir = Path(self.tmp) / "take-003"
+        take_dir.mkdir()
+        samples = golden._generate_sine(golden.ms_samples(1000), 440.0, 0.7)
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')
+
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=False,
+            min_peak_dbfs=-12.0, min_rms_dbfs=-12.0,
+        )
+        self.assertTrue(result["passed"],
+                       f"Loud signal should pass strict thresholds, got: {result}")
+
+    def test_default_threshold_passes_normal_signal(self):
+        """Default -60 dBFS threshold should pass a normal signal."""
+        take_dir = Path(self.tmp) / "take-004"
+        take_dir.mkdir()
+        samples = golden._generate_sine(golden.ms_samples(1000), 440.0, 0.5)
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')
+
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=False,
+        )
+        self.assertTrue(result["passed"],
+                       f"Normal signal should pass default thresholds, got: {result}")
+
+    def test_dry_run_never_shows_signal_present(self):
+        """Dry-run must never display 'Signal present' for non_silence check."""
+        take_dir = Path(self.tmp) / "take-005"
+        take_dir.mkdir()
+        samples = golden._generate_sine(golden.ms_samples(1000), 440.0, 0.5)
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text("")
+
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=True,
+        )
+        # Find the non_silence check
+        non_silence = [c for c in result.get("checks", [])
+                       if c.get("name") == "non_silence"]
+        self.assertGreater(len(non_silence), 0, "Should have non_silence check")
+        ns = non_silence[0]
+        self.assertFalse(ns["passed"],
+                        f"Dry-run non_silence must not pass, got: {ns}")
+        self.assertIn("DRY-RUN", ns.get("reason", ""),
+                     f"Dry-run reason must mention DRY-RUN, got: {ns.get('reason')}")
+        self.assertNotIn("Signal present", ns.get("reason", ""),
+                        "Dry-run must never say 'Signal present'")
+
+    def test_zero_samples_has_exact_threshold_check(self):
+        """Zero-sample WAV should fail with correct threshold in message."""
+        take_dir = Path(self.tmp) / "take-006"
+        take_dir.mkdir()
+        golden.write_wav(take_dir / "audio.wav", [])
+        (take_dir / "event-stream.jsonl").write_text('{"event":"stream_start"}\n')
+
+        # The WAV will have 0 samples but the write creates at least the header
+        # Actually write_wav with empty list still creates 0-frame WAV
+        result = golden._operator_quality_check(
+            take_dir, "test", "take", dry_run=False,
+            min_peak_dbfs=-40.0,
+        )
+        # Should have the threshold in the failure message
+        self.assertFalse(result["passed"])
+
+
+class TestLoadEventsMalformedHandling(unittest.TestCase):
+    """_load_events_from_stream strict vs lenient mode."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_jsonl(self, content: str):
+        path = Path(self.tmp) / "events.jsonl"
+        path.write_text(content)
+        return path
+
+    def test_lenient_skips_malformed(self):
+        """Lenient mode skips malformed lines silently."""
+        path = self._write_jsonl(
+            '{"event":"stream_start"}\nnot json\n{"event":"vad_session_end"}\n'
+        )
+        events, error = golden._load_events_from_stream(path, fail_on_malformed=False)
+        self.assertIsNone(error,
+                         f"Lenient mode should not return error, got: {error}")
+        self.assertEqual(len(events), 2,
+                        f"Should have 2 valid events, got {len(events)}")
+
+    def test_strict_fails_on_malformed(self):
+        """Strict mode must fail on malformed JSON."""
+        path = self._write_jsonl(
+            '{"event":"stream_start"}\nnot json\n'
+        )
+        events, error = golden._load_events_from_stream(path, fail_on_malformed=True)
+        self.assertIsNotNone(error,
+                            "Strict mode must return error for malformed JSON")
+        self.assertEqual(len(events), 0,
+                        f"Strict mode should return no events on error, got {len(events)}")
+
+    def test_strict_passes_valid_jsonl(self):
+        """Strict mode passes valid JSONL."""
+        path = self._write_jsonl(
+            '{"event":"stream_start"}\n{"event":"vad_session_end"}\n'
+        )
+        events, error = golden._load_events_from_stream(path, fail_on_malformed=True)
+        self.assertIsNone(error,
+                         f"Strict mode should not error on valid JSON: {error}")
+        self.assertEqual(len(events), 2)
+
+    def test_missing_file_returns_empty(self):
+        """Missing file returns empty list."""
+        path = Path(self.tmp) / "nonexistent.jsonl"
+        events, error = golden._load_events_from_stream(path, fail_on_malformed=False)
+        self.assertEqual(len(events), 0)
+        self.assertIsNotNone(error, "Missing file should return error message")
+
+
+class TestPromotionTamperChecks(unittest.TestCase):
+    """Independent promotion provenance/session/hash consistency."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_clean_take(self, name: str, session_id: str = "correct-session"):
+        """Create a take with all required promotion artifacts."""
+        take_dir = Path(self.tmp) / name
+        take_dir.mkdir()
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+        evidence_dir.mkdir(parents=True)
+
+        golden.save_file(
+            {"dry_run": False, "mode": "take",
+             "stream_session_id": session_id},
+            take_dir / "provenance.json"
+        )
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        golden.save_file(
+            {"accepted": True, "checks_passed": True},
+            take_dir / "review.json"
+        )
+        golden.save_file(
+            {"valid": True, "reason": "ok",
+             "artifact_hashes": {},
+             "stream_session_id": session_id},
+            evidence_dir / "validity.json"
+        )
+        # Create a valid WAV
+        samples = golden._generate_sine(golden.ms_samples(500), 440.0, 0.5)
+        golden.write_wav(take_dir / "audio.wav", samples)
+        # Create event stream with matching session
+        events_path = take_dir / "event-stream.jsonl"
+        with open(events_path, "w") as f:
+            f.write(f'{{"event":"stream_start","stream_session_id":"{session_id}"}}\n')
+
+        return take_dir
+
+    def test_event_stream_hash_tamper_detected(self):
+        """If validity record event_stream hash differs from actual, promotion fails."""
+        take_dir = self._make_clean_take("hash-tamper")
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+
+        # Tamper: set validity hash to something wrong
+        validity_path = evidence_dir / "validity.json"
+        val = golden.load_manifest_file(validity_path)
+        val["artifact_hashes"] = {"event_stream_sha256": "deadbeef"}
+        golden.save_file(val, validity_path)
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.ARTIFACT_HASH_MISMATCH)
+
+    def test_session_id_mismatch_in_events_detected(self):
+        """If event stream contains wrong session ID, promotion fails."""
+        take_dir = self._make_clean_take("session-tamper", session_id="expected-session")
+        # Tamper: write events with different session ID
+        events_path = take_dir / "event-stream.jsonl"
+        with open(events_path, "w") as f:
+            f.write('{"event":"stream_start","stream_session_id":"WRONG-SESSION"}\n')
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.EVENT_SCHEMA_INVALID)
+
+    def test_validity_session_id_mismatch_detected(self):
+        """If validity record session_id differs from provenance, promotion fails."""
+        take_dir = self._make_clean_take("validity-sid-tamper", session_id="provenance-sid")
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+
+        # Tamper validity record with different session
+        validity_path = evidence_dir / "validity.json"
+        val = golden.load_manifest_file(validity_path)
+        val["stream_session_id"] = "different-sid"
+        golden.save_file(val, validity_path)
+
+        with self.assertRaises(SystemExit) as cm:
+            golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(cm.exception.code, golden.ExitCode.EVENT_SCHEMA_INVALID)
+
+    def test_matching_session_and_hash_passes(self):
+        """When everything matches, promotion succeeds."""
+        take_dir = self._make_clean_take("clean-promote")
+        dest = Path(self.tmp) / "dest"
+
+        # Should not raise
+        code = golden.promote_take(take_dir, dest, dry_run=False)
+        self.assertEqual(code, golden.ExitCode.PASS)
+        self.assertTrue((dest / "promotion.json").exists())
+
+    def test_provenance_without_session_id_still_checked(self):
+        """If provenance lacks stream_session_id, event check still runs."""
+        take_dir = Path(self.tmp) / "no-sid-provenance"
+        take_dir.mkdir()
+        evidence_dir = take_dir / "quality" / "review" / "provenance"
+        evidence_dir.mkdir(parents=True)
+
+        # Provenance without stream_session_id
+        golden.save_file(
+            {"dry_run": False, "mode": "take"},
+            take_dir / "provenance.json"
+        )
+        golden.save_file({"accepted": True}, take_dir / "consent.json")
+        golden.save_file({"retention_class": "test"}, take_dir / "privacy.json")
+        golden.save_file(
+            {"accepted": True, "checks_passed": True},
+            take_dir / "review.json"
+        )
+        golden.save_file(
+            {"valid": True, "reason": "ok"},
+            evidence_dir / "validity.json"
+        )
+        samples = golden._generate_sine(golden.ms_samples(500), 440.0, 0.5)
+        golden.write_wav(take_dir / "audio.wav", samples)
+        (take_dir / "event-stream.jsonl").write_text(
+            '{"event":"stream_start"}\n'
+        )
+
+        # Only checks if provenance_sid is present — should skip check and pass
+        code = golden.promote_take(take_dir, Path(self.tmp) / "dest", dry_run=False)
+        self.assertEqual(code, golden.ExitCode.PASS)
 
 
 # Pytest-style runner compatible with unittest

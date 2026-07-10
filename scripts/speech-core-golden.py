@@ -1252,14 +1252,15 @@ def _operator_real_capture(
     clean up subprocesses. Returns (exit_code, capture_info).
 
     Fail-closed contract (P1):
-    - Watcher readiness policy: wait for first valid event matching
-      stream_session_id, with bounded timeout (WATCHER_READY_TIMEOUT_SEC).
+    - Watcher readiness: --ready-file side-channel. Watcher atomically
+      creates/writes the ready file only after connect_async + SubscribeEvents.
+      We wait for that file bounded by timeout while monitoring watcher exit.
+    - Stale pre-existing ready file is rejected (caller must provide fresh path).
     - Monitor early child exits, capture/persist stderr and exit codes.
     - After drain, let validity establish terminal completion.
     """
-    WATCHER_LIVENESS_TIMEOUT_SEC = 10.0
-    WATCHER_LIVENESS_POLL_SEC = 0.25
-    WATCHER_MIN_STABLE_SEC = 2.0  # Must stay alive at least this long
+    WATCHER_READY_TIMEOUT_SEC = 15.0
+    WATCHER_READY_POLL_SEC = 0.1
 
     watcher_bin = _find_binary("speech-core-watch")
     mic_bin = _find_binary("speech-core-mic-adapter")
@@ -1278,6 +1279,9 @@ def _operator_real_capture(
     diag_dir = take_dir / "diagnostics"
     diag_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fresh unique ready-file path (caller must provide a unique take_dir)
+    ready_path = diag_dir / "watcher.ready"
+
     capture_info: Dict[str, Any] = {
         "stream_session_id": stream_session_id,
         "watcher_bin": watcher_bin,
@@ -1291,6 +1295,9 @@ def _operator_real_capture(
         "mic_exit_code": None,
         "watcher_stderr_path": str(diag_dir / "watcher.stderr.log"),
         "mic_stderr_path": str(diag_dir / "mic.stderr.log"),
+        "ready_path": str(ready_path),
+        "readiness_at": None,
+        "readiness_method": "ready-file",
     }
 
     watcher_proc = None
@@ -1303,11 +1310,19 @@ def _operator_real_capture(
         # ── Launch watcher first ──────────────────────────────────────
         event_fh = open(event_path, "w")
         watcher_stderr_fh = open(diag_dir / "watcher.stderr.log", "w")
+
+        # Require fresh ready path: remove if somehow pre-existing
+        try:
+            ready_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
         watcher_args = [
             watcher_bin,
             "--mode", "jsonl",
             "--url", ws_url,
             "--stream-session-id", stream_session_id,
+            "--ready-file", str(ready_path),
         ]
         watcher_proc = subprocess.Popen(
             watcher_args,
@@ -1317,42 +1332,45 @@ def _operator_real_capture(
         )
         capture_info["watcher_pid"] = watcher_proc.pid
 
-        # ── Watcher readiness: liveness-based bounded policy ──────────
-        #   The watcher may not produce events until the mic starts, so
-        #   we use a liveness check: watcher must stay alive for at least
-        #   WATCHER_MIN_STABLE_SEC to prove it connected and subscribed.
-        #   If the watcher exits early, we fail immediately.
-        #   Post-capture validity checker establishes terminal completion.
-        stable_start = time.monotonic()
+        # ── Watcher readiness: explicit ready-file side-channel ───────
+        #   Poll for the ready file. Watcher writes it only after
+        #   connect_async + SubscribeEvents send returns Ok.
+        #   While waiting, monitor watcher exit (early exit = fail).
+        #   Stale pre-existing file has been removed above.
+        readiness_start = time.monotonic()
         watcher_ready = False
-        while (time.monotonic() - stable_start) < WATCHER_LIVENESS_TIMEOUT_SEC:
+        while (time.monotonic() - readiness_start) < WATCHER_READY_TIMEOUT_SEC:
             rc = watcher_proc.poll()
             if rc is not None:
-                # Watcher exited — capture stderr before we close files
                 watcher_stderr_fh.close()
                 stderr_content = _read_file_head(diag_dir / "watcher.stderr.log", 2000)
                 event_fh.close()
                 capture_info["watcher_exit_code"] = rc
                 capture_info["watcher_stderr_tail"] = stderr_content
+                capture_info["readiness_status"] = f"watcher-exited-early-rc-{rc}"
                 print(f"  [ERROR] Watcher exited early with code {rc}",
                       file=sys.stderr)
                 if stderr_content:
                     print(f"  Watcher stderr: {stderr_content[:500]}", file=sys.stderr)
                 return ExitCode.DAEMON_UNREACHABLE, capture_info
 
-            elapsed = time.monotonic() - stable_start
-            if elapsed >= WATCHER_MIN_STABLE_SEC:
+            if ready_path.exists():
                 watcher_ready = True
+                capture_info["readiness_at"] = datetime.now(timezone.utc).isoformat()
+                capture_info["readiness_elapsed_ms"] = int(
+                    (time.monotonic() - readiness_start) * 1000
+                )
+                capture_info["readiness_status"] = "ready-file-created"
                 break
 
-            time.sleep(WATCHER_LIVENESS_POLL_SEC)
+            time.sleep(WATCHER_READY_POLL_SEC)
 
         if not watcher_ready:
-            # Timeout — should not happen since we check poll() above
             watcher_stderr_fh.close()
             event_fh.close()
-            print(f"  [ERROR] Watcher readiness timeout: not stable after "
-                  f"{WATCHER_LIVENESS_TIMEOUT_SEC}s", file=sys.stderr)
+            capture_info["readiness_status"] = "timeout"
+            print(f"  [ERROR] Watcher readiness timeout: ready file not created "
+                  f"after {WATCHER_READY_TIMEOUT_SEC}s", file=sys.stderr)
             if watcher_proc.poll() is None:
                 watcher_proc.terminate()
                 watcher_proc.wait(timeout=5)
@@ -1646,12 +1664,25 @@ def _operator_run_validity_and_assertions(
         validity_evidence["reason"] = f"validity check exception: {e}"
         validity_evidence["run"] = True
 
-    # ── 2. Semantic assertions ────────────────────────────────────────
+    # ── 2. Semantic assertions — only run if validity passed ──────────
     try:
         dsl = _load_scenario_assertion_dsl(scenario, manifest_dir)
         if dsl:
-            events = _load_events_from_stream(take_dir / "event-stream.jsonl")
-            if events:
+            # Use strict JSON loading for assertion stage
+            events, load_error = _load_events_from_stream(
+                take_dir / "event-stream.jsonl", fail_on_malformed=True
+            )
+            if load_error:
+                assertion_evidence["reason"] = f"event stream invalid for assertions: {load_error}"
+                assertion_evidence["run"] = True
+            elif not validity_evidence.get("passed", False):
+                # Validity failed — assertions must not run
+                assertion_evidence["reason"] = (
+                    "assertions skipped: capture validity failed — "
+                    f"{validity_evidence.get('reason', 'unknown')}"
+                )
+                assertion_evidence["run"] = False
+            elif events:
                 a_exit, a_result = run_assertions(events, dsl, take_dir)
                 assertion_evidence = {
                     "passed": a_exit == 0 and a_result.all_passed,
@@ -1726,30 +1757,47 @@ def _load_scenario_assertion_dsl(
     return None
 
 
-def _load_events_from_stream(events_path: Path) -> List[Dict[str, Any]]:
-    """Load events from event-stream.jsonl."""
+def _load_events_from_stream(events_path: Path, *,
+                               fail_on_malformed: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Load events from event-stream.jsonl.
+
+    Returns (events, error_message). When fail_on_malformed is True,
+    malformed JSON causes immediate failure (used by assertion stage).
+    When False (default for quality checks), malformed lines are counted
+    but not fatal.
+    """
     if not events_path.exists():
-        return []
+        return [], "event-stream.jsonl missing"
     events = []
     try:
         with open(events_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if line:
                     try:
                         events.append(json.loads(line))
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        if fail_on_malformed:
+                            return [], f"Malformed JSON at line {line_no}: {e}"
+                        # In lenient mode, skip the line but don't fail
                         pass
-    except Exception:
-        pass
-    return events
+    except Exception as e:
+        if fail_on_malformed:
+            return [], f"Error reading event stream: {e}"
+        return [], None
+    return events, None
 
 
 def _operator_quality_check(take_dir: Path, scenario_id: str,
-                             mode: str, dry_run: bool) -> Dict[str, Any]:
+                             mode: str, dry_run: bool,
+                             min_peak_dbfs: float = -60.0,
+                             min_rms_dbfs: float = -60.0) -> Dict[str, Any]:
     """
     Run automated quality checks on captured artifacts.
     Returns a dict with pass/fail and specific check results.
+
+    Thresholds default to -60 dBFS but can be tightened by the caller
+    (e.g. from manifest min_peak_dbfs / min_rms_dbfs).
     """
     result: Dict[str, Any] = {
         "passed": False,
@@ -1797,12 +1845,13 @@ def _operator_quality_check(take_dir: Path, scenario_id: str,
                 "clipping_count": clip,
             }
 
-            # Peak check
-            if p < -96.0:
+            # Peak check — use caller-provided threshold
+            if p < min_peak_dbfs:
                 result["checks"].append({"name": "peak", "passed": False,
-                                          "reason": f"Pure silence (peak={p:.1f} dBFS)",
-                                          "value": round(p, 2)})
-                result["failures"].append(f"Pure silence (peak={p:.1f} dBFS)")
+                                          "reason": f"Peak {p:.1f} dBFS below threshold ({min_peak_dbfs:.0f} dBFS)",
+                                          "value": round(p, 2),
+                                          "threshold": min_peak_dbfs})
+                result["failures"].append(f"Peak {p:.1f} dBFS below threshold ({min_peak_dbfs:.0f} dBFS)")
             else:
                 result["checks"].append({"name": "peak", "passed": True,
                                           "reason": f"Peak {p:.1f} dBFS",
@@ -1818,16 +1867,24 @@ def _operator_quality_check(take_dir: Path, scenario_id: str,
                 result["checks"].append({"name": "clipping", "passed": True,
                                           "reason": "No clipping"})
 
-            # Non-silence check
-            if r < -60.0 and not dry_run:
+            # Non-silence check — use caller-provided threshold
+            if r < min_rms_dbfs and not dry_run:
                 result["checks"].append({"name": "non_silence", "passed": False,
-                                          "reason": f"Too quiet (RMS={r:.1f} dBFS)",
-                                          "value": round(r, 2)})
-                result["failures"].append(f"Too quiet (RMS={r:.1f} dBFS)")
+                                          "reason": f"Too quiet (RMS={r:.1f} dBFS, threshold={min_rms_dbfs:.0f} dBFS)",
+                                          "value": round(r, 2),
+                                          "threshold": min_rms_dbfs})
+                result["failures"].append(f"Too quiet (RMS={r:.1f} dBFS, threshold={min_rms_dbfs:.0f} dBFS)")
             else:
-                result["checks"].append({"name": "non_silence", "passed": True,
-                                          "reason": f"Signal present (RMS={r:.1f} dBFS)",
-                                          "value": round(r, 2)})
+                reason = f"Signal present (RMS={r:.1f} dBFS)"
+                if dry_run:
+                    # Dry-run must never display as passing signal
+                    result["checks"].append({"name": "non_silence", "passed": False,
+                                              "reason": "DRY-RUN: synthetic silence, not real audio",
+                                              "value": round(r, 2)})
+                else:
+                    result["checks"].append({"name": "non_silence", "passed": True,
+                                              "reason": reason,
+                                              "value": round(r, 2)})
 
         except Exception as e:
             result["failures"].append(f"WAV read error: {e}")
@@ -1866,11 +1923,6 @@ def _operator_quality_check(take_dir: Path, scenario_id: str,
     if dry_run:
         result["warnings"].append("DRY-RUN: not valid for promotion")
         result["passed"] = False
-        # Ensure dry-run silence does NOT display as passing
-        for c in result["checks"]:
-            if c.get("name") == "non_silence":
-                c["passed"] = False
-                c["reason"] = "DRY-RUN: synthetic silence, not real audio"
     else:
         result["passed"] = len(result["failures"]) == 0
 
@@ -2049,7 +2101,7 @@ def _operator_review_loop(
 
 def cmd_operator(args: argparse.Namespace) -> int:
     """
-    Main operator command: interactive scenario selection → recording → review.
+    Main operator command: interactive scenario selection -> recording -> review.
 
     Fail-closed additions (P1):
     - No-TTY/EOF produces clear noninteractive error.
@@ -2284,8 +2336,12 @@ def cmd_operator(args: argparse.Namespace) -> int:
         }
         save_file(provenance, take_dir / "provenance.json")
 
-        # Quality checks
-        quality = _operator_quality_check(take_dir, scenario_id, mode, dry_run)
+        # Quality checks — use scenario/manifest-specific thresholds
+        min_peak = scenario.get("min_peak_dbfs", -60.0)
+        min_rms = scenario.get("min_rms_dbfs", -60.0)
+        quality = _operator_quality_check(take_dir, scenario_id, mode, dry_run,
+                                           min_peak_dbfs=min_peak,
+                                           min_rms_dbfs=min_rms)
 
         # ── Fail-closed validity and semantic assertions (P1) ──────────
         validity_evidence: Optional[Dict[str, Any]] = None
@@ -2637,6 +2693,58 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
         die(ExitCode.BASELINE_REQUIRES_REVIEW,
             f"Cannot promote: capture validity check failed: "
             f"{validity_evidence.get('reason', 'unknown')}")
+
+    # ── Gate 6: Event-stream hash consistency ─────────────────────────
+    event_path = take_dir / "event-stream.jsonl"
+    promote_diag: Dict[str, Any] = {}
+    if event_path.exists():
+        event_hash = sha256_file(event_path)
+        promote_diag["event_stream_sha256"] = event_hash
+        # Cross-check against validity record if present
+        if validity_evidence:
+            ah = validity_evidence.get("artifact_hashes", {})
+            if ah.get("event_stream_sha256") and ah["event_stream_sha256"] != event_hash:
+                die(ExitCode.ARTIFACT_HASH_MISMATCH,
+                    f"Event-stream hash mismatch: provenance says {event_hash}, "
+                    f"validity record says {ah['event_stream_sha256']}")
+
+    # ── Gate 7: stream_session_id consistency ─────────────────────────
+    provenance_sid = provenance.get("stream_session_id")
+    if provenance_sid:
+        # Check against validity evidence if present
+        if validity_evidence:
+            vsid = validity_evidence.get("stream_session_id")
+            if vsid and vsid != provenance_sid:
+                die(ExitCode.EVENT_SCHEMA_INVALID,
+                    f"stream_session_id mismatch: provenance={provenance_sid}, "
+                    f"validity={vsid}")
+        # Check against events in the event stream
+        if event_path.exists():
+            # Sample first few events to verify session id consistency
+            session_mismatch = False
+            try:
+                with open(event_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line_no, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            evt = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        evt_sid = evt.get("stream_session_id")
+                        if evt_sid and evt_sid != provenance_sid:
+                            session_mismatch = True
+                            promote_diag["session_mismatch_line"] = line_no
+                            break
+                        if line_no > 50:  # Check first 50 events
+                            break
+            except Exception:
+                pass
+            if session_mismatch:
+                die(ExitCode.EVENT_SCHEMA_INVALID,
+                    f"stream_session_id in events does not match provenance: "
+                    f"expected {provenance_sid}")
 
     # ── Gate 5: Semantic assertion evidence ────────────────────────────
     assert_path = evidence_dir / "assert-report.json"

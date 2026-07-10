@@ -90,6 +90,13 @@ struct Args {
     /// Command used by inject mode to type committed transcript deltas into the focused Wayland client.
     #[arg(long, default_value = "wtype", env = "SPEECH_CORE_INJECT_COMMAND")]
     inject_command: String,
+
+    /// Path to a ready-signal file. After connect_async succeeds and the
+    /// SubscribeEvents message is sent, the file is atomically created/written.
+    /// No ready signal is emitted before that point. Stale file at this path is
+    /// removed at startup (caller should provide a fresh unique path).
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1468,6 +1475,11 @@ async fn main() -> Result<()> {
         return process_event_lines(&args, reader, true);
     }
 
+    // ── Ready file: remove stale from previous run ────────────────────
+    if let Some(ref ready_path) = args.ready_file {
+        let _ = std::fs::remove_file(ready_path);
+    }
+
     let (mut ws, _) = connect_async(&args.url)
         .await
         .with_context(|| format!("connecting to {}", args.url))?;
@@ -1479,6 +1491,12 @@ async fn main() -> Result<()> {
     };
     ws.send(Message::Text(serde_json::to_string(&subscribe)?))
         .await?;
+
+    // ── Atomically signal readiness: create/write only after connect + subscribe ──
+    if let Some(ref ready_path) = args.ready_file {
+        std::fs::write(ready_path, "ready\n")
+            .with_context(|| format!("writing ready file {}", ready_path.display()))?;
+    }
 
     let mut transcript_state = TranscriptState::default();
     let mut tui_model = TuiModel::new(args.speech_out_ui);
@@ -2448,6 +2466,71 @@ mod tests {
         );
         assert!(model.live_fallback_bar.is_empty());
         assert!(model.live_hold_bar.is_empty());
+    }
+
+    // ── ready-file argument parsing and lifecycle ────────────────────
+
+    #[test]
+    fn ready_file_arg_accepted_by_clap() {
+        let args = Args::try_parse_from([
+            "watch",
+            "--mode",
+            "jsonl",
+            "--ready-file",
+            "/tmp/test-ready",
+        ]);
+        assert!(args.is_ok(), "--ready-file should be accepted");
+        let args = args.unwrap();
+        assert_eq!(args.ready_file, Some(PathBuf::from("/tmp/test-ready")));
+    }
+
+    #[test]
+    fn ready_file_not_provided_by_default() {
+        let args = Args::try_parse_from(["watch", "--mode", "jsonl"]);
+        assert!(args.is_ok());
+        assert_eq!(args.unwrap().ready_file, None);
+    }
+
+    #[test]
+    fn ready_file_write_is_after_subscribe_in_websocket_path() {
+        // Verify code order: the ready file write appears after
+        // ws.send(SubscribeEvents) in the main() function.
+        // Use anchor comments to avoid matching test code.
+        let source = include_str!("main.rs");
+        let send_marker = "ws.send(Message::Text(serde_json::to_string(&subscribe)?))";
+        let write_marker = "// ── Atomically signal readiness";
+        let send_pos = source
+            .find(send_marker)
+            .expect("subscribe send must exist in source");
+        let write_pos = source
+            .find(write_marker)
+            .expect("ready write comment must exist in source");
+        assert!(
+            write_pos > send_pos,
+            "ready file write must occur AFTER subscribe send in source order. \
+             write at {write_pos}, send at {send_pos}"
+        );
+    }
+
+    #[test]
+    fn ready_file_removed_before_connect_in_websocket_path() {
+        // Verify code order: stale removal (remove_file) appears before connect_async.
+        // We use anchor comments from the actual main() function to avoid matching
+        // test code (include_str! includes the whole file).
+        let source = include_str!("main.rs");
+        let remove_marker = "// ── Ready file: remove stale from previous run";
+        let connect_marker = "connect_async(&args.url)";
+        let remove_pos = source
+            .find(remove_marker)
+            .expect("stale removal comment must exist in source");
+        let connect_pos = source
+            .find(connect_marker)
+            .expect("connect_async must exist in source");
+        assert!(
+            remove_pos < connect_pos,
+            "stale ready file removal must occur BEFORE connect_async. \
+             remove at {remove_pos}, connect at {connect_pos}"
+        );
     }
 
     #[test]
