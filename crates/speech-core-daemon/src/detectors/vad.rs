@@ -273,6 +273,13 @@ impl AudioDetector for SileroVadDetector {
             session.last_segment_start_sample = None;
             session.last_segment_end_sample = None;
             session.last_segment_end_confidence = None;
+            if reset_requires_low_release(reason) {
+                // Forced closes happen while VAD may still be in speech/noise. Clear the
+                // old segment and require an actual low-probability release before onset
+                // can arm again, otherwise continuous above-threshold noise immediately
+                // resurrects the just-closed segment.
+                session.reset_after_forced_close();
+            }
         }
         Ok(())
     }
@@ -300,6 +307,7 @@ struct VadSession {
     last_segment_end_confidence: Option<f32>,
     acoustic_fallback_emitted: bool,
     low_silence_start_sample: Option<u64>,
+    forced_close_rearm_required: bool,
     frames_processed: u64,
     segment_index: u32,
 }
@@ -328,9 +336,32 @@ impl VadSession {
             last_segment_end_confidence: None,
             acoustic_fallback_emitted: true,
             low_silence_start_sample: None,
+            forced_close_rearm_required: false,
             frames_processed: 0,
             segment_index: 0,
         }
+    }
+
+    fn reset_after_forced_close(&mut self) {
+        self.in_speech = false;
+        self.onset_counter = 0;
+        self.silence_counter = 0;
+        self.silence_start_sample = None;
+        self.candidate_start_sample = None;
+        self.current_segment_start_sample = None;
+        self.last_voice_sample_end = None;
+        self.low_silence_start_sample = None;
+        self.forced_close_rearm_required = true;
+    }
+
+    fn release_forced_close_rearm(&mut self) {
+        self.forced_close_rearm_required = false;
+        self.onset_counter = 0;
+        self.candidate_start_sample = None;
+    }
+
+    fn onset_can_arm(&self) -> bool {
+        !self.forced_close_rearm_required
     }
 
     fn push_samples(&mut self, frame: &AudioFrame, samples: &[f32]) {
@@ -355,8 +386,7 @@ impl VadSession {
         } else {
             f32::NAN
         };
-        let energy_gated = self.config.energy_enabled
-            && energy_rms < self.config.energy_threshold;
+        let energy_gated = self.config.energy_enabled && energy_rms < self.config.energy_threshold;
         let probability = if energy_gated {
             0.0_f32
         } else {
@@ -381,6 +411,11 @@ impl VadSession {
         let previous_smoothed_in_speech = self.last_smoothed_in_speech;
         let frame_end_sample = frame_start_sample.saturating_add(FRAME_SAMPLES as u64);
         let mut signals = Vec::new();
+        let rearm_released =
+            self.forced_close_rearm_required && smoothed_probability < stop_threshold;
+        if rearm_released {
+            self.release_forced_close_rearm();
+        }
 
         if self.in_speech {
             if smoothed_probability >= stop_threshold {
@@ -446,7 +481,8 @@ impl VadSession {
                     self.silence_start_sample = None;
                 }
             }
-        } else if raw_is_speech || smoothed_probability >= start_threshold {
+        } else if self.onset_can_arm() && (raw_is_speech || smoothed_probability >= start_threshold)
+        {
             if self.onset_counter == 0 {
                 let pre_roll = (self.config.pre_speech_frames * FRAME_SAMPLES) as u64;
                 self.candidate_start_sample = Some(frame_start_sample.saturating_sub(pre_roll));
@@ -877,9 +913,82 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+fn reset_requires_low_release(reason: &str) -> bool {
+    matches!(
+        reason,
+        "smart_turn_complete_direct"
+            | "human_hold_speech_like_audio_without_tokens"
+            | "vad_acoustic_fallback_low_probability_silence"
+            | "transcript_backed_turn_low_vad_silence"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use speech_core_protocol::{ClockDomain, SourceKind, TimestampProvenance, TimestampQuality};
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+    use tokio::sync::broadcast;
+
+    const SESSION_ID: &str = "test.session";
+
+    fn test_hello() -> HelloState {
+        HelloState {
+            adapter_id: "test.adapter".to_owned(),
+            stream_id: "test.stream".to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            source_kind: SourceKind::Synthetic,
+            sample_rate_hz: SAMPLE_RATE,
+            channels: 1,
+            format: PcmFormat::PcmF32Le,
+            timestamp_provenance: TimestampProvenance::uncalibrated(
+                "test-clock",
+                ClockDomain::HostMonotonic,
+                TimestampQuality::SyntheticScheduled,
+            ),
+        }
+    }
+
+    fn test_action(reason: &'static str, decision_sample: u64) -> DetectorAction {
+        DetectorAction::ResetEouState {
+            stream_id: "test.stream".to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: "test.adapter".to_owned(),
+            mode: super::super::EouResetMode::Decoder,
+            anchor_sample: decision_sample,
+            source: "test",
+            reason,
+            decision_sample,
+        }
+    }
+
+    fn test_session() -> VadSession {
+        VadSession::new(
+            test_hello(),
+            vad_rs::Vad::new(
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/silero_vad_v4.onnx"),
+                SAMPLE_RATE as usize,
+            )
+            .expect("test VAD model should load"),
+            SileroVadConfig::default(),
+        )
+    }
+
+    fn writer_fixture() -> (
+        crate::JsonlLogger,
+        Runtime,
+        tempfile::TempDir,
+        broadcast::Receiver<String>,
+    ) {
+        let runtime = Runtime::new().expect("test runtime should start");
+        let dir = tempdir().expect("temp log dir should be created");
+        let (event_tx, events) = broadcast::channel(256);
+        let logger = runtime
+            .block_on(crate::JsonlLogger::open(dir.path().to_path_buf(), event_tx))
+            .expect("test logger should open");
+        (logger, runtime, dir, events)
+    }
 
     #[test]
     fn frame_size_is_native_silero_window_at_16khz() {
@@ -908,5 +1017,96 @@ mod tests {
             u32::MAX,
             "the separate acoustic fallback timer is disabled by default so speech_end hangover is the close-gap source of truth"
         );
+    }
+    #[test]
+    fn forced_close_reset_clears_vad_state_and_requires_release() {
+        let mut session = test_session();
+        session.in_speech = true;
+        session.onset_counter = 2;
+        session.silence_counter = 1;
+        session.silence_start_sample = Some(10);
+        session.candidate_start_sample = Some(20);
+        session.current_segment_start_sample = Some(30);
+        session.last_voice_sample_end = Some(40);
+        session.low_silence_start_sample = Some(50);
+
+        session.reset_after_forced_close();
+
+        assert!(!session.in_speech);
+        assert_eq!(session.onset_counter, 0);
+        assert_eq!(session.silence_counter, 0);
+        assert_eq!(session.silence_start_sample, None);
+        assert_eq!(session.candidate_start_sample, None);
+        assert_eq!(session.current_segment_start_sample, None);
+        assert_eq!(session.last_voice_sample_end, None);
+        assert_eq!(session.low_silence_start_sample, None);
+        assert!(!session.onset_can_arm());
+    }
+
+    #[test]
+    fn forced_close_continuous_noise_does_not_rearm_without_low_release() {
+        let mut session = test_session();
+        session.reset_after_forced_close();
+
+        assert!(!session.onset_can_arm());
+        assert!(session.forced_close_rearm_required);
+        // Above-threshold frames are intentionally ignored while rearm is required.
+        assert!(!session.onset_can_arm());
+    }
+
+    #[test]
+    fn normal_new_speech_can_start_after_release() {
+        let mut session = test_session();
+        session.reset_after_forced_close();
+        session.release_forced_close_rearm();
+
+        assert!(session.onset_can_arm());
+        assert!(!session.forced_close_rearm_required);
+    }
+
+    #[test]
+    fn normal_accepted_boundary_reset_does_not_require_release() {
+        let mut detector = SileroVadDetector {
+            config: SileroVadConfig::default(),
+            sessions: HashMap::from([(SESSION_ID.to_owned(), test_session())]),
+        };
+        let (logger, runtime, _dir, _events) = writer_fixture();
+        let mut writer = DetectorWriter::new(&logger, runtime.handle());
+
+        detector
+            .handle_action(&test_action("vad_speech_end", 16_000), &mut writer)
+            .expect("normal reset should succeed");
+
+        let session = detector.sessions.get(SESSION_ID).expect("session remains");
+        assert!(session.onset_can_arm());
+        assert!(!session.forced_close_rearm_required);
+    }
+
+    #[test]
+    fn forced_close_action_requires_low_release() {
+        let mut detector = SileroVadDetector {
+            config: SileroVadConfig::default(),
+            sessions: HashMap::from([(SESSION_ID.to_owned(), test_session())]),
+        };
+        {
+            let session = detector.sessions.get_mut(SESSION_ID).unwrap();
+            session.in_speech = true;
+            session.current_segment_start_sample = Some(0);
+            session.last_voice_sample_end = Some(16_000);
+        }
+        let (logger, runtime, _dir, _events) = writer_fixture();
+        let mut writer = DetectorWriter::new(&logger, runtime.handle());
+
+        detector
+            .handle_action(
+                &test_action("human_hold_speech_like_audio_without_tokens", 16_000),
+                &mut writer,
+            )
+            .expect("forced close reset should succeed");
+
+        let session = detector.sessions.get(SESSION_ID).expect("session remains");
+        assert!(!session.in_speech);
+        assert_eq!(session.current_segment_start_sample, None);
+        assert!(!session.onset_can_arm());
     }
 }

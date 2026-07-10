@@ -570,9 +570,9 @@ impl ModelWorker {
             true,
             Some(reason),
         )?;
-        if let Some(ref progress) = self.model_progress {
-            progress.remove(stream_session_id);
-        }
+        // Keep the progress entry alive after finalize. TurnManager close paths may
+        // still consult last_token_end_sample while draining/closing the same input
+        // state; dropping it here makes close-time transcript alignment less stable.
         drop(session);
         Ok(())
     }
@@ -1203,5 +1203,19 @@ mod tests {
         payload.extend_from_slice(&(-0.5_f32).to_le_bytes());
         let decoded = decode_frame_to_f32(&test_frame(PcmFormat::PcmF32Le, payload, 2)).unwrap();
         assert_eq!(decoded, vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn progress_map_keeps_token_state_until_explicit_remove() {
+        let progress = ModelProgressMap::new();
+        progress.update("session", 1_600);
+        progress.record_token("session", 1_200);
+
+        assert_eq!(progress.get("session"), Some(1_600));
+        assert_eq!(progress.last_token_end_sample("session"), Some(1_200));
+
+        progress.remove("session");
+        assert_eq!(progress.get("session"), None);
+        assert_eq!(progress.last_token_end_sample("session"), None);
     }
 }

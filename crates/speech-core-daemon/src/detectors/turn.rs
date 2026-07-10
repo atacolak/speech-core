@@ -243,30 +243,9 @@ impl TurnManager {
                                 && decision.available
                                 && decision.complete =>
                         {
-                            // Don't close on smart-turn-complete if no transcript tokens
-                            // exist. Smart turn can produce high confidence on
-                            // non-speech audio (noise, breaths, hums).
-                            let has_any_tokens = model_progress
-                                .as_ref()
-                                .and_then(|mp| mp.last_token_end_sample(&stream_session_id))
-                                .is_some();
-                            if !has_any_tokens {
-                                writer.write(&TurnEouSuppressedEvent {
-                                    event: "turn_eou_suppressed",
-                                    stream_id: stream_id.clone(),
-                                    stream_session_id: stream_session_id.clone(),
-                                    adapter_id: adapter_id.clone(),
-                                    source: "semantic",
-                                    detector: decision.detector,
-                                    reason: "semantic_complete_no_tokens",
-                                    end_sample,
-                                    decision_sample,
-                                    observed_speech_samples,
-                                    min_required_samples: min_vad_speech_samples,
-                                    daemon_mono_ns: now_mono_ns(),
-                                })?;
-                                return Ok(Vec::new());
-                            }
+                            // Smart Turn completion is an endpoint decision. Do not gate it on
+                            // committed transcript tokens: ASR tokens can legitimately lag the
+                            // endpoint decision, especially with Nemotron right-context.
                             close_source = "smart_turn";
                             close_detector = decision.detector;
                             close_confidence = decision.probability;
@@ -308,9 +287,9 @@ impl TurnManager {
                                     session.last_human_hold_token_anchor = Some(token_anchor);
                                     writer.write(&TurnHumanHoldEvent {
                                         event: "turn_human_hold",
-                                        stream_id,
-                                        stream_session_id,
-                                        adapter_id,
+                                        stream_id: stream_id.clone(),
+                                        stream_session_id: stream_session_id.clone(),
+                                        adapter_id: adapter_id.clone(),
                                         turn_id: turn_id.clone(),
                                         detector: decision.detector,
                                         reason: "speech_like_audio_without_tokens",
@@ -324,9 +303,17 @@ impl TurnManager {
                                         threshold: None,
                                         daemon_mono_ns: now_mono_ns(),
                                     })?;
+                                    close_source = "human_hold";
+                                    close_detector = decision.detector;
+                                    close_confidence = decision.probability;
+                                    close_degraded = true;
+                                    close_reason = "human_hold_speech_like_audio_without_tokens";
+                                } else {
+                                    return Ok(Vec::new());
                                 }
+                            } else {
+                                return Ok(Vec::new());
                             }
-                            return Ok(Vec::new());
                         }
                         Some(decision)
                             if decision.end_sample == end_sample
@@ -350,53 +337,21 @@ impl TurnManager {
                     // VAD hangover can produce speech_end while Nemotron still has <160ms of
                     // buffered trailing audio; draining that buffer first lets final tokens commit
                     // before turn_closed rather than reopening as a transcript-backed turn later.
-                    let mut effective_end_sample = end_sample;
-                    let mut effective_decision_sample = decision_sample;
-                    let alignment_deadline = model_alignment_deadline(model_alignment_timeout_ms);
-                    if let Some(ref model_drain) = model_drain {
-                        if let Ok(result) = model_drain.drain_session(ModelDrainRequest {
-                            stream_id: stream_id.clone(),
-                            stream_session_id: stream_session_id.clone(),
-                            adapter_id: adapter_id.clone(),
-                            target_sample: decision_sample,
-                            reason: close_reason,
-                            timeout_ms: remaining_timeout_ms(alignment_deadline),
-                        }) {
-                            let _drain_observed = (
-                                result.session_found,
-                                result.chunk_processed,
-                                result.drained_until_sample,
-                            );
-                        }
-                    }
-                    if let Some(ref model_progress) = model_progress {
-                        wait_for_model_progress_until(
-                            model_progress,
-                            &stream_session_id,
-                            decision_sample,
-                            alignment_deadline,
-                        );
-                        // After the model has consumed all input audio, wait briefly for
-                        // pending transcript tokens to arrive. Nemotron emits tokens
-                        // asynchronously — they can lag 50-200ms behind input consumption.
-                        loop {
-                            let token_caught_up = model_progress
-                                .last_token_end_sample(&stream_session_id)
-                                .map(|token_end| token_end >= effective_decision_sample)
-                                .unwrap_or(true);
-                            if token_caught_up || Instant::now() >= alignment_deadline {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        apply_trailing_token_extension(
-                            model_progress,
-                            &stream_session_id,
-                            decision_sample,
-                            &mut effective_end_sample,
-                            &mut effective_decision_sample,
-                        );
-                    }
+                    let alignment = align_model_for_close(
+                        model_progress.as_ref(),
+                        model_drain.as_ref(),
+                        &stream_id,
+                        &stream_session_id,
+                        &adapter_id,
+                        end_sample,
+                        decision_sample,
+                        close_source,
+                        close_reason,
+                        model_alignment_timeout_ms,
+                    );
+                    writer.write(&alignment.event(&stream_id, &stream_session_id, &adapter_id))?;
+                    let effective_end_sample = alignment.effective_end_sample;
+                    let effective_decision_sample = alignment.effective_decision_sample;
                     session.close_turn(
                         turn_id,
                         close_source,
@@ -527,7 +482,9 @@ impl TurnManager {
                     session.start_turn(start_sample, "transcript", writer)?;
                 }
                 session.in_speech = true;
-                session.last_human_hold_token_anchor = Some(end_sample);
+                // A new token resets the hold timer naturally: ModelProgressMap now
+                // reports this end_sample. Keep last_human_hold_token_anchor solely
+                // as a duplicate-fire guard for a hold that already emitted.
                 let _ = token_index;
                 Ok(Vec::new())
             }
@@ -751,8 +708,7 @@ impl TurnManager {
                 // Only record the decision if we're not going to close.
                 let record_only = !complete || !self.config.semantic_gate_close_enabled;
                 {
-                    let session =
-                        self.session_mut(&stream_id, &stream_session_id, &adapter_id);
+                    let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                     session.last_semantic_decision = Some(SemanticDecisionState {
                         detector,
                         end_sample,
@@ -953,7 +909,6 @@ impl TurnManager {
         confidence: Option<f32>,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<Vec<DetectorAction>> {
-        let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
         let model_progress = self.config.model_progress.clone();
         let model_drain = self.config.model_drain.clone();
         let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
@@ -966,68 +921,24 @@ impl TurnManager {
             .as_ref()
             .map(|turn| turn.turn_id.clone())
             .unwrap_or_else(|| session.next_turn_id());
-        // Gate: don't close on non-speech audio (noise, breaths, hums).
-        let has_any_tokens = model_progress
-            .as_ref()
-            .and_then(|mp| mp.last_token_end_sample(stream_session_id))
-            .is_some();
-        if !has_any_tokens {
-            writer.write(&TurnEouSuppressedEvent {
-                event: "turn_eou_suppressed",
-                stream_id: stream_id.to_owned(),
-                stream_session_id: stream_session_id.to_owned(),
-                adapter_id: adapter_id.to_owned(),
-                source: "semantic",
-                detector,
-                reason: "semantic_complete_no_tokens",
-                end_sample,
-                decision_sample,
-                observed_speech_samples: end_sample,
-                min_required_samples: min_vad_speech_samples,
-                daemon_mono_ns: now_mono_ns(),
-            })?;
-            return Ok(Vec::new());
-        }
-        let mut effective_end_sample = end_sample;
-        let mut effective_decision_sample = decision_sample;
-        let alignment_deadline = model_alignment_deadline(model_alignment_timeout_ms);
-        // Drain model worker partial chunk.
-        if let Some(ref model_drain) = model_drain {
-            let _ = model_drain.drain_session(ModelDrainRequest {
-                stream_id: stream_id.to_owned(),
-                stream_session_id: stream_session_id.to_owned(),
-                adapter_id: adapter_id.to_owned(),
-                target_sample: decision_sample,
-                reason: "smart_turn_complete",
-                timeout_ms: remaining_timeout_ms(alignment_deadline),
-            });
-        }
-        if let Some(ref model_progress) = model_progress {
-            wait_for_model_progress_until(
-                model_progress,
-                stream_session_id,
-                decision_sample,
-                alignment_deadline,
-            );
-            // Wait for pending Nemotron tokens to arrive.
-            loop {
-                let token_caught_up = model_progress
-                    .last_token_end_sample(stream_session_id)
-                    .map(|token_end| token_end >= effective_decision_sample)
-                    .unwrap_or(true);
-                if token_caught_up || Instant::now() >= alignment_deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            apply_trailing_token_extension(
-                model_progress,
-                stream_session_id,
-                decision_sample,
-                &mut effective_end_sample,
-                &mut effective_decision_sample,
-            );
-        }
+        // Smart Turn completion is an endpoint decision. Do not require a token
+        // whose timestamp reaches decision_sample: that sample includes VAD hangover
+        // silence and may be impossible for transcript tokens to reach.
+        let alignment = align_model_for_close(
+            model_progress.as_ref(),
+            model_drain.as_ref(),
+            stream_id,
+            stream_session_id,
+            adapter_id,
+            end_sample,
+            decision_sample,
+            "smart_turn",
+            "smart_turn_complete_direct",
+            model_alignment_timeout_ms,
+        );
+        writer.write(&alignment.event(stream_id, stream_session_id, adapter_id))?;
+        let effective_end_sample = alignment.effective_end_sample;
+        let effective_decision_sample = alignment.effective_decision_sample;
         session.close_turn(
             turn_id,
             "smart_turn",
@@ -1240,6 +1151,57 @@ struct SemanticDecisionState {
     probability: Option<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct CloseModelAlignment {
+    effective_end_sample: u64,
+    effective_decision_sample: u64,
+    audio_target_sample: u64,
+    audio_committed_sample: Option<u64>,
+    last_token_end_sample: Option<u64>,
+    audio_caught_up: bool,
+    token_quiescent: bool,
+    token_quiescence_elapsed_ms: u64,
+    drain_attempted: bool,
+    drain_succeeded: bool,
+    drain_session_found: Option<bool>,
+    drain_chunk_processed: Option<bool>,
+    drain_until_sample: Option<u64>,
+    elapsed_ms: u64,
+    budget_ms: u32,
+}
+
+impl CloseModelAlignment {
+    fn event(
+        &self,
+        stream_id: &str,
+        stream_session_id: &str,
+        adapter_id: &str,
+    ) -> TurnCloseAlignmentEvent {
+        TurnCloseAlignmentEvent {
+            event: "turn_close_alignment",
+            stream_id: stream_id.to_owned(),
+            stream_session_id: stream_session_id.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            audio_target_sample: self.audio_target_sample,
+            audio_committed_sample: self.audio_committed_sample,
+            last_token_end_sample: self.last_token_end_sample,
+            effective_end_sample: self.effective_end_sample,
+            effective_decision_sample: self.effective_decision_sample,
+            audio_caught_up: self.audio_caught_up,
+            token_quiescent: self.token_quiescent,
+            token_quiescence_elapsed_ms: self.token_quiescence_elapsed_ms,
+            drain_attempted: self.drain_attempted,
+            drain_succeeded: self.drain_succeeded,
+            drain_session_found: self.drain_session_found,
+            drain_chunk_processed: self.drain_chunk_processed,
+            drain_until_sample: self.drain_until_sample,
+            elapsed_ms: self.elapsed_ms,
+            budget_ms: self.budget_ms,
+            daemon_mono_ns: now_mono_ns(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TurnSessionStartEvent {
     event: &'static str,
@@ -1342,6 +1304,30 @@ struct TurnSemanticDecisionEvent {
 }
 
 #[derive(Debug, Serialize)]
+struct TurnCloseAlignmentEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    audio_target_sample: u64,
+    audio_committed_sample: Option<u64>,
+    last_token_end_sample: Option<u64>,
+    effective_end_sample: u64,
+    effective_decision_sample: u64,
+    audio_caught_up: bool,
+    token_quiescent: bool,
+    token_quiescence_elapsed_ms: u64,
+    drain_attempted: bool,
+    drain_succeeded: bool,
+    drain_session_found: Option<bool>,
+    drain_chunk_processed: Option<bool>,
+    drain_until_sample: Option<u64>,
+    elapsed_ms: u64,
+    budget_ms: u32,
+    daemon_mono_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct TurnHumanHoldEvent {
     event: &'static str,
     stream_id: String,
@@ -1434,6 +1420,8 @@ fn ms_to_samples(ms: u32) -> u64 {
     u64::from(ms).saturating_mul(16_000) / 1_000
 }
 
+const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 25;
+
 fn model_alignment_deadline(timeout_ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(timeout_ms as u64)
 }
@@ -1452,12 +1440,9 @@ fn wait_for_model_progress(
     target_sample: u64,
     timeout_ms: u32,
 ) {
-    wait_for_model_progress_until(
-        model_progress,
-        stream_session_id,
-        target_sample,
-        model_alignment_deadline(timeout_ms),
-    );
+    let deadline = model_alignment_deadline(timeout_ms);
+    let _ =
+        wait_for_model_progress_until(model_progress, stream_session_id, target_sample, deadline);
 }
 
 fn wait_for_model_progress_until(
@@ -1465,13 +1450,155 @@ fn wait_for_model_progress_until(
     stream_session_id: &str,
     target_sample: u64,
     deadline: Instant,
-) {
+) -> bool {
     loop {
         let committed = model_progress.get(stream_session_id).unwrap_or(0);
-        if committed >= target_sample || Instant::now() >= deadline {
-            break;
+        if committed >= target_sample {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct TokenQuiescence {
+    last_token_end_sample: Option<u64>,
+    quiescent: bool,
+    elapsed_ms: u64,
+}
+
+fn wait_for_token_quiescence_until(
+    model_progress: &ModelProgressMap,
+    stream_session_id: &str,
+    deadline: Instant,
+    stable_for: Duration,
+) -> TokenQuiescence {
+    let started = Instant::now();
+    let mut last_seen = model_progress.last_token_end_sample(stream_session_id);
+    let mut stable_since = started;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return TokenQuiescence {
+                last_token_end_sample: last_seen,
+                quiescent: false,
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            };
+        }
+        let current = model_progress.last_token_end_sample(stream_session_id);
+        if current != last_seen {
+            last_seen = current;
+            stable_since = now;
+        }
+        if now.duration_since(stable_since) >= stable_for {
+            return TokenQuiescence {
+                last_token_end_sample: last_seen,
+                quiescent: true,
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            };
+        }
+        let remaining_deadline = deadline.saturating_duration_since(now);
+        let remaining_stable = stable_for.saturating_sub(now.duration_since(stable_since));
+        std::thread::sleep(
+            remaining_deadline
+                .min(remaining_stable)
+                .min(Duration::from_millis(5)),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_model_for_close(
+    model_progress: Option<&ModelProgressMap>,
+    model_drain: Option<&ModelDrainHandle>,
+    stream_id: &str,
+    stream_session_id: &str,
+    adapter_id: &str,
+    end_sample: u64,
+    decision_sample: u64,
+    close_source: &'static str,
+    close_reason: &'static str,
+    timeout_ms: u32,
+) -> CloseModelAlignment {
+    let started = Instant::now();
+    let deadline = model_alignment_deadline(timeout_ms);
+    let audio_target_sample = decision_sample;
+    let mut drain_attempted = false;
+    let mut drain_succeeded = false;
+    let mut drain_session_found = None;
+    let mut drain_chunk_processed = None;
+    let mut drain_until_sample = None;
+
+    if let Some(model_drain) = model_drain {
+        drain_attempted = true;
+        if let Ok(result) = model_drain.drain_session(ModelDrainRequest {
+            stream_id: stream_id.to_owned(),
+            stream_session_id: stream_session_id.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            target_sample: audio_target_sample,
+            reason: close_reason,
+            timeout_ms: remaining_timeout_ms(deadline),
+        }) {
+            drain_succeeded = true;
+            drain_session_found = Some(result.session_found);
+            drain_chunk_processed = Some(result.chunk_processed);
+            drain_until_sample = Some(result.drained_until_sample);
+        }
+    }
+
+    let mut audio_caught_up = true;
+    let mut token_quiescent = true;
+    let mut token_quiescence_elapsed_ms = 0;
+    let mut audio_committed_sample = None;
+    let mut last_token_end_sample = None;
+    let mut effective_end_sample = end_sample;
+    let mut effective_decision_sample = decision_sample;
+
+    if let Some(model_progress) = model_progress {
+        audio_caught_up = wait_for_model_progress_until(
+            model_progress,
+            stream_session_id,
+            audio_target_sample,
+            deadline,
+        );
+        audio_committed_sample = model_progress.get(stream_session_id);
+        let token_quiescence = wait_for_token_quiescence_until(
+            model_progress,
+            stream_session_id,
+            deadline,
+            Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS),
+        );
+        last_token_end_sample = token_quiescence.last_token_end_sample;
+        token_quiescent = token_quiescence.quiescent;
+        token_quiescence_elapsed_ms = token_quiescence.elapsed_ms;
+        apply_trailing_token_extension(
+            model_progress,
+            stream_session_id,
+            decision_sample,
+            &mut effective_end_sample,
+            &mut effective_decision_sample,
+        );
+    }
+
+    let _ = close_source;
+    CloseModelAlignment {
+        effective_end_sample,
+        effective_decision_sample,
+        audio_target_sample,
+        audio_committed_sample,
+        last_token_end_sample,
+        audio_caught_up,
+        token_quiescent,
+        token_quiescence_elapsed_ms,
+        drain_attempted,
+        drain_succeeded,
+        drain_session_found,
+        drain_chunk_processed,
+        drain_until_sample,
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        budget_ms: timeout_ms,
     }
 }
 
@@ -1736,6 +1863,13 @@ mod tests {
         );
     }
 
+    fn event_count(events: &[Value], event_name: &str) -> usize {
+        events
+            .iter()
+            .filter(|event| event.get("event").and_then(Value::as_str) == Some(event_name))
+            .count()
+    }
+
     fn assert_turn_closed(
         events: &[Value],
         expected_source: &'static str,
@@ -1834,7 +1968,7 @@ mod tests {
     #[test]
     fn smart_turn_complete_closes_non_degraded_turn() {
         let progress = ModelProgressMap::new();
-        progress.record_token(SESSION_ID, 3_200);
+        progress.update(SESSION_ID, 17_920);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
@@ -1849,18 +1983,8 @@ mod tests {
         let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
         let events = harness.drain_events();
 
-        assert_reset_action(
-            &actions,
-            "smart_turn",
-            "smart_turn_complete_direct",
-            17_920,
-        );
-        assert_turn_closed(
-            &events,
-            "smart_turn",
-            false,
-            "smart_turn_complete_direct",
-        );
+        assert_reset_action(&actions, "smart_turn", "smart_turn_complete_direct", 17_920);
+        assert_turn_closed(&events, "smart_turn", false, "smart_turn_complete_direct");
     }
 
     #[test]
@@ -1889,41 +2013,42 @@ mod tests {
     }
 
     #[test]
-    fn vad_close_with_model_alignment_timeout_returns_without_hanging() {
-        // Today VAD close waits synchronously for ASR model progress to reach the VAD decision
-        // sample. This characterization keeps the current blocking wait bounded. A future
-        // deferred-close implementation should replace this with an immediate non-blocking action.
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let progress = ModelProgressMap::new();
-            progress.update(SESSION_ID, 17_919);
-            let mut harness = TurnHarness::new(TurnManagerConfig {
-                vad_close_enabled: true,
-                model_progress: Some(progress),
-                model_alignment_timeout_ms: 100,
-                ..Default::default()
-            });
-            harness.send(vad_start(0, 3_200));
-            harness.drain_events();
-
-            let started = Instant::now();
-            let actions = harness.send(vad_end(0, 16_000, 17_920));
-            let elapsed = started.elapsed();
-            let events = harness.drain_events();
-            done_tx
-                .send((elapsed, actions, events))
-                .expect("test result receiver should still exist");
+    fn close_wait_does_not_require_token_to_reach_silence_decision_sample() {
+        let progress = ModelProgressMap::new();
+        progress.update(SESSION_ID, 17_920);
+        progress.record_token(SESSION_ID, 15_000);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress),
+            model_alignment_timeout_ms: 3_000,
+            ..Default::default()
         });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
 
-        let (elapsed, actions, events) = done_rx.recv_timeout(Duration::from_millis(750)).expect(
-            "VAD close should not hang indefinitely while model progress is behind decision_sample",
-        );
+        let started = Instant::now();
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let elapsed = started.elapsed();
+        let events = harness.drain_events();
+
         assert!(
-            elapsed < Duration::from_millis(500),
-            "blocking model-alignment wait should be bounded by model_alignment_timeout_ms; elapsed={elapsed:?}"
+            elapsed < Duration::from_millis(100),
+            "close should not wait for last_token_end_sample to reach the VAD silence decision sample; elapsed={elapsed:?}"
         );
         assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
         assert_turn_closed(&events, "vad", true, "vad_speech_end");
+        let alignment = find_event(&events, "turn_close_alignment")
+            .expect("close should emit model alignment instrumentation");
+        assert_eq!(
+            alignment
+                .get("last_token_end_sample")
+                .and_then(Value::as_u64),
+            Some(15_000)
+        );
+        assert_eq!(
+            alignment.get("audio_caught_up").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2026,7 +2151,7 @@ mod tests {
     }
 
     #[test]
-    fn human_hold_emits_after_long_speech_without_tokens_when_semantic_gate_suppresses() {
+    fn human_hold_closes_turn_when_semantic_gate_suppresses_and_hold_exceeded() {
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
@@ -2041,9 +2166,11 @@ mod tests {
         let actions = harness.send(vad_end(0, 16_000, 16_000));
         let events = harness.drain_events();
 
-        assert!(
-            actions.is_empty(),
-            "semantic incomplete should suppress VAD closure even when human-hold is emitted; got actions: {actions:#?}"
+        assert_reset_action(
+            &actions,
+            "human_hold",
+            "human_hold_speech_like_audio_without_tokens",
+            16_000,
         );
         assert_suppressed(&events, "semantic", "semantic_incomplete");
         assert!(
@@ -2058,7 +2185,38 @@ mod tests {
             }),
             "after >= human_hold_silence_ms of speech-like audio without tokens, TurnHumanHoldEvent should be emitted; got events: {events:#?}"
         );
-        assert_no_event(&events, "turn_closed");
+        assert_turn_closed(
+            &events,
+            "human_hold",
+            true,
+            "human_hold_speech_like_audio_without_tokens",
+        );
+    }
+
+    #[test]
+    fn old_segment_end_after_direct_semantic_close_does_not_duplicate_close() {
+        let progress = ModelProgressMap::new();
+        progress.update(SESSION_ID, 17_920);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            model_progress: Some(progress),
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
+        let events = harness.drain_events();
+        assert_reset_action(&actions, "smart_turn", "smart_turn_complete_direct", 17_920);
+        assert_eq!(event_count(&events, "turn_closed"), 1);
+
+        let stale_actions = harness.send(vad_end(0, 16_000, 17_920));
+        let stale_events = harness.drain_events();
+        assert!(
+            stale_actions.is_empty(),
+            "old VAD segment end should not emit another reset: {stale_actions:#?}"
+        );
+        assert_no_event(&stale_events, "turn_closed");
     }
 
     #[test]
