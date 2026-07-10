@@ -604,9 +604,10 @@ impl VadSession {
             .max(self.config.stop_threshold);
         let fallback_progress_ms = if !self.in_speech
             && smoothed_probability <= effective_fallback_threshold
+            && self.last_segment_end_sample.is_some()
         {
-            let silence_samples =
-                frame_end_sample.saturating_sub(self.last_segment_end_sample.unwrap_or(0));
+            let silence_samples = frame_end_sample
+                .saturating_sub(self.last_segment_end_sample.unwrap_or(frame_end_sample));
             samples_to_ms(silence_samples) as u32
         } else {
             0u32
