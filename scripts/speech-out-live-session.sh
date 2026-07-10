@@ -451,21 +451,53 @@ fi
 
 _kill_tree_timeout_secs="${SPEECH_OUT_KILL_TIMEOUT_SECS:-3}"
 
+# Collect all PIDs in the descendant tree rooted at $1 (including $1).
+# Returns space-separated list, children before parents, so a simple
+# left-to-right iteration sends TERM to leaves first.
+# Uses pgrep -P and DFS-style stack iteration; capped at _COLLECT_MAX_NODES
+# to prevent runaway walks on huge trees (e.g. accidental PID 1).
+_COLLECT_MAX_NODES=256
+_collect_descendants() {
+  local root="$1"
+  local -A seen=()
+  local stack=("$root")
+  local all=()
+  local max="${_COLLECT_MAX_NODES:-256}"
+  local p children child
+  while ((${#stack[@]} > 0 && ${#all[@]} < max)); do
+    p="${stack[-1]}"
+    unset 'stack[-1]'
+    [[ -n "${seen[$p]:-}" ]] && continue
+    seen[$p]=1
+    all+=("$p")
+    children="$(pgrep -P "$p" 2>/dev/null || true)"
+    for child in $children; do
+      [[ -n "$child" && -z "${seen[$child]:-}" ]] && stack+=("$child")
+    done
+  done
+  # Reverse for leaf-first ordering.
+  local idx
+  for ((idx = ${#all[@]} - 1; idx >= 0; idx--)); do
+    printf '%s ' "${all[$idx]}"
+  done
+}
+
 kill_tree() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
   kill -0 "$pid" 2>/dev/null || return 0
 
-  # Try to kill the entire process group first if the child is a group leader.
-  local pgid
-  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
-  if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
-    kill -TERM -"$pgid" 2>/dev/null || true
-  else
-    kill -TERM "$pid" 2>/dev/null || true
-  fi
+  # Collect every PID in the descendant tree, deepest first.
+  local pids
+  pids="$(_collect_descendants "$pid")"
 
-  # Wait briefly for graceful exit (0.1s per tick, timeout_secs * 10 ticks).
+  # Send SIGTERM to the entire tree (leaf-first order).
+  local p
+  for p in $pids; do
+    kill -TERM "$p" 2>/dev/null || true
+  done
+
+  # Wait for the root to exit, bounded by timeout.
   local waited=0 max_ticks=$(( _kill_tree_timeout_secs * 10 ))
   while (( waited < max_ticks )); do
     kill -0 "$pid" 2>/dev/null || return 0
@@ -473,15 +505,16 @@ kill_tree() {
     waited=$((waited + 1))
   done
 
-  # Escalate to SIGKILL.
-  if kill -0 "$pid" 2>/dev/null; then
-    if [[ -n "$pgid" && "$pgid" == "$pid" ]]; then
-      kill -KILL -"$pgid" 2>/dev/null || true
-    else
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-    wait "$pid" 2>/dev/null || true
-  fi
+  # Escalate: SIGKILL to every survivor in the tree.
+  for p in $pids; do
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done
+
+  # Best-effort reap: only succeeds when we are the direct parent.
+  # When called from a different shell context (e.g. cleanup in main
+  # script targeting a child of the while-pipeline subshell), the
+  # process is reaped by its real parent or reparented to init.
+  wait "$pid" 2>/dev/null || true
 }
 
 kill_tree_no_wait() {
@@ -647,17 +680,32 @@ run_speech_out() {
   if [[ -n "$current_style" ]]; then play_args+=(--style "$current_style"); fi
   printf '%s\n' "$current_response_text" >"$tts_expected_file"
   echo 0 >"$tts_echo_deadline_file"
+
+  # Launch speech-out directly; $! now captures the real binary PID
+  # rather than a transient bash subshell PID.  This pid file is the
+  # authoritative handle used by cancel_speech_out and tts_active,
+  # both of which may be called from a different shell context
+  # (main-script cleanup vs while-pipeline barge-in).
   "$bin_dir/speech-out" "${play_args[@]}" "$current_response_text" \
     2> >(while IFS= read -r out_line; do
       printf '%s\n' "$out_line" >>"$trigger_log"
       emit_ui_event "$out_line"
       printf '%s\n' "$out_line" >&2
-    done) || true
-  local self_pid="${BASHPID:-$$}"
+    done) &
+  local child_pid=$!
+  printf '%s\n' "$child_pid" >"$tts_pid_file"
+
+  # Block until the child exits (or is killed by cancel_speech_out).
+  local rc=0
+  wait "$child_pid" 2>/dev/null || rc=$?
+
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
-  if [[ "$(cat "$tts_pid_file" 2>/dev/null || true)" == "$self_pid" ]]; then
+  # Only remove the pid file if it still points to *our* child —
+  # a newer dispatch may have already overwritten it.
+  if [[ "$(cat "$tts_pid_file" 2>/dev/null || true)" == "$child_pid" ]]; then
     rm -f "$tts_pid_file"
   fi
+  return $rc
 }
 
 
@@ -672,9 +720,11 @@ dispatch_turn_response() {
     emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"self_echo","dispatch_source":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$dispatch_source")"
   else
     cancel_speech_out new_response
+    # run_speech_out writes the real child PID to tts_pid_file
+    # internally (the pid file is the cross-context authority).
+    # The background subshell that wraps this call is reaped by
+    # the owning while-pipeline subshell when the child exits.
     run_speech_out &
-    tts_pid=$!
-    printf '%s\n' "$tts_pid" >"$tts_pid_file"
   fi
 }
 
