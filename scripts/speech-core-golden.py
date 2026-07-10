@@ -1018,6 +1018,927 @@ def _default_cues_for_scenario(scenario_id: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Operator: one-command guided recording workflow
+# ═══════════════════════════════════════════════════════════════════
+
+FRIENDLY_NAMES: Dict[str, str] = {
+    "human-clean-complete": "Clean sentence",
+    "human-trailing-off": "Trailing off",
+    "human-pause-resume-incomplete": "Pause and resume",
+    "human-rapid-question": "Rapid question",
+    "human-hold-continuous-filler-7000": "Continuous hold",
+    "synthetic-vad-onset-below-32ms": "VAD onset below (32ms)",
+    "synthetic-vad-onset-at-64ms": "VAD onset at (64ms)",
+    "synthetic-vad-onset-above-96ms": "VAD onset above (96ms)",
+    "synthetic-vad-hangover-below-64ms-silence": "VAD hangover below (64ms)",
+    "synthetic-vad-hangover-at-96ms-silence": "VAD hangover at (96ms)",
+    "synthetic-vad-hangover-above-128ms-silence": "VAD hangover above (128ms)",
+    "synthetic-min-vad-speech-below-399ms": "Min speech below (399ms)",
+    "synthetic-min-vad-speech-at-400ms": "Min speech at (400ms)",
+    "synthetic-min-vad-speech-above-401ms": "Min speech above (401ms)",
+    "synthetic-smart-recheck-schedule": "Smart Turn recheck",
+    "synthetic-acoustic-fallback-installed-1700": "Acoustic fallback (1700ms)",
+    "synthetic-acoustic-fallback-code-default-3500": "Acoustic fallback (3500ms)",
+    "synthetic-transcript-silence-close-700": "Transcript silence close",
+}
+
+
+# Default drain window for event capture after mic stops (seconds)
+DEFAULT_EVENT_DRAIN_SEC = 5.0
+# Default URL for daemon websocket
+DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws/audio-ingress"
+
+
+def _find_binary(name: str) -> Optional[str]:
+    """Find a binary: first PATH, then script dir, then target/debug."""
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent
+
+    # Check PATH
+    import shutil as _shutil
+    found = _shutil.which(name)
+    if found:
+        return found
+
+    # Check script dir
+    candidate = script_dir / name
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+
+    # Check target/debug
+    candidate = repo_root / "target" / "debug" / name
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+
+    return None
+
+
+def _scenario_friendly_name(scenario_id: str) -> str:
+    """Return friendly name for a scenario, falling back to the ID."""
+    return FRIENDLY_NAMES.get(scenario_id, scenario_id)
+
+
+def _operator_scenario_menu(manifest: dict) -> Optional[str]:
+    """
+    Display an interactive numbered menu of scenarios.
+    Returns selected scenario_id or None if quit.
+    """
+    scenarios = manifest.get("scenarios", [])
+    if not scenarios:
+        die(ExitCode.SCENARIO_NOT_FOUND, "No scenarios in manifest.")
+
+    # Split into human and synthetic groups
+    human = [s for s in scenarios if s.get("construction") == "human-recorded"]
+    synthetic = [s for s in scenarios if s.get("construction") == "synthetic"]
+
+    _clear_screen()
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║  GOLDEN OPERATOR — speech-core endpoint testing      ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print("║                                                      ║")
+    print("║  Choose a scenario:                                  ║")
+    print("║                                                      ║")
+
+    idx = 1
+    mapping: Dict[int, str] = {}
+
+    if human:
+        print("║  [HUMAN RECORDINGS]                                  ║")
+        for s in human:
+            sid = s["id"]
+            name = _scenario_friendly_name(sid)
+            print(f"║    {idx:2d}. {name:<44s} ║")
+            mapping[idx] = sid
+            idx += 1
+
+    print("║                                                      ║")
+
+    if synthetic:
+        print("║  [SYNTHETIC TESTS]                                   ║")
+        for s in synthetic:
+            sid = s["id"]
+            name = _scenario_friendly_name(sid)
+            print(f"║    {idx:2d}. {name:<44s} ║")
+            mapping[idx] = sid
+            idx += 1
+
+    print("║                                                      ║")
+    print("║  Type a number or name, or [Q] to quit               ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print()
+
+    while True:
+        try:
+            raw = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if not raw:
+            continue
+
+        if raw.lower() in ("q", "quit"):
+            return None
+
+        # Try number
+        try:
+            num = int(raw)
+            if num in mapping:
+                return mapping[num]
+        except ValueError:
+            pass
+
+        # Try name prefix / fuzzy match
+        matches = [sid for sid in FRIENDLY_NAMES if raw.lower() in FRIENDLY_NAMES[sid].lower()]
+        if not matches:
+            matches = [sid for sid in FRIENDLY_NAMES if raw.lower() in sid.lower()]
+        if not matches:
+            # Last resort: check manifest scenario IDs
+            for s in scenarios:
+                sid = s["id"]
+                if raw.lower() in sid.lower() or raw.lower() == sid.lower():
+                    return sid
+
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            print(f"  Multiple matches: {', '.join(matches[:5])}")
+            print("  Please be more specific or use a number.")
+        else:
+            print(f"  No match for '{raw}'. Try a number or name.")
+
+
+def _operator_display_scenario_info(manifest: dict, scenario_id: str,
+                                     manifest_dir: Path) -> Optional[dict]:
+    """Display scenario description and prompt. Returns cue timeline."""
+    scenario = None
+    for s in manifest.get("scenarios", []):
+        if s.get("id") == scenario_id:
+            scenario = s
+            break
+    if scenario is None:
+        return None
+
+    scenario_file = scenario.get("scenario_file")
+    scenario_data = {}
+    if scenario_file:
+        sf_path = manifest_dir / scenario_file
+        if sf_path.exists():
+            try:
+                scenario_data = load_manifest_file(sf_path)
+            except Exception:
+                pass
+
+    cues = scenario_data.get("cues", [])
+    prompt = scenario_data.get("prompt", scenario.get("description", scenario_id))
+
+    if not cues:
+        cues = _default_cues_for_scenario(scenario_id)
+
+    _clear_screen()
+    name = _scenario_friendly_name(scenario_id)
+    print("╔══════════════════════════════════════════════════════╗")
+    print(f"║  {name[:48]:<48s} ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print(f"║  {prompt[:52]:<52s} ║")
+    print("║                                                      ║")
+    if cues:
+        print("║  Cue timeline:                                       ║")
+        for cue in cues:
+            label = cue.get("label", "")
+            band = cue.get("band_ms", [0, 0])
+            print(f"║    {band[0]:>5}–{band[1]:<5} ms  {label:<8s}  ║")
+    print("║                                                      ║")
+    print("║  [ENTER] Start   [B] Back   [Q] Quit                 ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print()
+
+    while True:
+        try:
+            key = _get_key()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if key.lower() == "q":
+            return None
+        if key.lower() == "b":
+            return "back"
+        if key in ("\r", "\n", " "):
+            return {"cues": cues, "prompt": prompt, "scenario": scenario}
+
+
+def _operator_real_capture(
+    scenario: dict,
+    cues: list,
+    take_dir: Path,
+    mode: str,
+    device: Optional[str],
+    ws_url: str,
+    stream_session_id: str,
+    total_ms: int,
+    drain_sec: float = DEFAULT_EVENT_DRAIN_SEC,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Run real capture: launch watcher, then mic adapter, display TUI,
+    clean up subprocesses. Returns (exit_code, capture_info).
+
+    Raises on subprocess launch failure; returns appropriate exit codes
+    for operator abort / timeout.
+    """
+    watcher_bin = _find_binary("speech-core-watch")
+    mic_bin = _find_binary("speech-core-mic-adapter")
+
+    if not watcher_bin or not mic_bin:
+        # In a dry-run or test context, binaries may not be available.
+        # Return a clear error code so the caller can fall back.
+        missing = []
+        if not watcher_bin:
+            missing.append("speech-core-watch")
+        if not mic_bin:
+            missing.append("speech-core-mic-adapter")
+        print(f"  [ERROR] Missing binaries: {', '.join(missing)}", file=sys.stderr)
+        return ExitCode.DEPENDENCY_MISSING, {"missing": missing}
+
+    event_path = take_dir / "event-stream.jsonl"
+    wav_path = take_dir / "audio.wav"
+
+    capture_info: Dict[str, Any] = {
+        "stream_session_id": stream_session_id,
+        "watcher_bin": watcher_bin,
+        "mic_bin": mic_bin,
+        "event_path": str(event_path),
+        "wav_path": str(wav_path),
+        "watcher_pid": None,
+        "mic_pid": None,
+        "events_captured": False,
+    }
+
+    watcher_proc = None
+    mic_proc = None
+
+    try:
+        # ── Launch watcher first ──────────────────────────────────────
+        event_fh = open(event_path, "w")
+        watcher_args = [
+            watcher_bin,
+            "--mode", "jsonl",
+            "--url", ws_url,
+            "--stream-session-id", stream_session_id,
+        ]
+        watcher_proc = subprocess.Popen(
+            watcher_args,
+            stdout=event_fh,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        capture_info["watcher_pid"] = watcher_proc.pid
+
+        # Wait for watcher to be ready: poll for event file to have content
+        # or for watcher to output something
+        ready_wait = 0.0
+        while ready_wait < 3.0:
+            if watcher_proc.poll() is not None:
+                # Watcher exited early
+                stderr_data = watcher_proc.stderr.read() if watcher_proc.stderr else ""
+                event_fh.close()
+                print(f"  [ERROR] Watcher exited early with code {watcher_proc.returncode}",
+                      file=sys.stderr)
+                if stderr_data:
+                    print(f"  Watcher stderr: {stderr_data[:500]}", file=sys.stderr)
+                return ExitCode.DAEMON_UNREACHABLE, capture_info
+            if event_path.exists() and event_path.stat().st_size > 0:
+                break
+            time.sleep(0.2)
+            ready_wait += 0.2
+
+        # ── Launch mic adapter ────────────────────────────────────────
+        mic_args = [
+            mic_bin,
+            "--record-wav", str(wav_path),
+            "--url", ws_url,
+            "--stream-session-id", stream_session_id,
+        ]
+        if device:
+            mic_args.extend(["--device", device])
+
+        mic_proc = subprocess.Popen(
+            mic_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        capture_info["mic_pid"] = mic_proc.pid
+
+        # ── Recording TUI loop ────────────────────────────────────────
+        scenario_id = scenario.get("id", "unknown")
+        take_number = int(take_dir.name.split("-")[-1]) if "-" in take_dir.name else 1
+        total_sec = total_ms / 1000.0
+
+        start_time = time.monotonic()
+        elapsed = 0.0
+        current_cue = None
+        hold_active = False
+        format_info = _get_format_info(device, dry_run=False)
+
+        while elapsed < total_sec + 2.0:
+            elapsed = time.monotonic() - start_time
+            elapsed_ms = int(elapsed * 1000)
+
+            new_cue = None
+            for cue in cues:
+                band = cue.get("band_ms", [0, 0])
+                if band[0] <= elapsed_ms < band[1]:
+                    new_cue = cue
+                    break
+
+            if new_cue and new_cue.get("label") == "HOLD":
+                hold_active = True
+            elif new_cue and new_cue.get("label") != "HOLD":
+                hold_active = False
+
+            if new_cue != current_cue:
+                current_cue = new_cue
+
+            _display_recording_screen(
+                elapsed, current_cue, format_info, scenario_id, take_number, mode, hold_active
+            )
+
+            # Non-blocking key check
+            try:
+                import select
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    key = _get_key()
+                    if key.lower() == "q":
+                        _clear_screen()
+                        return ExitCode.RECORDER_ABORTED, capture_info
+                    elif key == " ":
+                        pass  # toggle display
+            except (ImportError, OSError):
+                time.sleep(0.1)
+
+        _clear_screen()
+        print(f"\n{'═' * 60}")
+        print(f"  RECORDING COMPLETE")
+        print(f"  Total time: {_format_timer(min(elapsed, total_sec))}")
+        print(f"{'═' * 60}\n")
+
+        # ── Stop mic adapter cleanly ──────────────────────────────────
+        if mic_proc and mic_proc.poll() is None:
+            mic_proc.terminate()
+            try:
+                mic_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mic_proc.kill()
+                mic_proc.wait()
+
+        # ── Event drain window ────────────────────────────────────────
+        print(f"  Waiting {drain_sec}s for final events...")
+        time.sleep(drain_sec)
+
+        # ── Stop watcher ──────────────────────────────────────────────
+        if watcher_proc and watcher_proc.poll() is None:
+            watcher_proc.terminate()
+            try:
+                watcher_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher_proc.kill()
+                watcher_proc.wait()
+
+        event_fh.close()
+
+        # Check if events were captured
+        if event_path.exists() and event_path.stat().st_size > 0:
+            capture_info["events_captured"] = True
+
+        return ExitCode.PASS, capture_info
+
+    except KeyboardInterrupt:
+        _clear_screen()
+        print("\nOperator interrupted.")
+        # Cleanup
+        if mic_proc and mic_proc.poll() is None:
+            mic_proc.terminate()
+            try:
+                mic_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                mic_proc.kill()
+        if watcher_proc and watcher_proc.poll() is None:
+            watcher_proc.terminate()
+            try:
+                watcher_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                watcher_proc.kill()
+        try:
+            event_fh.close()
+        except Exception:
+            pass
+        return ExitCode.RECORDER_ABORTED, capture_info
+
+    except Exception as e:
+        print(f"  [ERROR] Capture failed: {e}", file=sys.stderr)
+        if mic_proc and mic_proc.poll() is None:
+            mic_proc.terminate()
+        if watcher_proc and watcher_proc.poll() is None:
+            watcher_proc.terminate()
+        try:
+            event_fh.close()
+        except Exception:
+            pass
+        return ExitCode.INTERNAL_ERROR, capture_info
+
+    finally:
+        # Ensure subprocesses are cleaned up
+        for p, name in [(mic_proc, "mic"), (watcher_proc, "watcher")]:
+            if p and p.poll() is None:
+                try:
+                    p.kill()
+                    p.wait(timeout=2)
+                except Exception:
+                    pass
+
+
+def _operator_quality_check(take_dir: Path, scenario_id: str,
+                             mode: str, dry_run: bool) -> Dict[str, Any]:
+    """
+    Run automated quality checks on captured artifacts.
+    Returns a dict with pass/fail and specific check results.
+    """
+    result: Dict[str, Any] = {
+        "passed": False,
+        "checks": [],
+        "failures": [],
+        "warnings": [],
+        "take_dir": str(take_dir),
+        "scenario_id": scenario_id,
+        "mode": mode,
+        "dry_run": dry_run,
+    }
+
+    wav_path = take_dir / "audio.wav"
+    event_path = take_dir / "event-stream.jsonl"
+
+    # ── WAV checks ────────────────────────────────────────────────────
+    if not wav_path.exists():
+        result["failures"].append("WAV missing")
+        result["checks"].append({"name": "wav_exists", "passed": False, "reason": "WAV file not found"})
+    else:
+        result["checks"].append({"name": "wav_exists", "passed": True})
+
+        # Validate format
+        wav_errors = validate_wav(wav_path)
+        if wav_errors:
+            for e in wav_errors:
+                result["failures"].append(e)
+                result["checks"].append({"name": "wav_format", "passed": False, "reason": e})
+        else:
+            result["checks"].append({"name": "wav_format", "passed": True})
+
+        # Quality metrics
+        try:
+            _sr, _ch, _sw, n, sample_data = read_wav(wav_path)
+            p = peak_dbfs(sample_data)
+            r = rms_dbfs(sample_data)
+            clip = clipping_count(sample_data)
+            dur = samples_ms(n)
+
+            result["quality"] = {
+                "duration_ms": dur,
+                "sample_count": n,
+                "peak_dbfs": round(p, 2),
+                "rms_dbfs": round(r, 2),
+                "clipping_count": clip,
+            }
+
+            # Peak check
+            if p < -96.0:
+                result["checks"].append({"name": "peak", "passed": False,
+                                          "reason": f"Pure silence (peak={p:.1f} dBFS)",
+                                          "value": round(p, 2)})
+                result["failures"].append(f"Pure silence (peak={p:.1f} dBFS)")
+            else:
+                result["checks"].append({"name": "peak", "passed": True,
+                                          "reason": f"Peak {p:.1f} dBFS",
+                                          "value": round(p, 2)})
+
+            # Clipping check
+            if clip > 0:
+                result["checks"].append({"name": "clipping", "passed": False,
+                                          "reason": f"{clip} clipped samples",
+                                          "value": clip})
+                result["failures"].append(f"Clipping: {clip} samples")
+            else:
+                result["checks"].append({"name": "clipping", "passed": True,
+                                          "reason": "No clipping"})
+
+            # Non-silence check
+            if r < -60.0 and not dry_run:
+                result["checks"].append({"name": "non_silence", "passed": False,
+                                          "reason": f"Too quiet (RMS={r:.1f} dBFS)",
+                                          "value": round(r, 2)})
+                result["failures"].append(f"Too quiet (RMS={r:.1f} dBFS)")
+            else:
+                result["checks"].append({"name": "non_silence", "passed": True,
+                                          "reason": f"Signal present (RMS={r:.1f} dBFS)",
+                                          "value": round(r, 2)})
+
+        except Exception as e:
+            result["failures"].append(f"WAV read error: {e}")
+            result["checks"].append({"name": "wav_read", "passed": False, "reason": str(e)})
+
+    # ── Event checks ──────────────────────────────────────────────────
+    if not event_path.exists():
+        if not dry_run:
+            result["checks"].append({"name": "events_exist", "passed": False,
+                                      "reason": "event-stream.jsonl missing"})
+            result["failures"].append("Event stream missing")
+        else:
+            result["checks"].append({"name": "events_exist", "passed": True,
+                                      "reason": "dry-run (no events expected)"})
+    else:
+        try:
+            event_count = 0
+            with open(event_path) as f:
+                for line in f:
+                    if line.strip():
+                        event_count += 1
+            result["event_count"] = event_count
+            if event_count > 0:
+                result["checks"].append({"name": "events_exist", "passed": True,
+                                          "reason": f"{event_count} events"})
+            else:
+                result["checks"].append({"name": "events_exist", "passed": False,
+                                          "reason": "Zero events"})
+                result["failures"].append("Zero events captured")
+        except Exception as e:
+            result["checks"].append({"name": "events_exist", "passed": False,
+                                      "reason": f"Error reading: {e}"})
+            result["failures"].append(f"Event stream read error: {e}")
+
+    # ── Dry-run is always invalid for promotion ───────────────────────
+    if dry_run:
+        result["warnings"].append("DRY-RUN: not valid for promotion")
+        result["passed"] = False
+    else:
+        result["passed"] = len(result["failures"]) == 0
+
+    return result
+
+
+def _operator_review_loop(take_dir: Path, quality: Dict[str, Any],
+                           mode: str, play_cmd: Optional[str] = None) -> int:
+    """
+    Post-capture review loop: P/R/A/Q.
+    Returns exit code (PASS if accepted, RECORDER_ABORTED if quit,
+    or a special code for retry).
+    """
+    take_name = take_dir.name
+    q = quality
+    failures = q.get("failures", [])
+    checks = q.get("checks", [])
+    passed = q.get("passed", False)
+    dry_run = q.get("dry_run", False)
+
+    while True:
+        _clear_screen()
+        print("╔══════════════════════════════════════════════════════╗")
+        print(f"║  REVIEW — {take_name:<40s} ║")
+        print("╠══════════════════════════════════════════════════════╣")
+
+        # Quality summary
+        if "quality" in q:
+            qual = q["quality"]
+            print(f"║  Audio:  {qual.get('duration_ms','?')}ms, 16kHz mono PCM16     ║")
+            print(f"║  Peak:   {qual.get('peak_dbfs',0):.1f} dBFS                          ║")
+            print(f"║  Clip:   {qual.get('clipping_count',0)} samples                          ║")
+
+        # Event summary
+        ec = q.get("event_count")
+        if ec is not None:
+            print(f"║  Events: {ec} captured                           ║")
+
+        print("╠══════════════════════════════════════════════════════╣")
+
+        # Check results
+        for c in checks:
+            name = c.get("name", "?")
+            ok = c.get("passed", False)
+            reason = c.get("reason", "")
+            mark = "✓" if ok else "✗"
+            print(f"║  {mark} {name:<25s} {reason[:24]:>24s} ║")
+
+        print("╠══════════════════════════════════════════════════════╣")
+
+        if passed:
+            print("║  Result: PASS — all checks OK                        ║")
+        else:
+            if dry_run:
+                print("║  Result: DRY-RUN — invalid for promotion              ║")
+            else:
+                print(f"║  Result: {'FAIL' if failures else 'WARN'} — {len(failures)} issue(s)                     ║")
+
+        print("╠══════════════════════════════════════════════════════╣")
+        print("║                                                      ║")
+
+        can_accept = passed or mode == "practice"
+        if can_accept:
+            print("║  [P] Play   [R] Retry   [A] Accept   [Q] Quit        ║")
+        else:
+            print("║  [P] Play   [R] Retry   [Q] Quit                     ║")
+            print("║  (Accept disabled — fix issues or use --force)       ║")
+
+        print("╚══════════════════════════════════════════════════════╝")
+        print()
+
+        try:
+            key = _get_key()
+        except (EOFError, KeyboardInterrupt):
+            return ExitCode.RECORDER_ABORTED
+
+        if key.lower() == "q":
+            return ExitCode.RECORDER_ABORTED
+
+        if key.lower() == "a":
+            if not can_accept:
+                print("\n  Cannot accept: quality checks have failures.")
+                print("  Use R to retry or Q to quit.")
+                time.sleep(1.5)
+                continue
+            # Accept: write review and return
+            review = {
+                "accepted": True,
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                "quality": q.get("quality", {}),
+                "checks_passed": passed,
+            }
+            save_file(review, take_dir / "review.json")
+            print(f"\n  ✓ Take accepted.")
+            return ExitCode.PASS
+
+        if key.lower() == "r":
+            # Retry: caller handles by returning a sentinel
+            return -1  # sentinel for retry
+
+        if key.lower() == "p":
+            # Playback
+            wav_path = take_dir / "audio.wav"
+            if not wav_path.exists():
+                print("\n  No audio to play.")
+                time.sleep(1.0)
+                continue
+
+            cmd_to_run = play_cmd
+            if not cmd_to_run:
+                # Auto-detect playback command
+                import shutil as _shutil
+                for candidate in ["pw-play", "aplay", "paplay", "ffplay"]:
+                    if _shutil.which(candidate):
+                        cmd_to_run = f"{candidate} {{wav}}"
+                        break
+                if not cmd_to_run:
+                    print("\n  No audio player found. Install pw-play, aplay, paplay, or ffplay.")
+                    print("  Or use --play-cmd to specify a custom command.")
+                    time.sleep(2.0)
+                    continue
+
+            full_cmd = cmd_to_run.replace("{wav}", str(wav_path))
+            print(f"\n  Playing: {full_cmd}")
+            try:
+                subprocess.run(full_cmd, shell=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                print("  Playback timed out.")
+            except Exception as e:
+                print(f"  Playback error: {e}")
+            time.sleep(0.5)
+
+
+def cmd_operator(args: argparse.Namespace) -> int:
+    """
+    Main operator command: interactive scenario selection → recording → review.
+    """
+    manifest_path = Path(args.manifest)
+    if not manifest_path.exists():
+        die(ExitCode.MANIFEST_INVALID, f"Manifest not found: {manifest_path}")
+
+    try:
+        manifest = load_manifest_file(manifest_path)
+    except Exception as e:
+        die(ExitCode.MANIFEST_INVALID, f"Failed to load manifest: {e}")
+
+    manifest_dir = manifest_path.parent.resolve()
+    out_dir = Path(args.out) if hasattr(args, "out") and args.out else Path("golden-runs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scenario selection
+    scenario_id = None
+    if hasattr(args, "scenario") and args.scenario:
+        # Try as number first, then as name/id
+        raw = str(args.scenario)
+        scenarios = manifest.get("scenarios", [])
+        try:
+            num = int(raw)
+            # Build mapping by menu order
+            human = [s for s in scenarios if s.get("construction") == "human-recorded"]
+            synthetic = [s for s in scenarios if s.get("construction") == "synthetic"]
+            ordered = human + synthetic
+            if 1 <= num <= len(ordered):
+                scenario_id = ordered[num - 1]["id"]
+        except ValueError:
+            # Try fuzzy match on ID or friendly name
+            for s in scenarios:
+                sid = s["id"]
+                fname = _scenario_friendly_name(sid)
+                if raw.lower() == sid.lower() or raw.lower() == fname.lower():
+                    scenario_id = sid
+                    break
+            if scenario_id is None:
+                matches = [s["id"] for s in scenarios
+                          if raw.lower() in s["id"].lower() or raw.lower() in _scenario_friendly_name(s["id"]).lower()]
+                if len(matches) == 1:
+                    scenario_id = matches[0]
+
+        if scenario_id is None:
+            die(ExitCode.SCENARIO_NOT_FOUND,
+                f"No scenario matches '{raw}'. Run without --scenario for interactive menu.")
+    else:
+        # Interactive menu
+        scenario_id = _operator_scenario_menu(manifest)
+        if scenario_id is None:
+            die(ExitCode.RECORDER_ABORTED, "Operator quit.")
+
+    # Verify scenario exists
+    scenario = None
+    for s in manifest.get("scenarios", []):
+        if s.get("id") == scenario_id:
+            scenario = s
+            break
+    if scenario is None:
+        die(ExitCode.SCENARIO_NOT_FOUND, f"Scenario not found: {scenario_id}")
+
+    # Show scenario info and get confirmation
+    info = _operator_display_scenario_info(manifest, scenario_id, manifest_dir)
+    if info is None:
+        die(ExitCode.RECORDER_ABORTED, "Operator quit.")
+    if info == "back":
+        return cmd_operator(args)  # Go back to menu
+
+    cues = info["cues"]
+    prompt = info.get("prompt", "")
+
+    # Determine mode
+    practice = getattr(args, "practice", False)
+    mode = "practice" if practice else "take"
+    dry_run = getattr(args, "dry_run", False)
+    device = getattr(args, "device", None)
+    play_cmd = getattr(args, "play_cmd", None)
+    ws_url = getattr(args, "url", None) or DEFAULT_WS_URL
+    force = getattr(args, "force", False)
+
+    # Determine total duration from cues
+    total_ms = max((cue.get("band_ms", [0, 0])[1] for cue in cues), default=10000) + 2000
+
+    # Determine take number and directory
+    scenario_out = out_dir / "scenarios" / scenario_id / "takes"
+    scenario_out.mkdir(parents=True, exist_ok=True)
+
+    max_retries = 50
+    retry_count = 0
+
+    while retry_count < max_retries:
+        if mode == "take":
+            existing_takes = sorted(scenario_out.glob("take-*"))
+            take_number = len(existing_takes) + retry_count + 1
+        else:
+            existing_practice = sorted(scenario_out.glob("practice-*"))
+            take_number = len(existing_practice) + retry_count + 1
+
+        take_dir_name = f"{'take' if mode == 'take' else 'practice'}-{take_number:03d}"
+        take_dir = scenario_out / take_dir_name
+
+        # Ensure non-overwriting: if dir exists, increment
+        attempt = 0
+        while take_dir.exists() and attempt < 100:
+            attempt += 1
+            new_num = take_number + attempt
+            take_dir_name = f"{'take' if mode == 'take' else 'practice'}-{new_num:03d}"
+            take_dir = scenario_out / take_dir_name
+
+        take_dir.mkdir(parents=True, exist_ok=False)
+
+        # Write metadata
+        consent = {
+            "consent_version": 1,
+            "purpose": "local speech-core endpointing diagnostics",
+            "stored_data": ["WAV audio", "transcripts/events", "timing metadata", "quality metrics"],
+            "upload_policy": "never uploaded by golden tool",
+            "sharing_policy": "not committed unless operator explicitly promotes",
+            "retention_policy": "delete-after-run (unless accepted)",
+            "speaker_label": "local-operator",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "scenario_id": scenario_id,
+            "mode": mode,
+        }
+        save_file(consent, take_dir / "consent.json")
+
+        privacy = {
+            "retention_class": "delete-after-run",
+            "access_policy": "local-only",
+            "pii_in_paths": False,
+            "scenario_id": scenario_id,
+            "take_id": take_dir_name,
+            "speaker_label": "local-operator",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_file(privacy, take_dir / "privacy.json")
+
+        # Countdown
+        _countdown(3, "READY")
+
+        # Capture
+        stream_session_id = str(uuid.uuid4())
+
+        if dry_run:
+            # Dry-run: generate silence
+            wav_path = take_dir / "audio.wav"
+            samples = _generate_silence(ms_samples(total_ms))
+            write_wav(wav_path, samples)
+            print(f"  [DRY-RUN] Generated silence WAV: {wav_path}")
+
+            # Fake event stream for dry-run
+            event_path = take_dir / "event-stream.jsonl"
+            event_path.write_text("")
+
+            capture_code = ExitCode.PASS
+        else:
+            # Real capture with subprocesses
+            print(f"  Launching capture...")
+            capture_code, capture_info = _operator_real_capture(
+                scenario=scenario,
+                cues=cues,
+                take_dir=take_dir,
+                mode=mode,
+                device=device,
+                ws_url=ws_url,
+                stream_session_id=stream_session_id,
+                total_ms=total_ms,
+                drain_sec=DEFAULT_EVENT_DRAIN_SEC,
+            )
+
+            if capture_code == ExitCode.RECORDER_ABORTED:
+                # Clean up and exit
+                shutil.rmtree(take_dir, ignore_errors=True)
+                return capture_code
+            if capture_code == ExitCode.DAEMON_UNREACHABLE:
+                print("  Daemon unreachable. Check that speech-core-daemon is running.")
+                shutil.rmtree(take_dir, ignore_errors=True)
+                return capture_code
+            if capture_code == ExitCode.DEPENDENCY_MISSING:
+                print("  Required binaries not found. Build them or use --dry-run.")
+                shutil.rmtree(take_dir, ignore_errors=True)
+                return capture_code
+
+        # Write provenance
+        provenance = {
+            "stream_session_id": stream_session_id,
+            "scenario_id": scenario_id,
+            "mode": mode,
+            "take_dir": str(take_dir_name),
+            "recorder_version": "1.0.0",
+            "sample_rate": SAMPLE_RATE,
+            "channels": CHANNELS,
+            "sample_width_bytes": SAMPLE_WIDTH,
+            "device": device or "dry-run" if dry_run else (device or "system default"),
+            "dry_run": dry_run,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "cue_timeline": cues,
+            "prompt": prompt,
+        }
+        save_file(provenance, take_dir / "provenance.json")
+
+        # Quality checks
+        quality = _operator_quality_check(take_dir, scenario_id, mode, dry_run)
+
+        # Review loop
+        review_code = _operator_review_loop(take_dir, quality, mode, play_cmd)
+
+        if review_code == ExitCode.PASS:
+            # Accepted
+            return ExitCode.PASS
+        elif review_code == -1:
+            # Retry
+            retry_count += 1
+            print(f"\n  Retrying (attempt {retry_count + 1})...")
+            time.sleep(0.5)
+            continue
+        else:
+            # Quit
+            shutil.rmtree(take_dir, ignore_errors=True)
+            return ExitCode.RECORDER_ABORTED
+
+    print("  Max retries reached.")
+    return ExitCode.RECORDER_ABORTED
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Synthetic scenario generation (synth)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1641,6 +2562,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_leg.add_argument("--legacy-dir", default="tests/golden/legacy", help="Legacy directory")
     p_leg.add_argument("--dry-run", action="store_true", help="Dry-run mode")
 
+    # ── operator ──
+    p_op = sub.add_parser("operator", help="Interactive guided recording workflow")
+    p_op.add_argument("--manifest", default="tests/golden/manifest.yaml", help="Path to manifest YAML/JSON")
+    p_op.add_argument("--scenario", help="Pre-select scenario (number or name); skip menu")
+    p_op.add_argument("--out", default="golden-runs", help="Output directory for run artifacts")
+    p_op.add_argument("--practice", action="store_true", help="Practice take (not saved)")
+    p_op.add_argument("--dry-run", action="store_true", help="Dry-run mode (synthetic silence, no mic)")
+    p_op.add_argument("--device", help="Audio device name")
+    p_op.add_argument("--url", default=None, help="Daemon WebSocket URL")
+    p_op.add_argument("--play-cmd", help="Playback command template (use {wav} for path)")
+    p_op.add_argument("--force", action="store_true", help="Allow accept despite quality check failures")
+
     return parser
 
 
@@ -1743,6 +2676,11 @@ def main() -> None:
     elif command == "quarantine-legacy":
         legacy_dir = Path(args.legacy_dir)
         code = quarantine_legacy_fixtures(legacy_dir, dry_run=args.dry_run)
+        sys.exit(code)
+
+    # ── operator ──
+    elif command == "operator":
+        code = cmd_operator(args)
         sys.exit(code)
 
     else:
