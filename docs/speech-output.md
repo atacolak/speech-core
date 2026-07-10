@@ -126,7 +126,7 @@ The output-only diagnostic supervisor adds local/replay-only events around that 
 
 ## output-only diagnostics and replay
 
-Use `scripts/speech-out-diagnostics.py` when testing the output seam by itself. It deliberately bypasses microphone ingress, VAD, ASR, smart-turn, and the live-session canned `turn_closed -> heard you` integration. The tool feeds scripted text fixtures directly to `speech-out play` or emits deterministic mock events with no daemon/audio backend.
+Use `scripts/speech-out-diagnostics.py` when testing the output seam by itself. It deliberately bypasses microphone ingress, VAD, ASR, smart-turn, and the live-session canned `transcript_committed -> heard you` integration. The tool feeds scripted text fixtures directly to `speech-out play` or emits deterministic mock events with no daemon/audio backend.
 
 Deterministic mock/replay mode for reducer/TUI tests:
 
@@ -167,7 +167,7 @@ When `speech-out play --output file.wav` receives multiple text chunks, it no lo
 
 ## developer live-session harness
 
-`scripts/speech-out-live-session.sh` remains the end-to-end speech loop harness. It reuses the speech-core live microphone/session pattern, streams mic audio through `speech-core-mic-adapter`, feeds speech-in events plus speech-out events through the same `speech-core-watch --mode debug` TUI, watches for speech-in `turn_closed`, and triggers/appends a short speech-out response (default `heard you.`) through the speech-out websocket daemon:
+`scripts/speech-out-live-session.sh` remains the end-to-end speech loop harness. It reuses the speech-core live microphone/session pattern, streams mic audio through `speech-core-mic-adapter`, feeds speech-in events plus speech-out events through the same `speech-core-watch --mode debug` TUI, dispatches from the authoritative speech-in `transcript_committed` event (with `turn_closed` only as a legacy-daemon fallback), and triggers/appends a short speech-out response (default `heard you.`) through the speech-out websocket daemon:
 
 ```bash
 SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress \
@@ -250,7 +250,7 @@ GET /v1/events
   emits queued|started|audio_ready|playback_started|cancelled|completed|failed
 ```
 
-Speech-in integration should be event-level, not a dependency from `speech-core-daemon`: a future coordinator can subscribe to `vad_speech_start` / `turn_closed` events and call the speech-out daemon's cancel/barge-in endpoint. This keeps speech-in turn-taking owned by `speech-core-daemon` and speech-out playback owned by `speech-out-daemon`.
+Speech-in integration should be event-level, not a dependency from `speech-core-daemon`: a coordinator subscribes to `vad_speech_start` for barge-in and `transcript_committed` for response dispatch; `turn_closed` remains the lifecycle terminal marker. This keeps speech-in turn-taking owned by `speech-core-daemon` and speech-out playback owned by `speech-out-daemon`.
 
 ## future `speech-out-daemon`
 
@@ -274,7 +274,7 @@ For future developers: the useful manual testing mode is the debug tui, not the 
 The local `~/workspace/patterns` repo documents `delayed-streams-modeling` as the speech-to-speech ideal: a single decoder-only model over time-aligned streams, avoiding the STT -> LLM -> TTS cascade. `speech-core` is not that architecture today. It is deliberately still a cascade:
 
 ```text
-speech-in: mic -> vad/asr/smart-turn -> turn_closed
+speech-in: mic -> vad/asr/smart-turn -> transcript_committed -> turn_closed
 router:    future coordinator / model response
 speech-out: text chunks -> Supertonic -> ordered playback
 ```
