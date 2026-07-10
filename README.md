@@ -203,10 +203,12 @@ model_session_start
 model_chunk_processed
 transcript_token_committed
 transcript_update
+transcript_committed
+transcript_finalized
 model_error
 ```
 
-`transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
+`transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. `transcript_committed` is the authoritative immutable per-turn snapshot: it is emitted after close-time model drain and before `turn_closed`, and is the controller dispatch trigger. `transcript_finalized` is diagnostic-only and must not revise a committed/closed turn. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
 
 ## speech-in turn detection
 

@@ -112,8 +112,11 @@ model_session_start
 model_chunk_processed
 transcript_token_committed
 transcript_update
+transcript_finalized
 model_error
 ```
+
+`transcript_update` and `transcript_token_committed` carry `turn_id` when a turn is deterministically open. `transcript_finalized` is diagnostic-only: late session-finalization text must not revise an already committed or closed conversation turn.
 
 files:
 
@@ -191,7 +194,8 @@ contract:
 - `turn_eou_candidate` means some detector proposed a boundary.
 - `turn_eou_suppressed` means the turn manager rejected it.
 - `turn_eou` means accepted boundary evidence.
-- `turn_closed` means the turn is closed for consumers.
+- `transcript_committed` is the authoritative per-turn text snapshot and controller dispatch trigger. It is emitted after close-time model drain/alignment and before `turn_closed`.
+- `turn_closed` means the turn is closed for consumers. Its operator/controller-visible text is immutable; later transcript updates or finalization are diagnostics only.
 
 current accepted sources:
 

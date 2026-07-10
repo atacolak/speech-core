@@ -128,9 +128,13 @@ smart_turn_recheck_cancelled
 vad_acoustic_fallback
 turn_human_hold
 turn_eou_suppressed
+transcript_committed
 turn_closed
 transcript_update
+transcript_finalized
 ```
+
+`transcript_committed` is the authoritative controller-facing text for one turn and is emitted before `turn_closed`. Closed turn text is immutable. `transcript_finalized` and any late transcript updates are diagnostic-only and must not rewrite operator/controller conversation state.
 
 quick latest-session sketch:
 
