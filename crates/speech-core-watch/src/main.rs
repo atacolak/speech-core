@@ -525,16 +525,34 @@ impl TuiModel {
                 self.clear_live_timers();
                 self.note_event(value, format!("turn closed by {source}"));
             }
+            "speech_out_request_queued" if self.speech_out_ui => {
+                let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let idx = self.last_turn_for_output();
+                self.turns[idx].outputs.push(SpeechOutLine {
+                    text: text.trim().to_owned(),
+                    chunks: Vec::new(),
+                    glyphs: vec!["⏳".to_owned()],
+                });
+                self.note_event(value, "speech-out request queued".to_owned());
+            }
             "speech_out_request_received" if self.speech_out_ui => {
                 let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let idx = self.last_turn_for_output();
                 if !text.trim().is_empty() {
-                    let idx = self.last_turn_for_output();
-                    self.turns[idx].outputs.push(SpeechOutLine {
-                        text: text.trim().to_owned(),
-                        chunks: Vec::new(),
-                        glyphs: vec!["⇢".to_owned()],
+                    let needs_new_output = self.turns[idx].outputs.last().is_none_or(|output| {
+                        !output.text.trim().is_empty() && output.text != text.trim()
                     });
+                    if needs_new_output {
+                        self.turns[idx].outputs.push(SpeechOutLine {
+                            text: text.trim().to_owned(),
+                            chunks: Vec::new(),
+                            glyphs: Vec::new(),
+                        });
+                    } else if let Some(output) = self.turns[idx].outputs.last_mut() {
+                        output.text = text.trim().to_owned();
+                    }
                 }
+                self.push_output_glyph(idx, "⇢");
                 let mut note = "speech-out request received".to_owned();
                 if let Some(num_chunks) = value.get("num_chunks").and_then(|v| v.as_u64()) {
                     note.push_str(&format!(" — {num_chunks} text chunks"));
@@ -574,6 +592,27 @@ impl TuiModel {
                 }
                 self.note_event(value, note);
             }
+            "speech_out_text_chunk_started" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                let chunk = value
+                    .get("text_chunk_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default()
+                    + 1;
+                let count = value
+                    .get("text_chunk_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                self.push_output_glyph(idx, "…");
+                if count > 0 {
+                    self.note_event(
+                        value,
+                        format!("speech-out text chunk {chunk}/{count} started"),
+                    );
+                } else {
+                    self.note_event(value, format!("speech-out text chunk {chunk} started"));
+                }
+            }
             "speech_out_audio_chunk" if self.speech_out_ui => {
                 let idx = self.last_turn_for_output();
                 let seq = value
@@ -595,6 +634,33 @@ impl TuiModel {
                     }
                     self.note_event(value, note);
                 }
+            }
+            "speech_out_text_chunk_completed" if self.speech_out_ui => {
+                let chunk = value
+                    .get("text_chunk_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default()
+                    + 1;
+                let count = value
+                    .get("text_chunk_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let bytes = value
+                    .get("bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                let mut note = if count > 0 {
+                    format!("speech-out text chunk {chunk}/{count} completed: {bytes}b")
+                } else {
+                    format!("speech-out text chunk {chunk} completed: {bytes}b")
+                };
+                if let Some(ms) = value
+                    .get("text_chunk_synthesis_duration_ms")
+                    .and_then(|v| v.as_f64())
+                {
+                    note.push_str(&format!(" ({ms:.1}ms)"));
+                }
+                self.note_event(value, note);
             }
             "speech_out_completed" if self.speech_out_ui => {
                 let idx = self.last_turn_for_output();
@@ -619,6 +685,30 @@ impl TuiModel {
                 }
                 self.note_event(value, note);
             }
+            "speech_out_diagnostic_terminal" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                let outcome = value
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                match outcome {
+                    "completed" => self.push_output_glyph(idx, "✓"),
+                    "cancelled" => self.push_output_glyph(idx, "⏹"),
+                    "failed" => self.push_output_glyph(idx, "✗"),
+                    _ => self.push_output_glyph(idx, "?"),
+                }
+                let mut note = format!("speech-out terminal: {outcome}");
+                if let Some(ms) = value.get("e2e_ms").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(" e2e={ms:.1}ms"));
+                }
+                if let Some(ms) = value.get("first_audio_ms").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(" first-audio={ms:.1}ms"));
+                }
+                if let Some(ms) = value.get("cancel_latency_ms").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(" cancel={ms:.1}ms"));
+                }
+                self.note_event(value, note);
+            }
 
             "speech_out_skipped" if self.speech_out_ui => {
                 let reason = value
@@ -634,7 +724,7 @@ impl TuiModel {
                     .unwrap_or("transcript");
                 self.note_event(value, format!("speech-out self-echo suppressed: {context}"));
             }
-            "speech_out_barge_in" if self.speech_out_ui => {
+            "speech_out_barge_in" | "speech_out_cancel_requested" if self.speech_out_ui => {
                 if let Some(idx) = self.turns.len().checked_sub(1) {
                     if !self.turns[idx].outputs.is_empty() {
                         self.push_output_glyph(idx, "⏹");
@@ -642,12 +732,19 @@ impl TuiModel {
                 }
                 let trigger = value
                     .get("trigger")
+                    .or_else(|| value.get("reason"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("user_speech");
-                self.note_event(
-                    value,
-                    format!("speech-out cancelled by barge-in: {trigger}"),
-                );
+                self.note_event(value, format!("speech-out cancel requested: {trigger}"));
+            }
+            "speech_out_cancel_ack" | "speech_out_cancel_acknowledged" if self.speech_out_ui => {
+                let idx = self.last_turn_for_output();
+                self.push_output_glyph(idx, "⏹");
+                let mut note = "speech-out cancel acknowledged".to_owned();
+                if let Some(ms) = value.get("cancel_latency_ms").and_then(|v| v.as_f64()) {
+                    note.push_str(&format!(" ({ms:.1}ms)"));
+                }
+                self.note_event(value, note);
             }
             "speech_out_playback_started" if self.speech_out_ui => {
                 let seq = value
@@ -655,6 +752,16 @@ impl TuiModel {
                     .and_then(|v| v.as_u64())
                     .unwrap_or_default();
                 self.note_event(value, format!("speech-out playback started: chunk {seq}"));
+            }
+            "speech_out_playback_ready" | "speech_out_playback_gate_released"
+                if self.speech_out_ui =>
+            {
+                let seq = value
+                    .get("playback_seq")
+                    .or_else(|| value.get("text_chunk_index"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
+                self.note_event(value, format!("speech-out playback ready: chunk {seq}"));
             }
             "speech_out_playback_completed" if self.speech_out_ui => {
                 let seq = value
@@ -824,7 +931,7 @@ impl TuiModel {
         out.push_str("glyphs  ◖ speech  ◗ pause  ①②③④ semantic checks  ◆ close  ↺ resume  · wait  ◇ unresolved/fallback\n");
         if self.speech_out_ui {
             out.push_str(
-                "output  ⇢ request  ✂ chunked  ⌁ synth  ▣ first-audio  ✓ done  ✗ failed\n",
+                "output  ⏳ queued  ⇢ request  ✂ chunked  ⌁ synth  … text-chunk  ▣ first-audio  ⏹ cancel  ✓ done  ✗ failed\n",
             );
             if let Some(params) = &self.speech_out_params {
                 out.push_str(params);
@@ -1869,6 +1976,8 @@ fn samples_to_ms(sample: u64) -> u64 {
 
 fn event_mono_ns(value: &Value) -> Option<u64> {
     [
+        "diagnostic_mono_ns",
+        "client_mono_ns",
         "daemon_mono_ns",
         "ingress_receive_mono_ns",
         "detector_end_mono_ns",
@@ -2192,5 +2301,51 @@ mod tests {
         );
         assert!(model.live_fallback_bar.is_empty());
         assert!(model.live_hold_bar.is_empty());
+    }
+
+    #[test]
+    fn speech_out_replay_renders_output_only_cancel_terminal() {
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_queued","utterance_id":"u","diagnostic_mono_ns":1_000_000_000_u64,"text":"hello output diagnostics"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_received","utterance_id":"u","diagnostic_mono_ns":1_004_000_000_u64,"text":"hello output diagnostics","num_chunks":1}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_text_chunks","utterance_id":"u","diagnostic_mono_ns":1_005_000_000_u64,"chunks":["hello output diagnostics"]}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_synthesis_started","utterance_id":"u","diagnostic_mono_ns":1_020_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_text_chunk_started","utterance_id":"u","diagnostic_mono_ns":1_030_000_000_u64,"text_chunk_index":0,"text_chunk_count":1}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_audio_chunk","utterance_id":"u","diagnostic_mono_ns":1_085_000_000_u64,"seq":0,"text_chunk_index":0,"bytes":2048}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_cancel_requested","utterance_id":"u","diagnostic_mono_ns":1_090_000_000_u64,"reason":"test"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_cancel_acknowledged","utterance_id":"u","diagnostic_mono_ns":1_100_000_000_u64,"cancel_latency_ms":10.0}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_diagnostic_terminal","utterance_id":"u","diagnostic_mono_ns":1_101_000_000_u64,"outcome":"cancelled","e2e_ms":101.0,"first_audio_ms":85.0,"cancel_latency_ms":10.0}),
+        );
+        let rendered = model.render(true);
+        assert!(rendered.contains("⏳ ⇢ ✂ ⌁ … ▣ ⏹ \"hello output diagnostics\""));
+        assert!(rendered.contains(
+            "speech-out terminal: cancelled e2e=101.0ms first-audio=85.0ms cancel=10.0ms"
+        ));
     }
 }

@@ -148,6 +148,11 @@ usage: speech-out-live-session [--debug-tui|--tui|--transcript|--jsonl|--mode MO
 Developer harness: reuse the speech-core live mic/session behavior and the same debug TUI, subscribe to speech-in turn_closed events, then append/trigger a short speech-out response (default: "heard you."). Defaults to --debug-tui because this is the useful diagnostic surface for testing the end-to-end speech loop.
 
 Expected topology: speech-core daemon and speech-out daemon run on the server; this laptop/client script streams mic audio and plays speech-out websocket chunks locally.
+
+For deterministic output-only diagnostics that bypass mic/VAD/ASR and canned turn replies, use:
+  scripts/speech-out-diagnostics.py mock --fixture chunked --jsonl-out /tmp/speech-out.jsonl
+  cargo run -p speech-core-watch -- --replay-events /tmp/speech-out.jsonl --speech-out-ui --mode debug
+  scripts/speech-out-diagnostics.py run --fixture chunked --url ws://<server>:8788/ws/speech-out
 EOF_HELP
       exit 0
       ;;

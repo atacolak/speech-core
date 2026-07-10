@@ -105,7 +105,9 @@ Daemon text events intentionally mirror speech-in observability style:
 
 ```text
 speech_out_request_received
+speech_out_text_chunks
 speech_out_synthesis_started
+speech_out_text_chunk_started
 speech_out_audio_chunk      # followed by one websocket binary chunk containing WAV bytes
 speech_out_text_chunk_completed
 speech_out_completed
@@ -116,11 +118,48 @@ speech_out_playback_completed  # client-side event from speech-out play
 speech_out_playback_failed     # client-side event from speech-out play
 ```
 
+The output-only diagnostic supervisor adds local/replay-only events around that stream: `speech_out_request_queued`, `speech_out_playback_ready`, `speech_out_cancel_requested`, `speech_out_cancel_acknowledged`, and `speech_out_diagnostic_terminal`. These are observability events for diagnostics and TUI replay; they do not change the speech-out daemon protocol.
+
 `streaming_mode=text_chunked_http_responses` means the daemon splits text into pragmatic chunks and sends one Supertonic `/v1/tts` request per text chunk. Within a single text chunk, Supertonic still buffers internally until it can return WAV bytes; first-audio latency is therefore bounded by the first text chunk, not the entire paragraph. The client queues completed chunk WAVs and plays them in order.
+
+## output-only diagnostics and replay
+
+Use `scripts/speech-out-diagnostics.py` when testing the output seam by itself. It deliberately bypasses microphone ingress, VAD, ASR, smart-turn, and the live-session canned `turn_closed -> heard you` integration. The tool feeds scripted text fixtures directly to `speech-out play` or emits deterministic mock events with no daemon/audio backend.
+
+Deterministic mock/replay mode for reducer/TUI tests:
+
+```bash
+./scripts/speech-out-diagnostics.py mock \
+  --fixture chunked \
+  --jsonl-out /tmp/speech-out-diag.jsonl
+
+cargo run -p speech-core-watch -- \
+  --replay-events /tmp/speech-out-diag.jsonl \
+  --speech-out-ui \
+  --mode debug
+```
+
+Output-only live mode against a speech-out daemon, defaulting playback to `true` so it observes synthesis/chunk flow without requiring an audio device:
+
+```bash
+./scripts/speech-out-diagnostics.py run \
+  --fixture chunked \
+  --url ws://<server-address>:8788/ws/speech-out
+```
+
+Useful knobs:
+
+- `--fixture short|chunked|barge` or repeated `--text 'literal fixture'` selects scripted text.
+- `--chunk-min-chars` / `--chunk-max-chars` make chunking behavior visible.
+- `--cancel-after-ms N` requests deterministic supervisor cancellation and reports cancel latency.
+- `--jsonl-out PATH` writes the combined diagnostic/speech-out event stream for replay.
+- `--play-command true` is the default for diagnostics; override with `pw-play` only when intentionally testing local audio playback.
+
+The diagnostic timeline uses this supervisor process' monotonic clock (`diagnostic_mono_ns`) for all displayed deltas. It renders unambiguous state transitions for request queued, request received, synthesis start, first audio, per-text-chunk start/completion, playback start/ready/end, cancel requested/acknowledged, and terminal completed/failed/cancelled outcome. The summary always includes end-to-end and first-audio latency; cancelled runs also include cancel latency.
 
 ## developer live-session harness
 
-`scripts/speech-out-live-session.sh` reuses the speech-core live microphone/session pattern. It streams mic audio through `speech-core-mic-adapter`, feeds speech-in events plus speech-out events through the same `speech-core-watch --mode debug` TUI, watches for speech-in `turn_closed`, and triggers/appends a short speech-out response (default `heard you.`) through the speech-out websocket daemon:
+`scripts/speech-out-live-session.sh` remains the end-to-end speech loop harness. It reuses the speech-core live microphone/session pattern, streams mic audio through `speech-core-mic-adapter`, feeds speech-in events plus speech-out events through the same `speech-core-watch --mode debug` TUI, watches for speech-in `turn_closed`, and triggers/appends a short speech-out response (default `heard you.`) through the speech-out websocket daemon:
 
 ```bash
 SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress \
