@@ -17,6 +17,7 @@ Covers:
 
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -623,19 +624,134 @@ class TestFormatting(unittest.TestCase):
 
 
 class TestDelegation(unittest.TestCase):
-    """Delegation stubs return correct exit codes."""
+    """Delegation to speech-core-golden-assert propagates correctly."""
 
-    def test_capture_delegated(self):
+    def test_build_assert_args_string(self):
         class FakeArgs:
-            pass
-        code = golden.delegation_stub("capture", FakeArgs())
+            url = "ws://localhost:8765/ws"
+            stream_session_id = "test-session"
+            out = None
+            timeout_ms = None
+            adapter_cmd = None
+            adapter_cwd = None
+        result = golden._build_assert_args(FakeArgs(), ["url", "stream_session_id", "out", "timeout_ms", "adapter_cmd", "adapter_cwd"])
+        self.assertIn("--url", result)
+        self.assertIn("ws://localhost:8765/ws", result)
+        self.assertIn("--stream-session-id", result)
+        self.assertIn("test-session", result)
+        self.assertNotIn("--out", result)  # None → skipped
+
+    def test_build_assert_args_list(self):
+        class FakeArgs:
+            adapter_cmd = ["sox", "-d"]
+            url = None
+            stream_session_id = None
+            out = None
+            timeout_ms = None
+            adapter_cwd = None
+        result = golden._build_assert_args(FakeArgs(), ["url", "stream_session_id", "out", "timeout_ms", "adapter_cmd", "adapter_cwd"])
+        self.assertIn("--adapter-cmd", result)
+        self.assertIn("sox", result)
+        self.assertIn("-d", result)
+
+    def test_capture_delegation_runs_assert_script(self):
+        """Verify that capture delegation invokes the assert script subprocess."""
+        # Test with --help to avoid needing a live daemon
+        result = golden.delegate_to_assert("capture", ["--help"])
+        self.assertEqual(result, 0)
+
+    def test_assert_delegation_runs_assert_script(self):
+        """Verify that assert delegation invokes the assert script subprocess."""
+        result = golden.delegate_to_assert("assert", ["--help"])
+        self.assertEqual(result, 0)
+
+    def test_run_delegation_runs_assert_script(self):
+        """Verify that run delegation invokes the assert script subprocess."""
+        result = golden.delegate_to_assert("run", ["--help"])
+        self.assertEqual(result, 0)
+
+    def test_test_delegation_runs_assert_script_tests(self):
+        """End-to-end: delegate test command runs the 24 mock assertion tests."""
+        result = golden.delegate_to_assert("test", [])
+        self.assertEqual(result, 0)
+
+
+class TestDelete(unittest.TestCase):
+    """Delete with tombstone, dry-run, and metadata retention."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_delete_missing_dir(self):
+        class FakeArgs:
+            run = "/nonexistent/path"
+            scenario = "test"
+            dry_run = False
+            purge_audio = True
+        code = golden.delegate_delete(FakeArgs())
+        self.assertEqual(code, golden.ExitCode.SCENARIO_NOT_FOUND)
+
+    def test_delete_requires_purge_audio(self):
+        run_dir = Path(self.tmp) / "run"
+        run_dir.mkdir()
+        class FakeArgs:
+            run = str(run_dir)
+            scenario = "test"
+            dry_run = False
+            purge_audio = False
+        code = golden.delegate_delete(FakeArgs())
         self.assertEqual(code, golden.ExitCode.INTERNAL_ERROR)
 
-    def test_assert_delegated(self):
+    def test_delete_dry_run_no_wav(self):
+        run_dir = Path(self.tmp) / "run"
+        run_dir.mkdir()
         class FakeArgs:
-            pass
-        code = golden.delegation_stub("assert", FakeArgs())
-        self.assertEqual(code, golden.ExitCode.INTERNAL_ERROR)
+            run = str(run_dir)
+            scenario = "test"
+            dry_run = True
+            purge_audio = True
+        code = golden.delegate_delete(FakeArgs())
+        self.assertEqual(code, golden.ExitCode.PASS)
+
+    def test_delete_dry_run_with_wav(self):
+        run_dir = Path(self.tmp) / "run"
+        run_dir.mkdir()
+        wav_path = run_dir / "audio.wav"
+        samples = golden._generate_silence(100)
+        golden.write_wav(wav_path, samples)
+        class FakeArgs:
+            run = str(run_dir)
+            scenario = "test"
+            dry_run = True
+            purge_audio = True
+        code = golden.delegate_delete(FakeArgs())
+        self.assertEqual(code, golden.ExitCode.PASS)
+        self.assertTrue(wav_path.exists())  # dry-run preserves
+
+    def test_delete_purges_wav_and_writes_tombstone(self):
+        run_dir = Path(self.tmp) / "run"
+        run_dir.mkdir()
+        wav_path = run_dir / "audio.wav"
+        samples = golden._generate_silence(100)
+        golden.write_wav(wav_path, samples)
+        class FakeArgs:
+            run = str(run_dir)
+            scenario = "test"
+            dry_run = False
+            purge_audio = True
+        code = golden.delegate_delete(FakeArgs())
+        self.assertEqual(code, golden.ExitCode.PASS)
+        self.assertFalse(wav_path.exists())
+        tombstone = run_dir / "delete-tombstone.json"
+        self.assertTrue(tombstone.exists())
+        with open(tombstone) as f:
+            data = json.load(f)
+        self.assertEqual(data["operation"], "delete")
+        self.assertEqual(len(data["purged_files"]), 1)
+        self.assertTrue(data["sha256_tombstone"])
 
 
 class TestJSONManifestLoading(unittest.TestCase):

@@ -1330,16 +1330,122 @@ def promote_take(take_dir: Path, dest_dir: Path, dry_run: bool = False) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Delegation stubs for sibling-owned commands
+# Delegation to speech-core-golden-assert
 # ═══════════════════════════════════════════════════════════════════
 
-def delegation_stub(command: str, args: argparse.Namespace) -> int:
-    """Signal that this command is delegated to a sibling owner."""
-    print(f"[DELEGATED] '{command}' is owned by a sibling component.", file=sys.stderr)
-    print(f"            This CLI provides the interface only.", file=sys.stderr)
-    print(f"            Implementation: capture/event subscription and semantic", file=sys.stderr)
-    print(f"            assertion evaluation belong to sibling ownership.", file=sys.stderr)
-    return ExitCode.INTERNAL_ERROR
+_ASSERT_SCRIPT = Path(__file__).resolve().parent / "speech-core-golden-assert.py"
+
+
+def _build_assert_args(args: argparse.Namespace, keys: List[str]) -> List[str]:
+    """Build CLI argument list for delegation, converting underscore keys to dash-prefixed args."""
+    result: List[str] = []
+    for key in keys:
+        value = getattr(args, key, None)
+        if value is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                result.append(flag)
+        elif isinstance(value, list):
+            result.append(flag)
+            result.extend(str(v) for v in value)
+        else:
+            result.append(flag)
+            result.append(str(value))
+    return result
+
+
+def delegate_to_assert(cmd: str, cli_args: List[str]) -> int:
+    """Delegate a command to speech-core-golden-assert.py via subprocess.
+
+    Propagates exact exit codes and stdout/stderr.
+    """
+    argv = [sys.executable, str(_ASSERT_SCRIPT), cmd] + cli_args
+    result = subprocess.run(argv)
+    return result.returncode
+
+
+def delegate_delete(args: argparse.Namespace) -> int:
+    """Safe audio purge: deletes WAV file(s) while retaining metadata/hash/tombstone.
+
+    Implements consent/privacy-record-aware deletion:
+    - Preserves JSON metadata, provenance, consent, and review files.
+    - Writes a tombstone record when audio is purged.
+    - Supports --dry-run for safety inspection.
+    - Requires explicit --purge-audio flag.
+    """
+    run_dir = Path(args.run) if args.run else None
+    if not run_dir or not run_dir.exists():
+        print(f"Run directory not found: {run_dir}", file=sys.stderr)
+        return ExitCode.SCENARIO_NOT_FOUND
+
+    scenario_id = args.scenario or "unknown"
+    dry_run = args.dry_run
+    purge_audio = args.purge_audio
+
+    if not purge_audio:
+        print("delete: --purge-audio is required to remove audio files.", file=sys.stderr)
+        print("        Use --dry-run first to inspect what would be deleted.", file=sys.stderr)
+        return ExitCode.INTERNAL_ERROR
+
+    # Collect WAV files
+    wav_files = sorted(run_dir.rglob("*.wav"))
+    if not wav_files:
+        print(f"No WAV files found in {run_dir}")
+        return ExitCode.PASS
+
+    tombstone = {
+        "operation": "delete",
+        "scenario_id": scenario_id,
+        "run_dir": str(run_dir),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "purged_files": [],
+        "retained_metadata": [],
+        "sha256_tombstone": True,
+    }
+
+    for wav_path in wav_files:
+        wav_hash = sha256_file(wav_path)
+        entry = {
+            "path": str(wav_path),
+            "wav_sha256": wav_hash,
+            "size_bytes": wav_path.stat().st_size,
+        }
+        tombstone["purged_files"].append(entry)
+
+        # Record retained metadata files alongside
+        for sibling in sorted(wav_path.parent.glob("*.json")):
+            rel = str(sibling.relative_to(run_dir))
+            if rel not in tombstone["retained_metadata"]:
+                tombstone["retained_metadata"].append(rel)
+
+    if dry_run:
+        print(f"[DRY-RUN] Would purge {len(wav_files)} WAV file(s) from {run_dir}:")
+        for entry in tombstone["purged_files"]:
+            print(f"  {entry['path']}  ({entry['size_bytes']} bytes, sha256={entry['wav_sha256'][:12]}…)")
+        print(f"[DRY-RUN] Metadata files retained: {len(tombstone['retained_metadata'])}")
+        tombstone_path = run_dir / "delete-tombstone.json"
+        print(f"[DRY-RUN] Would write tombstone: {tombstone_path}")
+        return ExitCode.PASS
+
+    # Purge audio
+    purged = 0
+    for entry in tombstone["purged_files"]:
+        path = Path(entry["path"])
+        if path.exists():
+            path.unlink()
+            purged += 1
+
+    # Write tombstone
+    tombstone_path = run_dir / "delete-tombstone.json"
+    with open(tombstone_path, "w") as f:
+        json.dump(tombstone, f, indent=2)
+
+    print(f"Purged {purged} WAV file(s) from {run_dir}")
+    print(f"Tombstone written: {tombstone_path}")
+    print(f"Metadata retained: {len(tombstone['retained_metadata'])} file(s)")
+    return ExitCode.PASS
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1488,25 +1594,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_syn.add_argument("--seed", type=int, help="Override generator seed")
     p_syn.add_argument("--dry-run", action="store_true", help="Dry-run (print plan, no WAV)")
 
-    # ── capture (delegated) ──
-    p_cap = sub.add_parser("capture", help="[DELEGATED] Subscribe, replay WAV, wait for terminal markers")
-    p_cap.add_argument("--manifest", help="Path to manifest file")
-    p_cap.add_argument("--profile", help="Profile name")
-    p_cap.add_argument("--scenario", help="Scenario ID")
-    p_cap.add_argument("--wav", help="Path to WAV file")
-    p_cap.add_argument("--url", help="WebSocket URL")
-    p_cap.add_argument("--out", help="Output directory")
+    # ── capture ──
+    p_cap = sub.add_parser("capture", help="Subscribe, replay WAV, wait for terminal markers")
+    p_cap.add_argument("--url", default="ws://127.0.0.1:8765/ws/audio-ingress", help="WebSocket URL")
+    p_cap.add_argument("--stream-session-id", help="Unique stream session id")
+    p_cap.add_argument("--out", help="Output directory for event-stream.jsonl")
+    p_cap.add_argument("--timeout-ms", type=int, default=30000, help="Capture timeout in ms")
+    p_cap.add_argument("--adapter-cmd", nargs="*", help="Optional adapter command to spawn")
+    p_cap.add_argument("--adapter-cwd", help="Working dir for adapter")
+    p_cap.add_argument("--manifest", help="(ignored, forwarded for CLI compat)")
+    p_cap.add_argument("--scenario", help="(ignored, forwarded for CLI compat)")
 
-    # ── assert (delegated) ──
-    p_asr = sub.add_parser("assert", help="[DELEGATED] Run assertion DSL against captured artifacts")
+    # ── assert ──
+    p_asr = sub.add_parser("assert", help="Run assertion DSL against captured artifacts")
     p_asr.add_argument("--scenario-dir", help="Path to scenario take directory")
+    p_asr.add_argument("--assertion-dsl", help="Path to assertion DSL YAML/JSON file")
+    p_asr.add_argument("--stream-session-id", help="Expected stream session id")
+    p_asr.add_argument("--wav-hash", help="Expected WAV SHA-256")
+    p_asr.add_argument("--config-hash", help="Expected config SHA-256")
 
-    # ── run (delegated) ──
-    p_run = sub.add_parser("run", help="[DELEGATED] Run synth/capture/assert for non-human scenarios")
-    p_run.add_argument("--manifest", help="Path to manifest file")
-    p_run.add_argument("--profile", help="Profile name")
-    p_run.add_argument("--priority", help="Priority filter (mvp, exhaustive)")
+    # ── run ──
+    p_run = sub.add_parser("run", help="Combined capture + assert")
+    p_run.add_argument("--url", default="ws://127.0.0.1:8765/ws/audio-ingress", help="WebSocket URL")
+    p_run.add_argument("--stream-session-id", help="Unique stream session id")
     p_run.add_argument("--out", help="Output directory")
+    p_run.add_argument("--timeout-ms", type=int, default=30000, help="Capture timeout in ms")
+    p_run.add_argument("--assertion-dsl", help="Assertion DSL file")
+    p_run.add_argument("--wav-hash", help="Expected WAV SHA-256")
+    p_run.add_argument("--config-hash", help="Expected config SHA-256")
 
     # ── promote ──
     p_pro = sub.add_parser("promote", help="Promote accepted take to repo fixture")
@@ -1514,11 +1629,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pro.add_argument("--dest", required=True, help="Destination fixture directory")
     p_pro.add_argument("--dry-run", action="store_true", help="Dry-run mode")
 
-    # ── delete (delegated) ──
-    p_del = sub.add_parser("delete", help="[DELEGATED] Delete human audio per retention policy")
+    # ── delete ──
+    p_del = sub.add_parser("delete", help="Delete human audio per retention policy (retains metadata)")
     p_del.add_argument("--run", help="Run directory")
     p_del.add_argument("--scenario", help="Scenario ID")
     p_del.add_argument("--purge-audio", action="store_true", help="Purge audio files")
+    p_del.add_argument("--dry-run", action="store_true", help="Dry-run mode")
 
     # ── quarantine-legacy ──
     p_leg = sub.add_parser("quarantine-legacy", help="Quarantine legacy eight fixtures with explicit disposition")
@@ -1597,17 +1713,20 @@ def main() -> None:
         )
         sys.exit(code)
 
-    # ── capture (delegated) ──
+    # ── capture ──
     elif command == "capture":
-        sys.exit(delegation_stub("capture", args))
+        cli_args = _build_assert_args(args, ["url", "stream_session_id", "out", "timeout_ms", "adapter_cmd", "adapter_cwd"])
+        sys.exit(delegate_to_assert("capture", cli_args))
 
-    # ── assert (delegated) ──
+    # ── assert ──
     elif command == "assert":
-        sys.exit(delegation_stub("assert", args))
+        cli_args = _build_assert_args(args, ["scenario_dir", "assertion_dsl", "stream_session_id", "wav_hash", "config_hash"])
+        sys.exit(delegate_to_assert("assert", cli_args))
 
-    # ── run (delegated) ──
+    # ── run ──
     elif command == "run":
-        sys.exit(delegation_stub("run", args))
+        cli_args = _build_assert_args(args, ["url", "stream_session_id", "out", "timeout_ms", "assertion_dsl", "wav_hash", "config_hash"])
+        sys.exit(delegate_to_assert("run", cli_args))
 
     # ── promote ──
     elif command == "promote":
@@ -1616,9 +1735,9 @@ def main() -> None:
         code = promote_take(take_dir, dest_dir, dry_run=args.dry_run)
         sys.exit(code)
 
-    # ── delete (delegated) ──
+    # ── delete ──
     elif command == "delete":
-        sys.exit(delegation_stub("delete", args))
+        sys.exit(delegate_delete(args))
 
     # ── quarantine-legacy ──
     elif command == "quarantine-legacy":
