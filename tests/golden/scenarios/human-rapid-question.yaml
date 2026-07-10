@@ -1,0 +1,47 @@
+# human-rapid-question
+# Short complete question.
+scenario_id: human-rapid-question
+class: natural_endpoint
+construction: human-recorded
+priority: mvp
+
+prompt: "What time is it right now?"
+
+cues:
+  - band_ms: [0, 3000]
+    label: READY
+    visual: "Prepare a quick natural question."
+  - band_ms: [3000, 5500]
+    label: SPEAK
+    visual: "Say: What time is it right now?"
+  - band_ms: [5500, 7500]
+    label: STOP
+    visual: "Stay quiet."
+
+expected_timing:
+  speech_band_ms: [3000, 5500]
+  silence_band_ms: [5500, 7500]
+
+quality_bounds:
+  max_clipped_samples: 0
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+
+assertions:
+  dsl_version: 1
+  require:
+    - event: turn_closed
+      count: 1
+      where:
+        source: smart_turn
+        preferred: true
+  forbid:
+    - event: turn_closed
+      where:
+        source: session_end
+  invariants:
+    - balanced_turns
+    - monotonic_audio_seq
+
+allowed_close_sources:
+  - smart_turn

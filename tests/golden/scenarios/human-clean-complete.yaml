@@ -1,0 +1,48 @@
+# human-clean-complete
+# Ordinary complete utterance — smart_turn close expected.
+scenario_id: human-clean-complete
+class: natural_endpoint
+construction: human-recorded
+priority: mvp
+
+prompt: "The weather looks great today. I think I will go outside."
+
+cues:
+  - band_ms: [0, 3000]
+    label: READY
+    visual: "Read silently. Breathe normally."
+  - band_ms: [3000, 9000]
+    label: SPEAK
+    visual: "Say: The weather looks great today. I think I will go outside."
+  - band_ms: [9000, 11000]
+    label: STOP
+    visual: "Stay quiet, then stop."
+
+expected_timing:
+  speech_band_ms: [3000, 9000]
+  silence_band_ms: [9000, 11000]
+
+quality_bounds:
+  max_clipped_samples: 0
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+
+assertions:
+  dsl_version: 1
+  require:
+    - event: turn_closed
+      count: 1
+      where:
+        source: smart_turn
+        degraded: false
+  forbid:
+    - event: turn_closed
+      where:
+        source: session_end
+  invariants:
+    - balanced_turns
+    - monotonic_audio_seq
+
+allowed_close_sources:
+  - smart_turn
+  - vad_acoustic_fallback

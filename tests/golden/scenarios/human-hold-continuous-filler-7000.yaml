@@ -1,0 +1,56 @@
+# human-hold-continuous-filler-7000
+# Sustained non-word vocalization, human-hold close expected.
+scenario_id: human-hold-continuous-filler-7000
+class: natural_endpoint
+construction: human-recorded
+priority: exhaustive
+
+prompt: "Sustain a non-word thinking sound, like uhhhh, without saying recognizable words."
+
+cues:
+  - band_ms: [0, 3000]
+    label: READY
+    visual: "Prepare to sustain a non-word vocalization."
+  - band_ms: [3000, 11200]
+    label: HOLD
+    visual: "Hold: uhhhh / thinking hum. No words."
+  - band_ms: [11200, 13000]
+    label: STOP
+    visual: "Stop and stay quiet."
+
+expected_timing:
+  hold_band_ms: [3000, 11200]
+  silence_band_ms: [11200, 13000]
+
+quality_bounds:
+  max_clipped_samples: 0
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+
+assertions:
+  dsl_version: 1
+  require:
+    - event: turn_human_hold
+      where:
+        reason: speech_like_audio_without_tokens
+    - event: turn_closed
+      count: 1
+      where:
+        source: human_hold
+  invariants:
+    - balanced_turns
+    - monotonic_audio_seq
+  # After forced close, no new turn until low-release interval
+  sample_window:
+    - name: no_close_before_hold
+      forbid_event: turn_closed
+      window: [0, 7000]
+    - name: force_close_on_hold
+      event: turn_closed
+      field: decision_sample
+      min_from: 7000ms
+  rearm:
+    require_low_release_after_forced_close: true
+
+allowed_close_sources:
+  - human_hold

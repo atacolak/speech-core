@@ -1,0 +1,53 @@
+# golden-mvp profile
+# Required terminal markers for capture validation.
+profile_id: golden-mvp
+version: 1
+description: >
+  MVP golden profile with ASR, VAD, Smart Turn, and turn manager enabled.
+  Installed fallback at 1700ms. Used for golden capture validation.
+
+components:
+  asr: true
+  vad: true
+  smart_turn: true
+  turn_manager: true
+  eou_model: false
+
+effective_config:
+  sample_rate_hz: 16000
+  channels: 1
+  sample_format: pcm_s16le
+
+  # VAD settings
+  vad_threshold: 0.5
+  vad_hangover_frames: 3
+  vad_smoothing_alpha: 0.1
+  vad_stop_threshold: 0.2
+  vad_fallback_threshold: 0.1
+  vad_acoustic_fallback_silence_ms: 1700
+  turn_min_vad_speech_ms: 400
+  turn_vad_close_enabled: true
+
+  # Smart Turn
+  smart_turn_threshold: 0.5
+  smart_turn_timeout_ms: 250
+  smart_turn_recheck_offsets_ms: [96, 192, 384, 768, 1536]
+
+  # Hold / EOU
+  turn_human_hold_silence_ms: 7000
+  turn_model_eou_close_enabled: false
+
+required_terminal_markers:
+  - event: vad_session_end
+  - event: turn_session_end
+  - event: smart_turn_session_end
+  - event: model_chunk_processed
+    where:
+      is_final: true
+
+quality_checks:
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+  max_clipped_samples: 0
+  min_duration_ms: 100
+  require_nonzero_audio: true

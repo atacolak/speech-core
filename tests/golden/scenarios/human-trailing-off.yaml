@@ -1,0 +1,62 @@
+# human-trailing-off
+# Trailing-off endpointing and conservative fallback.
+scenario_id: human-trailing-off
+class: natural_endpoint
+construction: human-recorded
+priority: mvp
+
+prompt: "I was going to say something about the... actually, never mind."
+
+cues:
+  - band_ms: [0, 3000]
+    label: READY
+    visual: "Prepare to trail off naturally at the ellipsis."
+  - band_ms: [3000, 11000]
+    label: SPEAK
+    visual: "Say the line, trailing off before actually never mind."
+  - band_ms: [11000, 13000]
+    label: STOP
+    visual: "Stay quiet."
+
+expected_timing:
+  speech_band_ms: [3000, 11000]
+  silence_band_ms: [11000, 13000]
+  trailing_uncertainty: true
+
+quality_bounds:
+  max_clipped_samples: 0
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+
+assertions:
+  dsl_version: 1
+  require:
+    - event: turn_closed
+      count: 1
+  forbid:
+    - event: turn_closed
+      where:
+        source: session_end
+  invariants:
+    - balanced_turns
+    - monotonic_audio_seq
+  # Allow smart_turn if complete or vad_acoustic_fallback if incomplete
+  require_any:
+    - event: turn_closed
+      where:
+        source: smart_turn
+        degraded: false
+    - event: turn_closed
+      where:
+        source: vad_acoustic_fallback
+        degraded: true
+  # Must have incomplete decision evidence
+  require:
+    - event: smart_turn_decision
+      where:
+        complete: false
+      count_at_least: 1
+
+allowed_close_sources:
+  - smart_turn
+  - vad_acoustic_fallback

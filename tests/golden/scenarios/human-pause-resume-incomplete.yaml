@@ -1,0 +1,69 @@
+# human-pause-resume-incomplete
+# Smart Turn recheck cancellation and no premature turn split.
+scenario_id: human-pause-resume-incomplete
+class: natural_endpoint
+construction: human-recorded
+priority: mvp
+
+prompt: "I need to check... one more thing before I answer."
+
+cues:
+  - band_ms: [0, 3000]
+    label: READY
+    visual: "Prepare for a real pause."
+  - band_ms: [3000, 5200]
+    label: SPEAK
+    visual: "Say: I need to check"
+  - band_ms: [5200, 6800]
+    label: PAUSE
+    visual: "Pause silently. Do not breathe loudly into mic."
+  - band_ms: [6800, 10500]
+    label: RESUME
+    visual: "Say: one more thing before I answer."
+  - band_ms: [10500, 12500]
+    label: STOP
+    visual: "Stay quiet."
+
+expected_timing:
+  speech_band_ms: [[3000, 5200], [6800, 10500]]
+  pause_band_ms: [5200, 6800]
+  # Observed pause must be 800-1600ms
+  pause_duration_ms: [800, 1600]
+
+quality_bounds:
+  max_clipped_samples: 0
+  min_peak_dbfs: -24.0
+  max_peak_dbfs: 0.0
+
+assertions:
+  dsl_version: 1
+  require:
+    - event: turn_closed
+      count: 1
+  forbid:
+    - event: turn_closed
+      where:
+        source: session_end
+  invariants:
+    - balanced_turns
+    - monotonic_audio_seq
+  # No turn_closed before resumed speech starts
+  partial_order:
+    - before:
+        event: smart_turn_decision
+        where:
+          complete: false
+    - after:
+        event: vad_speech_start
+        bind: resume_start
+  # Final close after resumed speech
+  partial_order:
+    - before:
+        event: vad_speech_end
+    - after:
+        event: turn_closed
+        match: same_turn
+
+allowed_close_sources:
+  - smart_turn
+  - vad_acoustic_fallback

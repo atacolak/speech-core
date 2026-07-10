@@ -1,0 +1,128 @@
+# speech-core-golden manifest v1
+# MVP manifest for golden recording/synthesis/validation
+manifest_version: 1
+profile: golden-mvp
+description: >
+  Golden suite manifest for speech-core endpointing.
+  Covers MVP natural endpoint classes and synthetic boundary scenarios.
+
+scenarios:
+  # ── MVP natural endpoint classes ──
+  - id: human-clean-complete
+    class: natural_endpoint
+    construction: human-recorded
+    priority: mvp
+    description: "Ordinary complete utterance — smart_turn close expected"
+    scenario_file: scenarios/human-clean-complete.yaml
+
+  - id: human-trailing-off
+    class: natural_endpoint
+    construction: human-recorded
+    priority: mvp
+    description: "Trailing-off endpointing and conservative fallback"
+    scenario_file: scenarios/human-trailing-off.yaml
+
+  - id: human-pause-resume-incomplete
+    class: natural_endpoint
+    construction: human-recorded
+    priority: mvp
+    description: "Smart Turn recheck cancellation and no premature turn split"
+    scenario_file: scenarios/human-pause-resume-incomplete.yaml
+
+  - id: human-rapid-question
+    class: natural_endpoint
+    construction: human-recorded
+    priority: mvp
+    description: "Short complete question"
+    scenario_file: scenarios/human-rapid-question.yaml
+
+  - id: human-hold-continuous-filler-7000
+    class: natural_endpoint
+    construction: human-recorded
+    priority: exhaustive
+    description: "Sustained non-word vocalization, human-hold close expected"
+    scenario_file: scenarios/human-hold-continuous-filler-7000.yaml
+
+  # ── VAD onset triplets ──
+  - id: synthetic-vad-onset-below-32ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "VAD onset below threshold — 32ms speech-like, no vad_speech_start"
+
+  - id: synthetic-vad-onset-at-64ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "VAD onset at threshold — 64ms speech-like"
+
+  - id: synthetic-vad-onset-above-96ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "VAD onset above threshold — 96ms speech-like"
+
+  # ── VAD hangover triplets ──
+  - id: synthetic-vad-hangover-below-64ms-silence
+    class: synthetic_boundary
+    construction: synthetic
+    priority: exhaustive
+    description: "VAD hangover below — 64ms silence gap"
+
+  - id: synthetic-vad-hangover-at-96ms-silence
+    class: synthetic_boundary
+    construction: synthetic
+    priority: exhaustive
+    description: "VAD hangover at threshold — 96ms silence gap"
+
+  - id: synthetic-vad-hangover-above-128ms-silence
+    class: synthetic_boundary
+    construction: synthetic
+    priority: exhaustive
+    description: "VAD hangover above — 128ms silence gap, two VAD segments"
+
+  # ── Min VAD speech triplets ──
+  - id: synthetic-min-vad-speech-below-399ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "Min VAD speech below — 399ms, vad_too_short suppression expected"
+
+  - id: synthetic-min-vad-speech-at-400ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "Min VAD speech at threshold — 400ms, eligible boundary"
+
+  - id: synthetic-min-vad-speech-above-401ms
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "Min VAD speech above — 401ms, eligible boundary"
+
+  # ── Smart Turn recheck ──
+  - id: synthetic-smart-recheck-schedule
+    class: recheck
+    construction: synthetic
+    priority: mvp
+    description: "Smart Turn recheck schedule probing"
+
+  # ── Acoustic fallback ──
+  - id: synthetic-acoustic-fallback-installed-1700
+    class: fallback
+    construction: synthetic
+    priority: mvp
+    description: "Installed acoustic fallback at 1700ms"
+
+  - id: synthetic-acoustic-fallback-code-default-3500
+    class: fallback
+    construction: synthetic
+    priority: exhaustive
+    description: "Code-default acoustic fallback at 3500ms"
+
+  # ── Transcript silence ──
+  - id: synthetic-transcript-silence-close-700
+    class: synthetic_boundary
+    construction: synthetic
+    priority: mvp
+    description: "Transcript silence close at 700ms"

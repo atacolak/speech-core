@@ -1,0 +1,45 @@
+quarantine_version: 1
+generated_at: '2026-07-10T10:32:39.279387+00:00'
+disposition: Legacy fixtures retained for evidence; not valid release gates.
+fixtures:
+- legacy_id: 01-clean-sentence
+  disposition: quarantine
+  reclassify_as: legacy-clean-fallback-regression
+  reason: One degraded vad_acoustic_fallback; smart-turn incomplete.
+  migration: Re-record as human-clean-complete until clean smart_turn close.
+- legacy_id: 02-trailing-off
+  disposition: candidate-fallback
+  reclassify_as: null
+  reason: One degraded vad_acoustic_fallback; transcript matches trailing-off.
+  migration: Import with WAV hash and config if fallback intent explicit.
+- legacy_id: 03-pause-resume
+  disposition: quarantine
+  reclassify_as: null
+  reason: Two turns; closes on first phrase; does not test resume-without-close.
+  migration: Re-record with deliberate incomplete pre-pause phrase.
+- legacy_id: 04-human-hold
+  disposition: quarantine
+  reclassify_as: fallback/no-token fixture only
+  reason: 6.7s hum; too short for 7000ms hold; closes via fallback.
+  migration: New hold fixture must sustain VAD-active no-token audio >= 8s.
+- legacy_id: 05-short-word
+  disposition: reclassify
+  reclassify_as: human-short-complete-no-transcript
+  reason: Short word passes min speech, closes via smart_turn with no tokens.
+  migration: Add synthetic below/at/above min-speech triplet for actual threshold
+    coverage.
+- legacy_id: 06-rapid-question
+  disposition: candidate-after-recapture
+  reclassify_as: null
+  reason: Smart-turn close plus extra session_end close; transcript mismatch.
+  migration: Recapture with terminal-marker capture to eliminate session-end artifact.
+- legacy_id: 07-self-interrupt
+  disposition: candidate-exhaustive
+  reclassify_as: null
+  reason: Two VAD segments, one smart-turn close on recheck; minor transcript mismatch.
+  migration: Import with coarse assertions around interruption/recheck.
+- legacy_id: 08-slow-thoughtful
+  disposition: candidate-exhaustive
+  reclassify_as: null
+  reason: Four VAD segments, earlier incomplete decisions, final smart-turn close.
+  migration: Import with provenance and assertions for multiple incomplete decisions.

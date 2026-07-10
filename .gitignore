@@ -10,3 +10,12 @@
 .DS_Store
 
 .pi/
+
+# Golden suite run artifacts (local recordings, rejected takes, raw captures)
+/tests/golden/runs/
+/tests/golden/legacy/recordings/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
