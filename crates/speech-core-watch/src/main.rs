@@ -19,6 +19,21 @@ const SAMPLE_RATE: u64 = 16_000;
 const MAX_TUI_TURNS: usize = 10;
 const MAX_TUI_NOTES: usize = 10;
 
+/// Independent monotonic clock domains whose timestamps must never be
+/// subtracted across domains without a known calibration offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ClockDomainKey {
+    /// `diagnostic_mono_ns` — harness-side diagnostic clock (elapsed since
+    /// harness start). `diagnostic_clock_origin` is metadata that does not
+    /// reclassify the domain.
+    Harness,
+    /// `client_mono_ns` — client-side monotonic (speech-out producer).
+    Client,
+    /// `daemon_mono_ns`, `ingress_receive_mono_ns`, `detector_end_mono_ns`,
+    /// `model_feed_end_mono_ns` — daemon-side monotonic.
+    Daemon,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about = "watch live speech-core daemon events")]
 struct Args {
@@ -197,7 +212,11 @@ struct TuiModel {
     live_fallback_bar: String,
     live_hold_bar: String,
     speech_out_params: Option<String>,
-    first_mono_ns: Option<u64>,
+    /// Per-clock-domain baselines. The first observed monotonic timestamp in
+    /// each domain seeds the baseline; subsequent timestamps in that domain
+    /// are rendered as deltas from the baseline. Timestamps from different
+    /// domains are never subtracted across domains.
+    clock_baselines: HashMap<ClockDomainKey, u64>,
     transcript: TuiTranscriptState,
 }
 
@@ -253,6 +272,11 @@ impl TuiModel {
     }
 
     fn handle(&mut self, value: &Value) {
+        // Observe the event timestamp domain before dispatching so that
+        // per-domain baselines are seeded even when the handler does not
+        // call note_event (e.g. vad_speech_start uses self.note).
+        self.observe_event_clock(value);
+
         if let Some(session_id) = value.get("stream_session_id").and_then(|v| v.as_str()) {
             self.stream_session_id
                 .get_or_insert_with(|| session_id.to_owned());
@@ -1266,8 +1290,13 @@ impl TuiModel {
     }
 
     fn note_event(&mut self, value: &Value, note: String) {
-        let note = if let Some(ms) = self.relative_event_ms(value) {
-            format!("+{ms:07.1}ms {note}")
+        let note = if let Some((ms, domain)) = self.relative_event_ms(value) {
+            let domain_tag = if self.clock_baselines.len() > 1 {
+                domain_label(domain)
+            } else {
+                ""
+            };
+            format!("+{ms:07.1}ms{domain_tag} {note}")
         } else {
             note
         };
@@ -1284,10 +1313,19 @@ impl TuiModel {
         }
     }
 
-    fn relative_event_ms(&mut self, value: &Value) -> Option<f64> {
-        let ns = event_mono_ns(value)?;
-        let first = *self.first_mono_ns.get_or_insert(ns);
-        Some(ns.saturating_sub(first) as f64 / 1_000_000.0)
+    /// Observe the timestamp of every received event and seed the
+    /// per-domain baseline, even if the event emits no note.
+    fn observe_event_clock(&mut self, value: &Value) {
+        if let Some((ns, domain)) = classify_timestamp(value) {
+            self.clock_baselines.entry(domain).or_insert(ns);
+        }
+    }
+
+    fn relative_event_ms(&mut self, value: &Value) -> Option<(f64, ClockDomainKey)> {
+        let (ns, domain) = classify_timestamp(value)?;
+        let first = *self.clock_baselines.entry(domain).or_insert(ns);
+        let delta_ms = ns.saturating_sub(first) as f64 / 1_000_000.0;
+        Some((delta_ms, domain))
     }
 
     fn handle_model_chunk_processed(&mut self, value: &Value) {
@@ -2013,21 +2051,50 @@ fn samples_to_ms(sample: u64) -> u64 {
     sample.saturating_mul(1_000) / SAMPLE_RATE
 }
 
-fn event_mono_ns(value: &Value) -> Option<u64> {
-    [
-        "diagnostic_mono_ns",
-        "client_mono_ns",
-        "daemon_mono_ns",
-        "ingress_receive_mono_ns",
-        "detector_end_mono_ns",
-        "model_feed_end_mono_ns",
-    ]
-    .iter()
-    .find_map(|field| value.get(*field).and_then(|v| v.as_u64()))
+/// Classify an event's timestamp field into a clock domain.
+///
+/// Field-name heuristics:
+/// - `client_mono_ns` → Client
+/// - `daemon_mono_ns`, `ingress_receive_mono_ns`, `detector_end_mono_ns`,
+///   `model_feed_end_mono_ns` → Daemon
+/// - `diagnostic_mono_ns` → Harness (elapsed-since-harness-start diagnostic
+///   clock; `diagnostic_clock_origin` does NOT reclassify this domain).
+fn classify_timestamp(value: &Value) -> Option<(u64, ClockDomainKey)> {
+    // Field-name heuristics, respecting priority order.
+    if let Some(ns) = value.get("client_mono_ns").and_then(|v| v.as_u64()) {
+        return Some((ns, ClockDomainKey::Client));
+    }
+    if let Some(ns) = value.get("daemon_mono_ns").and_then(|v| v.as_u64()) {
+        return Some((ns, ClockDomainKey::Daemon));
+    }
+    if let Some(ns) = value
+        .get("ingress_receive_mono_ns")
+        .and_then(|v| v.as_u64())
+    {
+        return Some((ns, ClockDomainKey::Daemon));
+    }
+    if let Some(ns) = value.get("detector_end_mono_ns").and_then(|v| v.as_u64()) {
+        return Some((ns, ClockDomainKey::Daemon));
+    }
+    if let Some(ns) = value.get("model_feed_end_mono_ns").and_then(|v| v.as_u64()) {
+        return Some((ns, ClockDomainKey::Daemon));
+    }
+    if let Some(ns) = value.get("diagnostic_mono_ns").and_then(|v| v.as_u64()) {
+        return Some((ns, ClockDomainKey::Harness));
+    }
+    None
 }
 
 fn format_ms(ms: u64) -> String {
     format!("{ms}ms")
+}
+
+fn domain_label(domain: ClockDomainKey) -> &'static str {
+    match domain {
+        ClockDomainKey::Harness => " h",
+        ClockDomainKey::Client => " c",
+        ClockDomainKey::Daemon => " d",
+    }
 }
 
 fn circled(index: usize) -> String {
@@ -2669,6 +2736,331 @@ mod tests {
             !model.turns[0].glyphs.contains(&"·".to_owned()),
             "no wait glyph on closed turn: {:?}",
             model.turns[0].glyphs
+        );
+    }
+
+    // ── clock-domain tests ───────────────────────────────────────────────
+
+    #[test]
+    fn single_domain_no_tag() {
+        // When all events share the same domain (Harness), no domain tag is
+        // rendered.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","start_sample":0,"decision_sample":320,"diagnostic_mono_ns":1_000_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","end_sample":16000,"decision_sample":21760,"diagnostic_mono_ns":1_500_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0","diagnostic_mono_ns":2_000_000_000_u64}),
+        );
+        let rendered = model.render(true);
+        // Notes must show harness-relative deltas without a domain tag.
+        // Format is +{ms:07.1}ms, 7-char zero-padded.
+        assert!(rendered.contains("+00500.0ms"), "{rendered}");
+        assert!(rendered.contains("+01000.0ms"), "{rendered}");
+        assert!(
+            !rendered.contains("ms h"),
+            "no per-note domain tag in single domain: {rendered}"
+        );
+        assert!(!rendered.contains("ms c"), "{rendered}");
+        assert!(!rendered.contains("ms d"), "{rendered}");
+    }
+
+    #[test]
+    fn domain_tag_appears_when_multiple_domains_interleave() {
+        // Events from Harness and Daemon domains interleaved — domain tags
+        // must appear on note_event calls after both domains are known.
+        let mut model = TuiModel::default();
+        // Harness event at t=0 (uses self.note, no timestamp tag).
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","start_sample":0,"decision_sample":320,"diagnostic_mono_ns":0_u64}),
+        );
+        // Daemon event at its own t=10_000_000_000 (different epoch).
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","end_sample":16000,"decision_sample":21760,"daemon_mono_ns":10_000_000_000_u64}),
+        );
+        // Harness event (smart_turn_candidate emits no note).
+        apply(
+            &mut model,
+            json!({"event":"smart_turn_candidate","stream_session_id":"s","diagnostic_mono_ns":500_000_000_u64}),
+        );
+        // Daemon event at t=10_500_000_000.
+        apply(
+            &mut model,
+            json!({"event":"smart_turn_decision","stream_session_id":"s","probability":0.8,"complete":true,"daemon_mono_ns":10_500_000_000_u64}),
+        );
+        // Harness event at t=700ms — first harness note_event call.
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0","diagnostic_mono_ns":700_000_000_u64}),
+        );
+        let rendered = model.render(true);
+        // Harness: only turn_closed emits a harness note_event.
+        assert!(
+            rendered.contains("+00700.0ms h"),
+            "harness delta from baseline 0: {rendered}"
+        );
+        // Daemon deltas — zero-based for its own epoch.
+        assert!(
+            rendered.contains("+00000.0ms d"),
+            "daemon baseline: {rendered}"
+        );
+        assert!(
+            rendered.contains("+00500.0ms d"),
+            "daemon delta: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_cross_domain_subtraction_prevents_zero_clamp() {
+        // Harness epoch ~100ms, Daemon epoch 10_000_000_000_000.
+        // Without per-domain baselines the harness delta would be enormous
+        // or zero-clamped.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","diagnostic_mono_ns":100_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","daemon_mono_ns":10_000_000_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","diagnostic_mono_ns":250_000_000_u64}),
+        );
+        let rendered = model.render(true);
+        // Harness: 250ms - 100ms = 150ms delta.
+        assert!(
+            rendered.contains("+00150.0ms h"),
+            "harness relative after multi-domain: {rendered}"
+        );
+        // Daemon: 0ms delta (its own baseline).
+        assert!(
+            rendered.contains("+00000.0ms d"),
+            "daemon baseline: {rendered}"
+        );
+        // Must NOT contain absurd deltas.
+        assert!(
+            !rendered.contains("+9999"),
+            "no enormous fabricated duration: {rendered}"
+        );
+        assert!(!rendered.contains("+10000"), "{rendered}");
+    }
+
+    #[test]
+    fn client_domain_separate_from_daemon() {
+        // Client timestamps have their own independent epoch.
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_queued","utterance_id":"u","client_mono_ns":7_000_000_000_u64,"text":"hello"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_received","utterance_id":"u","daemon_mono_ns":50_000_000_000_u64,"text":"hello","num_chunks":1}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_completed","utterance_id":"u","client_mono_ns":7_200_000_000_u64}),
+        );
+        let rendered = model.render(true);
+        // First client event: single domain, no tag.
+        assert!(
+            rendered.contains("+00000.0ms"),
+            "client baseline (no tag): {rendered}"
+        );
+        // Daemon domain tag appears once second domain is known.
+        assert!(
+            rendered.contains("+00000.0ms d"),
+            "daemon baseline: {rendered}"
+        );
+        // Subsequent client event gets tag (multi-domain).
+        assert!(
+            rendered.contains("+00200.0ms c"),
+            "client delta: {rendered}"
+        );
+        // No cross-domain leakage.
+        assert!(
+            !rendered.contains("+43000"),
+            "no cross-domain subtraction: {rendered}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_clock_origin_does_not_reclassify() {
+        // diagnostic_mono_ns is always Harness regardless of
+        // diagnostic_clock_origin presence or value.
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_queued","utterance_id":"u","diagnostic_mono_ns":100_000_000_u64,"diagnostic_clock_origin":"harness_local_monotonic","text":"hi"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"speech_out_request_received","utterance_id":"u","diagnostic_mono_ns":150_000_000_u64,"diagnostic_clock_origin":"harness_local_monotonic","text":"hi","num_chunks":1}),
+        );
+        let rendered = model.render(true);
+        // Both are single Harness domain, so no tag. Delta 150M-100M = 50ms.
+        assert!(
+            rendered.contains("+00050.0ms"),
+            "harness delta, no tag: {rendered}"
+        );
+        // Should NOT show Client or Daemon tag.
+        assert!(!rendered.contains("ms c"), "no client tag: {rendered}");
+        assert!(!rendered.contains("ms d"), "no daemon tag: {rendered}");
+    }
+
+    #[test]
+    fn non_note_seed_event_observes_domain() {
+        // An event that uses self.note (not note_event) must still seed the
+        // clock-domain baseline so that subsequent note_event calls in the
+        // same domain compute correct relative deltas.
+        let mut model = TuiModel::default();
+        // vad_speech_start uses self.note — no note_event call — but the
+        // domain baseline must still be seeded.
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","start_sample":0,"diagnostic_mono_ns":500_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","end_sample":16000,"diagnostic_mono_ns":700_000_000_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","diagnostic_mono_ns":900_000_000_u64}),
+        );
+        let rendered = model.render(true);
+        // Delta from 500M to 700M = 200ms.
+        assert!(
+            rendered.contains("+00200.0ms"),
+            "correct seed-relative delta: {rendered}"
+        );
+        // Delta from 500M to 900M = 400ms.
+        assert!(
+            rendered.contains("+00400.0ms"),
+            "correct relative delta: {rendered}"
+        );
+        // Single domain -> no tag.
+        assert!(!rendered.contains("ms h"), "no tag: {rendered}");
+    }
+
+    #[test]
+    fn equal_raw_timestamps_diff_domain_stay_zero() {
+        // Two domains with equal raw timestamp values but separate baselines
+        // must each render as zero in its own domain.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","diagnostic_mono_ns":42_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","daemon_mono_ns":42_u64}),
+        );
+        let rendered = model.render(true);
+        // Daemon note_event shows its own zero delta.
+        assert!(rendered.contains("+00000.0ms d"), "daemon zero: {rendered}");
+        // Harness baseline was seeded by vad_speech_start (uses self.note).
+        // No negative delta timestamps.
+        assert!(!rendered.contains("+-"), "no negative delta: {rendered}");
+    }
+
+    #[test]
+    fn plain_single_domain_unchanged_behavior() {
+        // Existing test scenario (all diagnostic_mono_ns, same epoch) must
+        // still work with no domain tags and correct deltas.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s","start_sample":0,"decision_sample":320,"diagnostic_mono_ns":0_u64}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","committed_text":"hello there","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","end_sample":16000,"decision_sample":21760,"diagnostic_mono_ns":200_000_000_u64}),
+        );
+        for (i, p) in [(0, 0.31), (1, 0.45), (2, 0.79)] {
+            apply(
+                &mut model,
+                json!({"event":"smart_turn_candidate","stream_session_id":"s","end_sample":16000,"decision_sample":21760 + i * 4000,"diagnostic_mono_ns":300_000_000_u64 + i * 100_000_000_u64}),
+            );
+            apply(
+                &mut model,
+                json!({"event":"smart_turn_decision","stream_session_id":"s","end_sample":16000,"decision_sample":21760 + i * 4000,"probability":p,"threshold":0.5,"complete":p > 0.5,"diagnostic_mono_ns":350_000_000_u64 + i * 100_000_000_u64}),
+            );
+            if p <= 0.5 {
+                apply(
+                    &mut model,
+                    json!({"event":"smart_turn_recheck_scheduled","stream_session_id":"s","pending_decision_samples":[1,2]}),
+                );
+            }
+        }
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0","diagnostic_mono_ns":700_000_000_u64}),
+        );
+        let rendered = model.render(false);
+        // Glyph rendering must still work as before.
+        assert!(rendered.contains("#01\n  ◖ \"hello there\" ◗ ①.31 · ②.45 · ③.79 ◆"));
+        // Debug notes must show deltas.
+        let debug = model.render(true);
+        assert!(debug.contains("+00200.0ms"), "vad end delta: {debug}");
+        assert!(debug.contains("+00700.0ms"), "turn close delta: {debug}");
+        // No domain tags for single-domain.
+        assert!(!debug.contains("ms h"), "no domain tag: {debug}");
+    }
+
+    #[test]
+    fn classify_timestamp_deterministic_ordering() {
+        // When multiple timestamp fields exist on the same event, the
+        // deterministic priority order must pick the right one.
+        let v = json!({
+            "event": "test",
+            "diagnostic_mono_ns": 1,
+            "client_mono_ns": 2,
+            "daemon_mono_ns": 3
+        });
+        // classify_timestamp respects field-name priority.
+        // client_mono_ns is checked before daemon_mono_ns and diagnostic_mono_ns.
+        let (ns, domain) = classify_timestamp(&v).expect("must find a timestamp");
+        assert_eq!(
+            ns, 2,
+            "client_mono_ns takes priority over diagnostic_mono_ns"
+        );
+        assert_eq!(domain, ClockDomainKey::Client);
+
+        // When only diagnostic_mono_ns exists.
+        let v2 = json!({"event": "test", "diagnostic_mono_ns": 42});
+        let (ns2, domain2) = classify_timestamp(&v2).expect("must find a timestamp");
+        assert_eq!(ns2, 42);
+        assert_eq!(domain2, ClockDomainKey::Harness);
+
+        // When only daemon_mono_ns exists.
+        let v3 = json!({"event": "test", "daemon_mono_ns": 99});
+        let (ns3, domain3) = classify_timestamp(&v3).expect("must find a timestamp");
+        assert_eq!(ns3, 99);
+        assert_eq!(domain3, ClockDomainKey::Daemon);
+
+        // diagnostic_clock_origin does NOT reclassify diagnostic_mono_ns.
+        let v4 = json!({"event": "test", "diagnostic_mono_ns": 77, "diagnostic_clock_origin": "harness_local_monotonic"});
+        let (ns4, domain4) = classify_timestamp(&v4).expect("must find a timestamp");
+        assert_eq!(ns4, 77);
+        assert_eq!(
+            domain4,
+            ClockDomainKey::Harness,
+            "diagnostic_clock_origin must not reclassify"
         );
     }
 }
