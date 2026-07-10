@@ -337,6 +337,23 @@ impl TuiModel {
             }
             "transcript_token_committed" => {}
             "transcript_update" => self.handle_transcript_update(value),
+            "transcript_committed" | "turn_transcript_committed" => {
+                // Authoritative per-turn committed transcript event. Applies
+                // only to a matching open turn; ignores closed turns and
+                // orphan events.
+                let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    return;
+                }
+                if let Some(idx) = self
+                    .turn_for_event(value)
+                    .or_else(|| self.current_open_turn())
+                    .filter(|idx| !self.turns[*idx].closed)
+                {
+                    self.set_turn_id(idx, value);
+                    self.turns[idx].text = normalized_text(text);
+                }
+            }
             "turn_started" => {
                 let start_sample = value
                     .get("start_sample")
@@ -370,6 +387,9 @@ impl TuiModel {
                         self.finalize_section(idx);
                         self.turns[idx].paused = false;
                         self.turns[idx].boundary = None;
+                        // Anchor the transcript prefix so subsequent cumulative
+                        // transcript_update payloads render only the new delta.
+                        self.turns[idx].transcript_prefix = self.transcript.display.clone();
                         self.push_glyph(idx, "◖");
                         self.note("speech resumed; fresh transcript section started".to_owned());
                     } else if !self.turns[idx].glyphs.iter().any(|glyph| glyph == "◖") {
@@ -886,15 +906,22 @@ impl TuiModel {
                 }
             }
             "vad_acoustic_fallback" => {
-                let idx = self.ensure_turn();
-                self.push_wait(idx);
-                self.note_event(
-                    value,
-                    format!(
-                        "acoustic fallback armed at {}; low smoothed vad",
-                        sample_field_ms(value, "decision_sample")
-                    ),
-                );
+                // Only attach to a matching *open* turn; ignore orphan/stale
+                // fallback events when no turn is open or the matched turn
+                // has already been closed.
+                if let Some(idx) = self
+                    .turn_for_event(value)
+                    .filter(|idx| !self.turns[*idx].closed)
+                {
+                    self.push_wait(idx);
+                    self.note_event(
+                        value,
+                        format!(
+                            "acoustic fallback armed at {}; low smoothed vad",
+                            sample_field_ms(value, "decision_sample")
+                        ),
+                    );
+                }
             }
             "turn_human_hold" => {
                 let ms_without_tokens = value
@@ -1007,16 +1034,28 @@ impl TuiModel {
         }
 
         let idx = self.transcript_turn(value);
+        // Closed visible turns are immutable; ordinary late transcript_update /
+        // finalize events after close must not rewrite them.
+        if self.turns[idx].closed {
+            return;
+        }
+
         let local = if display.starts_with(&self.turns[idx].transcript_prefix) {
             display[self.turns[idx].transcript_prefix.len()..].to_owned()
         } else {
             // Backward-compatible fallback for streams where the daemon/model resets
-            // cumulative transcript text between turns. Without a transcript turn_id,
-            // this is necessarily conservative: once a new acoustic turn is open it
-            // owns non-prefix updates; otherwise late updates remain attributed to
-            // the last transcript owner/closed turn to avoid ghost turns.
-            display
+            // cumulative transcript text between turns.
+            display.clone()
         };
+
+        // Punctuation-only deltas (e.g. late "." from a prior closed turn)
+        // must not render as the open turn's text, but must still advance the
+        // section baseline so subsequent real deltas compute correctly.
+        if is_punctuation_only_delta(&local) {
+            self.turns[idx].transcript_prefix = display;
+            return;
+        }
+
         self.turns[idx].text = local;
     }
 
@@ -1991,14 +2030,31 @@ fn format_ms(ms: u64) -> String {
     format!("{ms}ms")
 }
 
-fn circled(index: usize) -> &'static str {
+fn circled(index: usize) -> String {
     match index {
-        1 => "①",
-        2 => "②",
-        3 => "③",
-        4 => "④",
-        _ => "④",
+        1 => '①',
+        2 => '②',
+        3 => '③',
+        4 => '④',
+        5 => '⑤',
+        6 => '⑥',
+        7 => '⑦',
+        8 => '⑧',
+        9 => '⑨',
+        10 => '⑩',
+        11 => '⑪',
+        12 => '⑫',
+        13 => '⑬',
+        14 => '⑭',
+        15 => '⑮',
+        16 => '⑯',
+        17 => '⑰',
+        18 => '⑱',
+        19 => '⑲',
+        20 => '⑳',
+        n => return format!("({n})"),
     }
+    .to_string()
 }
 
 fn compact_probability(probability: f64) -> String {
@@ -2009,6 +2065,13 @@ fn compact_probability(probability: f64) -> String {
 
 fn normalized_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when a transcript delta contains only punctuation and whitespace
+/// (no alphanumeric characters). Such deltas are late punctuation revisions
+/// from a prior closed turn and must not render as the current turn's text.
+fn is_punctuation_only_delta(text: &str) -> bool {
+    !text.chars().any(|c| c.is_alphanumeric())
 }
 
 fn bar8(value: f64) -> String {
@@ -2133,7 +2196,10 @@ mod tests {
     }
 
     #[test]
-    fn tui_applies_punctuation_revision_after_close_without_ghost_turn() {
+    fn closed_turn_rejects_late_punctuation_revision() {
+        // Regression: closed visible turns are immutable. Late transcript_update
+        // must not rewrite the closed turn's text or create ghost turns.
+        // Modeled on session 37c36a9d.
         let mut model = TuiModel::default();
         apply(
             &mut model,
@@ -2147,6 +2213,7 @@ mod tests {
             &mut model,
             json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
         );
+        // Late punctuation arrives after close — must not rewrite the closed turn.
         apply(
             &mut model,
             json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"hello there.","tentative_text":""}),
@@ -2157,9 +2224,12 @@ mod tests {
             1,
             "late punctuation must not create a ghost turn"
         );
+        // Closed turn text stays frozen at rev-1 text.
+        assert_eq!(model.turns[0].text, "hello there");
+        assert!(model.turns[0].closed);
         let rendered = model.render(false);
         assert!(
-            rendered.contains("#01\n  ◖ \"hello there.\" ◆"),
+            rendered.contains("#01\n  ◖ \"hello there\" ◆"),
             "{rendered}"
         );
     }
@@ -2186,7 +2256,10 @@ mod tests {
     }
 
     #[test]
-    fn tui_attaches_delayed_final_update_to_prior_closed_turn() {
+    fn disconnect_final_flush_keeps_closed_turn_immutable() {
+        // Regression: a final transcript flush on disconnect must not rewrite
+        // the already-closed turn text.
+        // Modeled on session f62ee314.
         let mut model = TuiModel::default();
         apply(
             &mut model,
@@ -2200,18 +2273,24 @@ mod tests {
             &mut model,
             json!({"event":"turn_closed","stream_session_id":"s","source":"vad","turn_id":"s:turn:0"}),
         );
+        // Disconnect final flush — must not rewrite the closed turn.
         apply(
             &mut model,
             json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"almost final now","tentative_text":""}),
         );
 
         assert_eq!(model.turns.len(), 1);
-        assert_eq!(model.turns[0].text, "almost final now");
+        // Closed turn is immutable; text stays at rev-1.
+        assert_eq!(model.turns[0].text, "almost final");
         assert!(model.turns[0].closed);
     }
 
     #[test]
-    fn tui_opens_actual_new_turn_after_late_closed_turn_revision() {
+    fn punctuation_between_turns_routes_to_open_turn_only() {
+        // Regression: when a new turn opens, late punctuation for a prior
+        // closed turn must not rewrite it; the new turn must only get its own
+        // transcript delta.
+        // Modeled on session acc49911.
         let mut model = TuiModel::default();
         apply(
             &mut model,
@@ -2225,10 +2304,12 @@ mod tests {
             &mut model,
             json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
         );
+        // Late punctuation for the closed turn — must be ignored.
         apply(
             &mut model,
             json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"first turn.","tentative_text":""}),
         );
+        // New speech starts a fresh turn.
         apply(
             &mut model,
             json!({"event":"vad_speech_start","stream_session_id":"s"}),
@@ -2239,13 +2320,12 @@ mod tests {
         );
 
         assert_eq!(model.turns.len(), 2);
-        assert_eq!(model.turns[0].text, "first turn.");
+        // Closed turn stays frozen at its last-open revision.
+        assert_eq!(model.turns[0].text, "first turn");
+        // New turn gets only the delta after its transcript prefix.
         assert_eq!(model.turns[1].text, " second turn");
         let rendered = model.render(false);
-        assert!(
-            rendered.contains("#01\n  ◖ \"first turn.\" ◆"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("#01\n  ◖ \"first turn\" ◆"), "{rendered}");
         assert!(rendered.contains("#02\n  ◖ \"second turn\""), "{rendered}");
     }
 
@@ -2347,5 +2427,248 @@ mod tests {
         assert!(rendered.contains(
             "speech-out terminal: cancelled e2e=101.0ms first-audio=85.0ms cancel=10.0ms"
         ));
+    }
+
+    #[test]
+    fn pause_resume_cumulative_delta_renders_only_new_section() {
+        // Regression: when speech pauses and resumes, the resumed section must
+        // only render the new transcript delta, not the entire cumulative text
+        // accumulated before the pause.
+        // Modeled on session 37c36a9d.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"hello","tentative_text":""}),
+        );
+        // Speech pauses; more transcript arrives before the pause registers.
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_end","stream_session_id":"s","end_sample":8000,"decision_sample":12000}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"hello world","tentative_text":""}),
+        );
+        // Speech resumes — a fresh transcript section starts.
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":3,"committed_text":"hello world and more","tentative_text":""}),
+        );
+
+        // The resumed section must only contain the delta added after resume.
+        let rendered = model.render(false);
+        assert!(
+            rendered.contains("#01\n  ◖ \"hello world\" ◗"),
+            "first section: {rendered}"
+        );
+        assert!(
+            rendered.contains("◖ \"and more\""),
+            "second section should only have delta: {rendered}"
+        );
+    }
+
+    #[test]
+    fn stale_fallback_after_close_is_ignored() {
+        // Regression: vad_acoustic_fallback arriving after the turn closed
+        // must not create a ghost turn or attach to a closed turn.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_started","stream_session_id":"s","turn_id":"s:turn:0","source":"vad"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        // Stale fallback arrives after close — no open turn to attach to.
+        apply(
+            &mut model,
+            json!({"event":"vad_acoustic_fallback","stream_session_id":"s","decision_sample":20000}),
+        );
+
+        // Must not have created a new ghost turn.
+        assert_eq!(model.turns.len(), 1);
+        assert!(model.turns[0].closed);
+    }
+
+    #[test]
+    fn circled_glyph_beyond_four_renders_unicode_circled() {
+        // The fifth semantic probe check must not render another ④.
+        let glyph = circled(5);
+        assert_eq!(glyph, "⑤");
+        assert_ne!(glyph, circled(4));
+        // Unicode circled numbers through ⑳, then parenthesized fallback.
+        assert_eq!(circled(10), "⑩");
+        assert_eq!(circled(20), "⑳");
+        assert_eq!(circled(21), "(21)");
+    }
+
+    #[test]
+    fn authoritative_per_turn_committed_transcript_overrides_cumulative_text() {
+        // The forthcoming per-turn transcript_committed event must be used as
+        // the authoritative turn text instead of deriving a delta from the
+        // cumulative stream.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"hello","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_committed","stream_session_id":"s","text":"hello world"}),
+        );
+
+        assert_eq!(model.turns[0].text, "hello world");
+    }
+
+    #[test]
+    fn authoritative_committed_transcript_respects_closed_turn_immutability() {
+        // Even the authoritative per-turn event must not rewrite a closed turn.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"first","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        // Late transcript_committed for closed turn must not rewrite.
+        apply(
+            &mut model,
+            json!({"event":"turn_transcript_committed","stream_session_id":"s","text":"first final","turn_id":"s:turn:0"}),
+        );
+
+        assert_eq!(model.turns[0].text, "first");
+        assert!(model.turns[0].closed);
+    }
+
+    #[test]
+    fn fallback_bar_clamped_to_target_and_cleared_on_close() {
+        // The fallback progress bar must never exceed the target bar width and
+        // must clear when the turn closes.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_started","stream_session_id":"s","turn_id":"s:turn:0","source":"vad"}),
+        );
+        // Progress exceeds target (5s > 3.5s) — bar must clamp, not overflow.
+        apply(
+            &mut model,
+            json!({"event":"vad_frame","stream_session_id":"s","probability":0.5,"smoothed_probability":0.4,"silence_counter":2,"hangover_frames":5,"fallback_progress_ms":5000,"fallback_target_ms":3500}),
+        );
+        // Bar must exist and not be beyond full.
+        assert!(model.live_fallback_bar.contains("████████"));
+        assert!(!model.live_fallback_bar.contains("█████████"));
+
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"vad","turn_id":"s:turn:0"}),
+        );
+        assert!(model.live_fallback_bar.is_empty());
+    }
+
+    #[test]
+    fn punctuation_only_delta_suppressed_but_advances_baseline() {
+        // Regression: when a late punctuation-only transcript_update (e.g. "."
+        // for a prior closed turn) arrives after a new acoustic turn has opened,
+        // the punctuation must not render as the new turn's text, but the
+        // section baseline must advance so the next real update is correct.
+        let mut model = TuiModel::default();
+        // Turn 0: say something and close.
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"hello","tentative_text":""}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        // Turn 1: new speech starts.
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        // Late punctuation for turn 0 arrives — cumulative text now "hello."
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"hello.","tentative_text":""}),
+        );
+        // Turn 1 must NOT show the punctuation.
+        assert!(
+            model.turns[1].text.is_empty(),
+            "punctuation delta must not render: '{}'",
+            model.turns[1].text
+        );
+        // Now real text for turn 1 arrives.
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":3,"committed_text":"hello. world","tentative_text":""}),
+        );
+        // Turn 1 must get only its own delta (the leading space is part of the
+        // cumulative-text delta since the prefix ended at "hello.").
+        assert_eq!(model.turns[1].text, " world");
+    }
+
+    #[test]
+    fn orphan_fallback_with_mismatched_turn_id_is_ignored() {
+        // vad_acoustic_fallback with a turn_id that matches a closed turn
+        // must not attach to it.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_started","stream_session_id":"s","turn_id":"s:turn:0","source":"vad"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"turn_closed","stream_session_id":"s","source":"smart_turn","turn_id":"s:turn:0"}),
+        );
+        // Stale fallback with turn_id of the closed turn.
+        apply(
+            &mut model,
+            json!({"event":"vad_acoustic_fallback","stream_session_id":"s","turn_id":"s:turn:0","decision_sample":20000}),
+        );
+
+        // Must not have created a ghost turn or modified the closed turn.
+        assert_eq!(model.turns.len(), 1);
+        assert!(model.turns[0].closed);
+        // The closed turn must not carry a wait glyph from the stale fallback.
+        assert!(
+            !model.turns[0].glyphs.contains(&"·".to_owned()),
+            "no wait glyph on closed turn: {:?}",
+            model.turns[0].glyphs
+        );
     }
 }
