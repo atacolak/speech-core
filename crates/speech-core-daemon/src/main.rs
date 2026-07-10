@@ -958,7 +958,10 @@ fn parse_recheck_offsets_ms(value: &str) -> Vec<u32> {
 }
 
 fn is_jsonl_filtered_event(text: &str) -> bool {
-    event_type_from_text(text).as_deref() == Some("vad_meter")
+    matches!(
+        event_type_from_text(text).as_deref(),
+        Some("vad_meter") | Some("turn_hold")
+    )
 }
 
 fn event_matches(

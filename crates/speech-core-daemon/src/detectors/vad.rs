@@ -598,6 +598,20 @@ impl VadSession {
             })?;
         }
 
+        let effective_fallback_threshold = self
+            .config
+            .fallback_threshold
+            .max(self.config.stop_threshold);
+        let fallback_progress_ms = if !self.in_speech
+            && smoothed_probability <= effective_fallback_threshold
+        {
+            let silence_samples =
+                frame_end_sample.saturating_sub(self.last_segment_end_sample.unwrap_or(0));
+            samples_to_ms(silence_samples) as u32
+        } else {
+            0u32
+        };
+
         writer.write(&VadMeterEvent {
             event: "vad_meter",
             stream_id: self.hello.stream_id.clone(),
@@ -613,6 +627,8 @@ impl VadSession {
             threshold: self.config.threshold,
             stop_threshold,
             fallback_threshold: self.config.fallback_threshold,
+            fallback_progress_ms,
+            fallback_target_ms: self.config.acoustic_fallback_silence_ms,
             raw_is_speech,
             smoothed_in_speech: self.in_speech,
             silence_counter: self.silence_counter as u32,
@@ -735,6 +751,8 @@ struct VadMeterEvent {
     smoothed_in_speech: bool,
     silence_counter: u32,
     hangover_frames: u32,
+    fallback_progress_ms: u32,
+    fallback_target_ms: u32,
     energy_rms: Option<f32>,
     energy_gated: bool,
     ingress_receive_mono_ns: u64,

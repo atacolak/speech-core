@@ -431,6 +431,7 @@ impl TurnManager {
                 confidence,
             } => {
                 let human_hold_silence_samples = ms_to_samples(self.config.human_hold_silence_ms);
+                let hold_target_ms = u64::from(self.config.human_hold_silence_ms);
                 let model_progress = self.config.model_progress.clone();
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 if human_hold_silence_samples == 0 || session.open_turn.is_none() {
@@ -441,21 +442,19 @@ impl TurnManager {
                     .and_then(|progress| progress.last_token_end_sample(&stream_session_id))
                     .unwrap_or(start_sample);
                 let samples_without_tokens = decision_sample.saturating_sub(token_anchor);
+                let hold_progress_ms = samples_to_ms(samples_without_tokens);
+                let open_turn_id = session.open_turn.as_ref().map(|t| t.turn_id.clone());
+                let turn_id = open_turn_id.unwrap_or_else(|| session.next_turn_id());
                 if samples_without_tokens >= human_hold_silence_samples
                     && session.last_human_hold_token_anchor != Some(token_anchor)
                 {
                     session.last_human_hold_token_anchor = Some(token_anchor);
-                    let turn_id = session
-                        .open_turn
-                        .as_ref()
-                        .map(|turn| turn.turn_id.clone())
-                        .unwrap_or_else(|| session.next_turn_id());
                     writer.write(&TurnHumanHoldEvent {
                         event: "turn_human_hold",
-                        stream_id,
-                        stream_session_id,
-                        adapter_id,
-                        turn_id,
+                        stream_id: stream_id.clone(),
+                        stream_session_id: stream_session_id.clone(),
+                        adapter_id: adapter_id.clone(),
+                        turn_id: turn_id.clone(),
                         detector,
                         reason: "speech_like_audio_without_tokens",
                         start_sample,
@@ -463,12 +462,23 @@ impl TurnManager {
                         decision_sample,
                         last_token_end_sample: token_anchor,
                         samples_without_tokens,
-                        ms_without_tokens: samples_to_ms(samples_without_tokens),
+                        ms_without_tokens: hold_progress_ms,
                         probability: confidence,
                         threshold: None,
                         daemon_mono_ns: now_mono_ns(),
                     })?;
                 }
+                // Emit hold-timer progress every frame for the TUI bar.
+                writer.write(&TurnHoldProgressEvent {
+                    event: "turn_hold",
+                    stream_id,
+                    stream_session_id,
+                    adapter_id,
+                    turn_id,
+                    hold_progress_ms,
+                    hold_target_ms,
+                    daemon_mono_ns: now_mono_ns(),
+                })?;
                 Ok(Vec::new())
             }
             DetectorSignal::TranscriptTokenCommitted {
@@ -1348,6 +1358,21 @@ struct TurnHumanHoldEvent {
     ms_without_tokens: u64,
     probability: Option<f32>,
     threshold: Option<f32>,
+    daemon_mono_ns: u64,
+}
+
+/// Fires every frame during VAD speech with hold-timer progress for the TUI.
+#[derive(Debug, Serialize)]
+struct TurnHoldProgressEvent {
+    event: &'static str,
+    stream_id: String,
+    stream_session_id: String,
+    adapter_id: String,
+    turn_id: String,
+    /// Wall-clock ms since the last committed transcript token.
+    hold_progress_ms: u64,
+    /// Threshold at which human-hold fires (typically 7000ms).
+    hold_target_ms: u64,
     daemon_mono_ns: u64,
 }
 
