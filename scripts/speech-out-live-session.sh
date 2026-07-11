@@ -102,6 +102,8 @@ incoming_watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-}"
 incoming_watch_trace_asr="${SPEECH_CORE_WATCH_TRACE_ASR:-}"
 incoming_watch_trace_vad="${SPEECH_CORE_WATCH_TRACE_VAD:-}"
 incoming_watch_trace_tokens="${SPEECH_CORE_WATCH_TRACE_TOKENS:-}"
+incoming_vad_energy_enabled="${SPEECH_CORE_VAD_ENERGY_ENABLED:-}"
+incoming_vad_energy_threshold="${SPEECH_CORE_VAD_ENERGY_THRESHOLD:-}"
 if [[ -f "$env_file" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -126,6 +128,8 @@ if [[ -n "$incoming_watch_verbose" ]]; then SPEECH_CORE_WATCH_VERBOSE="$incoming
 if [[ -n "$incoming_watch_trace_asr" ]]; then SPEECH_CORE_WATCH_TRACE_ASR="$incoming_watch_trace_asr"; fi
 if [[ -n "$incoming_watch_trace_vad" ]]; then SPEECH_CORE_WATCH_TRACE_VAD="$incoming_watch_trace_vad"; fi
 if [[ -n "$incoming_watch_trace_tokens" ]]; then SPEECH_CORE_WATCH_TRACE_TOKENS="$incoming_watch_trace_tokens"; fi
+if [[ -n "$incoming_vad_energy_enabled" ]]; then SPEECH_CORE_VAD_ENERGY_ENABLED="$incoming_vad_energy_enabled"; fi
+if [[ -n "$incoming_vad_energy_threshold" ]]; then SPEECH_CORE_VAD_ENERGY_THRESHOLD="$incoming_vad_energy_threshold"; fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
@@ -178,6 +182,8 @@ style="${SPEECH_OUT_STYLE:-}"
 play_command="${SPEECH_OUT_PLAY_COMMAND:-pw-play}"
 chunk_min_chars="${SPEECH_OUT_CHUNK_MIN_CHARS:-8}"
 chunk_max_chars="${SPEECH_OUT_CHUNK_MAX_CHARS:-160}"
+vad_energy_enabled="${SPEECH_CORE_VAD_ENERGY_ENABLED:-0}"
+vad_energy_threshold="${SPEECH_CORE_VAD_ENERGY_THRESHOLD:-0.01}"
 # This harness is diagnostic by design. Mirror the speech-core-live-session --debug-tui surface by default.
 watch_mode="${SPEECH_CORE_WATCH_MODE:-debug}"
 watch_verbose="${SPEECH_CORE_WATCH_VERBOSE:-0}"
@@ -218,13 +224,15 @@ while [[ $# -gt 0 ]]; do
     --trace-asr) watch_trace_asr=1; shift ;;
     --trace-vad) watch_trace_vad=1; shift ;;
     --trace-tokens) watch_trace_tokens=1; shift ;;
+    --vad-energy-enabled) vad_energy_enabled=1; shift ;;
+    --vad-energy-threshold) vad_energy_threshold="$2"; shift 2 ;;
     --run-dir) run_base="$2"; shift 2 ;;
     --record-audio) record_audio=1; shift ;;
     --no-record-audio) record_audio=0; shift ;;
     --device) device_arg=(--device "$2"); shift 2 ;;
     --help|-h)
       cat <<'EOF_HELP'
-usage: speech-out-live-session [--debug-tui|--tui|--transcript|--jsonl|--mode MODE] [--steps N] [--speed X] [--voice ID] [--lang CODE] [--reference REF] [--style STYLE] [--response-text TEXT] [--core-url WS] [--out-url WS] [--play-command CMD] [--device NAME] [--run-dir DIR]
+usage: speech-out-live-session [--debug-tui|--tui|--transcript|--jsonl|--mode MODE] [--steps N] [--speed X] [--voice ID] [--lang CODE] [--reference REF] [--style STYLE] [--response-text TEXT] [--core-url WS] [--out-url WS] [--play-command CMD] [--device NAME] [--run-dir DIR] [--vad-energy-enabled] [--vad-energy-threshold FLOAT]
 
 Developer harness: reuse the speech-core live mic/session behavior and the same debug TUI, subscribe to speech-in turn_closed events, then append/trigger a short speech-out response (default: "heard you."). Defaults to --debug-tui because this is the useful diagnostic surface for testing the end-to-end speech loop.
 
@@ -271,6 +279,7 @@ speech-out developer live session
   voice/lang:     $voice / $lang
   steps/speed:    $steps / $speed
   watch_mode:     $watch_mode
+  vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
@@ -295,6 +304,10 @@ SPEECH_OUT_VOICE=$(quote_sh "$voice")
 SPEECH_OUT_LANG=$(quote_sh "$lang")
 SPEECH_OUT_REFERENCE=$(quote_sh "$reference")
 SPEECH_OUT_STYLE=$(quote_sh "$style")
+# Server-side VAD energy gate config. These only take effect if the server
+# speech-core-daemon is restarted with the corresponding env vars.
+SPEECH_CORE_VAD_ENERGY_ENABLED=$(quote_sh "$vad_energy_enabled")
+SPEECH_CORE_VAD_ENERGY_THRESHOLD=$(quote_sh "$vad_energy_threshold")
 EOF_PARAMS
 }
 
