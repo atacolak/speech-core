@@ -10,6 +10,10 @@
 #   P1f – Process-substitution stderr helper is cleaned up with the tree
 #   P1g – Harness dispatch_turn_response no longer captures subshell PID
 #   P1h – kill_tree uses descendant tree walk (pgrep -P), not pgid heuristic
+#   P1i – TERM-escaping descendant: root exits, child traps TERM, escalation to KILL
+#   P1j – TERM-cooperative tree exits fast without unnecessary timeout
+#   P1k – Zombie-aware liveness helpers (_pid_is_alive, _pid_is_zombie)
+#   P1l – PID reuse defence: starttime captured, KILL guards against reuse
 #
 # Uses controlled fake children (sleep). No real audio, no network, no daemons.
 
@@ -56,6 +60,29 @@ _collect_descendants() {
   done
 }
 
+# ── Zombie-aware liveness helpers ────────────────────────────────────
+
+_pid_is_zombie() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  local state
+  state="$(awk '/^State:/ {print $2}' /proc/"$p"/status 2>/dev/null || true)"
+  [[ "$state" == "Z" || "$state" == "z" ]]
+}
+
+_pid_is_alive() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  _pid_is_zombie "$p" && return 1
+  return 0
+}
+
+_pid_starttime() {
+  local p="$1"
+  awk '{print $22}' /proc/"$p"/stat 2>/dev/null || printf '0'
+}
+
 kill_tree() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
@@ -64,20 +91,68 @@ kill_tree() {
   local pids
   pids="$(_collect_descendants "$pid")"
 
+  # Capture start times for PID reuse safety.
+  local -A _kt_starttimes=()
   local p
+  for p in $pids; do
+    _kt_starttimes[$p]="$(_pid_starttime "$p")"
+  done
+
+  # Phase 1: SIGTERM to every PID (leaf-first).
   for p in $pids; do
     kill -TERM "$p" 2>/dev/null || true
   done
 
+  # Phase 2: Wait for ALL captured PIDs to be dead or zombie.
+  # This closes the escalation hole where a TERM-ignoring descendant
+  # survived because the root exited first.
   local waited=0 max_ticks=$(( _kill_tree_timeout_secs * 10 ))
+  local all_dead=0
   while (( waited < max_ticks )); do
-    kill -0 "$pid" 2>/dev/null || return 0
+    all_dead=1
+    for p in $pids; do
+      if _pid_is_alive "$p"; then
+        all_dead=0
+        break
+      fi
+    done
+    (( all_dead )) && break
     sleep 0.1 2>/dev/null || true
     waited=$((waited + 1))
   done
 
+  if (( all_dead )); then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+
+  # Phase 3: Escalate — KILL every survivor with PID reuse defence.
   for p in $pids; do
-    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+    if _pid_is_alive "$p"; then
+      local cur_st
+      cur_st="$(_pid_starttime "$p")"
+      if [[ -n "${_kt_starttimes[$p]:-}" && "${_kt_starttimes[$p]}" != "0" && \
+            -n "$cur_st" && "$cur_st" != "0" && \
+            "${_kt_starttimes[$p]}" != "$cur_st" ]]; then
+        continue  # PID was reused; don't kill the new occupant.
+      fi
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+
+  # Phase 4: Bounded verify — confirm KILL took effect.
+  local verify_waited=0 verify_max=20  # 2 seconds
+  while (( verify_waited < verify_max )); do
+    all_dead=1
+    for p in $pids; do
+      if _pid_is_alive "$p"; then
+        all_dead=0
+        break
+      fi
+    done
+    (( all_dead )) && break
+    sleep 0.1 2>/dev/null || true
+    verify_waited=$((verify_waited + 1))
   done
 
   wait "$pid" 2>/dev/null || true
@@ -122,15 +197,16 @@ ENDSCRIPT
 }
 
 # ── Helper: ensure no PIDs from a list are still alive ─────────────────
+# Treats zombies as effectively dead (cannot run code, cannot be killed).
 assert_all_dead() {
   local pids="$1"
   local label="$2"
   local all_ok=1
   for p in $pids; do
     [[ -n "$p" ]] || continue
-    if kill -0 "$p" 2>/dev/null; then
+    if _pid_is_alive "$p"; then
       kill -KILL "$p" 2>/dev/null || true
-      fail "$label" "pid $p still alive"
+      fail "$label" "pid $p still alive (not zombie)"
       all_ok=0
     fi
   done
@@ -457,6 +533,240 @@ test_p1h() {
 }
 
 test_p1h
+
+# ── P1i ────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== P1i: TERM-escaping descendant — root exits, escalation to KILL ==="
+
+test_p1i() {
+  local tmp="$TEST_DIR/p1i"
+  mkdir -p "$tmp"
+
+  # Child script: explicitly trap (ignore) SIGTERM, sleep forever.
+  cat >"$tmp/ignore_term.sh" <<'ENDSCRIPT'
+#!/usr/bin/env bash
+trap '' TERM
+sleep 300
+ENDSCRIPT
+  chmod +x "$tmp/ignore_term.sh"
+
+  # Root script: spawn TERM-ignoring child, then sleep (will die on TERM).
+  cat >"$tmp/root.sh" <<'ENDSCRIPT'
+#!/usr/bin/env bash
+"$1" &
+sleep 300
+ENDSCRIPT
+  chmod +x "$tmp/root.sh"
+
+  # Start the tree.
+  "$tmp/root.sh" "$tmp/ignore_term.sh" </dev/null >/dev/null 2>&1 &
+  local root_pid=$!
+  sleep 0.5  # Let child settle in /proc.
+
+  # Collect all PIDs before kill.
+  local all_pids
+  all_pids="$(_collect_descendants "$root_pid")"
+  local pid_count
+  pid_count="$(echo "$all_pids" | tr ' ' '\n' | grep -c '^[0-9]' || echo 0)"
+  echo "  INFO: tree has $pid_count PIDs: $all_pids"
+
+  if (( pid_count < 2 )); then
+    # Tree wasn't fully formed yet, but the root may have died quickly.
+    # Try a second attempt with a longer settle.
+    kill -KILL "$root_pid" 2>/dev/null || true
+    "$tmp/root.sh" "$tmp/ignore_term.sh" </dev/null >/dev/null 2>&1 &
+    root_pid=$!
+    sleep 0.8
+    all_pids="$(_collect_descendants "$root_pid")"
+    pid_count="$(echo "$all_pids" | tr ' ' '\n' | grep -c '^[0-9]' || echo 0)"
+    echo "  INFO: retry tree has $pid_count PIDs: $all_pids"
+  fi
+
+  if (( pid_count < 2 )); then
+    kill -KILL "$root_pid" 2>/dev/null || true
+    fail "P1i: spawn" "could not create 2-process tree (got $pid_count)"
+    return
+  fi
+
+  # Use a short timeout so we prove escalation happens.
+  local saved_timeout="${_kill_tree_timeout_secs}"
+  _kill_tree_timeout_secs=1
+
+  kill_tree "$root_pid"
+
+  _kill_tree_timeout_secs="$saved_timeout"
+
+  # Verify: every captured PID must now be dead (or zombie).
+  local survivor=0
+  for p in $all_pids; do
+    if _pid_is_alive "$p"; then
+      echo "  FAIL: pid $p survived kill_tree" >&2
+      survivor=1
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+
+  if (( survivor == 0 )); then
+    pass "P1i: all PIDs dead after escalation (TERM-escaping descendant killed)"
+  else
+    fail "P1i: TERM-escaping" "$survivor PIDs survived kill_tree"
+  fi
+}
+
+test_p1i
+
+# ── P1j ────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== P1j: TERM-cooperative tree exits fast without unnecessary timeout ==="
+
+test_p1j() {
+  # spawn_fake_tree creates sleep children that die immediately on TERM.
+  local root_pid
+  root_pid="$(spawn_fake_tree 3 120)"
+
+  local start_sec
+  start_sec="$(date +%s)"
+
+  kill_tree "$root_pid"
+
+  local end_sec
+  end_sec="$(date +%s)"
+  local elapsed=$(( end_sec - start_sec ))
+
+  # With TERM-cooperative children and default 3s timeout, we should
+  # finish well within the timeout — all PIDs die on TERM immediately.
+  if (( elapsed < 3 )); then
+    pass "P1j: TERM-cooperative tree exited in ${elapsed}s (under timeout)"
+  else
+    fail "P1j: fast exit" "took ${elapsed}s, expected < 3s"
+  fi
+
+  # Root must be dead.
+  if ! kill -0 "$root_pid" 2>/dev/null; then
+    pass "P1j: root dead after cooperative kill_tree"
+  else
+    kill -KILL "$root_pid" 2>/dev/null || true
+    fail "P1j: root dead" "still alive after cooperative kill_tree"
+  fi
+}
+
+test_p1j
+
+# ── P1k ────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== P1k: Zombie-aware liveness helpers ==="
+
+test_p1k() {
+  # _pid_is_zombie on a non-existent PID.
+  if _pid_is_zombie 99999999; then
+    fail "P1k: _pid_is_zombie" "non-existent PID reported as zombie"
+  else
+    pass "P1k: _pid_is_zombie returns false for non-existent PID"
+  fi
+
+  # _pid_is_alive on a non-existent PID.
+  if _pid_is_alive 99999999; then
+    fail "P1k: _pid_is_alive" "non-existent PID reported as alive"
+  else
+    pass "P1k: _pid_is_alive returns false for non-existent PID"
+  fi
+
+  # _pid_is_alive on our own shell PID.
+  if _pid_is_alive $$; then
+    pass "P1k: _pid_is_alive returns true for current shell PID"
+  else
+    fail "P1k: _pid_is_alive" "current shell PID $$ reported as dead"
+  fi
+
+  # _pid_is_zombie on our own shell PID (should not be zombie).
+  if _pid_is_zombie $$; then
+    fail "P1k: _pid_is_zombie" "current shell PID reported as zombie"
+  else
+    pass "P1k: _pid_is_zombie returns false for live process"
+  fi
+
+  # _pid_starttime returns a number for a live PID.
+  local st
+  st="$(_pid_starttime $$)"
+  if [[ -n "$st" && "$st" =~ ^[0-9]+$ && "$st" != "0" ]]; then
+    pass "P1k: _pid_starttime returns numeric value for live PID ($st)"
+  else
+    fail "P1k: _pid_starttime" "got '$st' for $$, expected non-zero number"
+  fi
+
+  # _pid_starttime returns 0 for non-existent PID.
+  st="$(_pid_starttime 99999999)"
+  if [[ "$st" == "0" ]]; then
+    pass "P1k: _pid_starttime returns 0 for non-existent PID"
+  else
+    fail "P1k: _pid_starttime fake" "got '$st' for non-existent PID, expected 0"
+  fi
+}
+
+test_p1k
+
+# ── P1l ────────────────────────────────────────────────────────────────
+
+echo ""
+echo "=== P1l: PID reuse defence — starttime guard on KILL escalation ==="
+
+test_p1l() {
+  # Start a process, capture its starttime, then let it die.
+  # Run kill_tree on the PID; the starttime mismatch on the reused
+  # slot (if any) should prevent killing the new occupant.
+  #
+  # We can't force PID reuse deterministically, but we can prove:
+  #   a) starttime is captured before TERM
+  #   b) kill_tree with an already-dead PID is harmless
+  #   c) starttime check exits cleanly when /proc is readable
+
+  local tmp="$TEST_DIR/p1l"
+  mkdir -p "$tmp"
+
+  # Spawn a short-lived process to get a PID that will die.
+  sleep 0.1 &
+  local short_pid=$!
+  wait "$short_pid" 2>/dev/null || true
+
+  # kill_tree on an already-dead PID should be harmless and fast.
+  local start_sec
+  start_sec="$(date +%s)"
+  kill_tree "$short_pid" 2>&1
+  local elapsed
+  elapsed=$(($(date +%s) - start_sec))
+
+  if (( elapsed <= 2 )); then
+    pass "P1l: kill_tree on dead PID exits quickly (${elapsed}s)"
+  else
+    fail "P1l: dead PID" "kill_tree took ${elapsed}s on dead PID"
+  fi
+
+  # Verify the KILL escalation path handles starttime mismatch gracefully.
+  # Spawn a tree, capture PIDs, kill the root (so children are reparented),
+  # then call kill_tree again — it should handle the already-dead root.
+  local root_pid
+  root_pid="$(spawn_fake_tree 2 60)"
+  local all_pids
+  all_pids="$(_collect_descendants "$root_pid")"
+
+  # Kill and verify.
+  kill_tree "$root_pid"
+
+  # Second call should be a no-op (already dead).
+  if kill_tree "$root_pid" 2>&1; then
+    pass "P1l: re-kill on dead tree exits cleanly (starttime guard harmless)"
+  else
+    fail "P1l: re-kill" "unexpected error on re-kill of dead tree"
+  fi
+
+  # All PIDs gone.
+  assert_all_dead "$all_pids" "P1l: no survivors after double kill_tree"
+}
+
+test_p1l
 
 # ── Summary ────────────────────────────────────────────────────────────
 

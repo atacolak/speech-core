@@ -482,6 +482,33 @@ _collect_descendants() {
   done
 }
 
+# ── PID liveness helpers (zombie-aware) ──────────────────────────────
+
+# True if PID exists as a zombie (defunct, waiting for parent reap).
+# Zombies cannot be signalled, but they are effectively dead.
+_pid_is_zombie() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  local state
+  state="$(awk '/^State:/ {print $2}' /proc/"$p"/status 2>/dev/null || true)"
+  [[ "$state" == "Z" || "$state" == "z" ]]
+}
+
+# True if PID exists AND is not a zombie (i.e. it is actually running).
+_pid_is_alive() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  _pid_is_zombie "$p" && return 1
+  return 0
+}
+
+# Capture /proc starttime for PID reuse defence (field 22 of stat).
+_pid_starttime() {
+  local p="$1"
+  awk '{print $22}' /proc/"$p"/stat 2>/dev/null || printf '0'
+}
+
 kill_tree() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
@@ -491,23 +518,72 @@ kill_tree() {
   local pids
   pids="$(_collect_descendants "$pid")"
 
-  # Send SIGTERM to the entire tree (leaf-first order).
+  # Capture start times for PID reuse safety.
+  local -A _kt_starttimes=()
   local p
+  for p in $pids; do
+    _kt_starttimes[$p]="$(_pid_starttime "$p")"
+  done
+
+  # Phase 1: Send SIGTERM to every PID (leaf-first order).
   for p in $pids; do
     kill -TERM "$p" 2>/dev/null || true
   done
 
-  # Wait for the root to exit, bounded by timeout.
+  # Phase 2: Wait for ALL captured PIDs to be dead or zombie.
+  # Unlike the previous implementation that returned as soon as the
+  # root exited, we now hold until every captured descendant is gone.
+  # This closes the escalation hole where a TERM-ignoring descendant
+  # survived because the root exited first.
   local waited=0 max_ticks=$(( _kill_tree_timeout_secs * 10 ))
+  local all_dead=0
   while (( waited < max_ticks )); do
-    kill -0 "$pid" 2>/dev/null || return 0
+    all_dead=1
+    for p in $pids; do
+      if _pid_is_alive "$p"; then
+        all_dead=0
+        break
+      fi
+    done
+    (( all_dead )) && break
     sleep 0.1 2>/dev/null || true
     waited=$((waited + 1))
   done
 
-  # Escalate: SIGKILL to every survivor in the tree.
+  if (( all_dead )); then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+
+  # Phase 3: Escalate — KILL every survivor.
+  # Verify starttime hasn't changed to avoid killing a reused PID.
   for p in $pids; do
-    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+    if _pid_is_alive "$p"; then
+      local cur_st
+      cur_st="$(_pid_starttime "$p")"
+      if [[ -n "${_kt_starttimes[$p]:-}" && "${_kt_starttimes[$p]}" != "0" && \
+            -n "$cur_st" && "$cur_st" != "0" && \
+            "${_kt_starttimes[$p]}" != "$cur_st" ]]; then
+        # PID was reused; don't kill the new occupant.
+        continue
+      fi
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+
+  # Phase 4: Bounded verify — a brief poll to confirm KILL took effect.
+  local verify_waited=0 verify_max=20  # 2 seconds
+  while (( verify_waited < verify_max )); do
+    all_dead=1
+    for p in $pids; do
+      if _pid_is_alive "$p"; then
+        all_dead=0
+        break
+      fi
+    done
+    (( all_dead )) && break
+    sleep 0.1 2>/dev/null || true
+    verify_waited=$((verify_waited + 1))
   done
 
   # Best-effort reap: only succeeds when we are the direct parent.
@@ -698,6 +774,17 @@ run_speech_out() {
   # Block until the child exits (or is killed by cancel_speech_out).
   local rc=0
   wait "$child_pid" 2>/dev/null || rc=$?
+
+  # The process-substitution stderr helper (> >(while ...)) is a sibling
+  # process tied to a pipe that closes when speech-out exits.  Wait
+  # briefly for any remaining children (the helper, if still flushing).
+  # emit_ui_event already uses "|| true" on the fifo write, so a stalled
+  # pipe won't hang the helper indefinitely.
+  local _ps_grace=0
+  while (( _ps_grace < 10 )); do
+    wait -n 2>/dev/null || break
+    _ps_grace=$((_ps_grace + 1))
+  done
 
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
   # Only remove the pid file if it still points to *our* child —
