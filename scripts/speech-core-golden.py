@@ -1047,7 +1047,7 @@ FRIENDLY_NAMES: Dict[str, str] = {
     "synthetic-min-vad-speech-at-400ms": "Min speech at (400ms)",
     "synthetic-min-vad-speech-above-401ms": "Min speech above (401ms)",
     "synthetic-smart-recheck-schedule": "Smart Turn recheck",
-    "synthetic-acoustic-fallback-installed-1700": "Acoustic fallback (1700ms)",
+    "synthetic-acoustic-fallback-installed-2500": "Acoustic fallback (2500ms)",
     "synthetic-acoustic-fallback-code-default-3500": "Acoustic fallback (3500ms)",
     "synthetic-transcript-silence-close-700": "Transcript silence close",
 }
