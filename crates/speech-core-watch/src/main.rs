@@ -909,12 +909,11 @@ impl TuiModel {
                     .and_then(|v| v.as_u64())
                     .unwrap_or_default();
                 let energy_rms = value.get("energy_rms").and_then(|v| v.as_f64());
-                let energy_threshold = value.get("energy_threshold").and_then(|v| v.as_f64());
                 let energy_gated = value
                     .get("energy_gated")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                self.push_vad_bar(0, probability, smoothed, silence, hangover, energy_rms, energy_threshold, energy_gated);
+                self.push_vad_bar(0, probability, smoothed, silence, hangover, energy_rms, energy_gated);
                 // Update fallback timer bar from vad_meter.
                 let fallback_progress = value
                     .get("fallback_progress_ms")
@@ -1226,8 +1225,7 @@ impl TuiModel {
         silence: u64,
         hangover: u64,
         energy_rms: Option<f64>,
-        energy_threshold: Option<f64>,
-        energy_gated: bool,
+        _energy_gated: bool,
     ) {
         let raw = bar8(probability);
         let smooth = bar8(smoothed);
@@ -1237,14 +1235,14 @@ impl TuiModel {
             format!("{}/{}", silence.min(hangover), hangover)
         };
         let energy_part = if let Some(rms) = energy_rms {
-            let threshold = energy_threshold.unwrap_or(0.0);
-            // Scale the energy bar relative to a fixed upper bound (10x the
-            // configured threshold). This makes the threshold position stable
-            // and shows headroom above the gate.
-            let upper_bound = if threshold > 0.0 { threshold * 10.0 } else { 1.0 };
-            let energy_bar = bar8(rms / upper_bound);
-            let gate_indicator = if energy_gated { "🔒" } else { "  " };
-            format!("energy:{energy_bar} {rms:.3}/{upper_bound:.3} (thr {threshold:.3}) {gate_indicator}  ")
+            // Fixed 0..1 scale for the RMS bar so the display is stable across
+            // different threshold settings. The gate threshold itself is a
+            // daemon-side policy; the TUI just shows the measured energy.
+            let energy_bar = bar8(rms);
+            // Lightning marker when there is appreciable acoustic energy.
+            // Single-space placeholder keeps alignment because ϟ is single-width.
+            let marker = if rms >= 0.1 { "ϟ" } else { " " };
+            format!("{marker}energy:{energy_bar} {rms:.3}  ")
         } else {
             String::new()
         };
