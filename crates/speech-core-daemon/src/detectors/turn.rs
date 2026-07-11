@@ -1369,15 +1369,25 @@ impl TurnSession {
         // Emit transcript_committed before turn_closed — this is the controller
         // dispatch trigger. It constructs per-turn committed text from shared model
         // state, sliced by the turn-start token-count baseline and sample boundaries.
+        //
+        // The VAD-derived end_sample can be premature (e.g. acoustic fallback)
+        // while the ASR still commits tokens whose audio extends past it. Extend
+        // the snapshot boundary to the latest committed token end so those final
+        // words are not dropped from the turn text. The turn's lifecycle end_sample
+        // stays unchanged for boundary ordering.
         let session_id = &self.hello.stream_session_id;
         let baseline_token_count = self.current_turn_start_token_count;
+        let snapshot_end_sample = model_progress
+            .and_then(|progress| progress.last_token_end_sample(session_id))
+            .map(|last_token_end| last_token_end.max(end_sample))
+            .unwrap_or(end_sample);
         let (committed_text, committed_token_count, committed_revision) = model_progress
             .and_then(|progress| {
                 progress.per_turn_committed_snapshot(
                     session_id,
                     baseline_token_count,
                     turn_start_sample,
-                    end_sample,
+                    snapshot_end_sample,
                 )
             })
             .unwrap_or_default();
@@ -3229,6 +3239,65 @@ mod tests {
         // Index 1 is missing → gap → walk stops before reaching index 2.
         assert_eq!(text, "hi");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn per_turn_committed_snapshot_includes_tokens_when_snapshot_end_is_extended() {
+        // Regression: VAD may declare speech ended before the ASR commits the
+        // final word (e.g. acoustic fallback). close_specific_turn extends the
+        // snapshot boundary to the latest committed token end so those final
+        // words are not dropped. This test verifies that when the caller passes
+        // an extended end_sample, per_turn_committed_snapshot includes the late
+        // tokens.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        // "Let's see the" fits inside the VAD segment (0..84_992).
+        for (idx, text, start, end) in [
+            (0u32, " Let", 33_280u64, 34_560u64),
+            (1, "'", 33_280, 34_560),
+            (2, "s", 33_280, 34_560),
+            (3, " see", 43_520, 44_800),
+            (4, " the", 76_800, 78_080),
+        ] {
+            progress.record_token_snapshot(
+                SESSION_ID,
+                crate::model::CommittedTokenSnapshot {
+                    index: idx,
+                    text: text.into(),
+                    start_sample: start,
+                    end_sample: end,
+                },
+            );
+        }
+        // "noise" is committed before close but its audio starts at 97_280,
+        // well past the VAD-derived turn end of 84_992.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 5,
+                text: " no".into(),
+                start_sample: 97_280,
+                end_sample: 98_560,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 6,
+                text: "ise".into(),
+                start_sample: 97_280,
+                end_sample: 98_560,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "Let's see the noise", 7, 4);
+
+        // close_specific_turn would compute snapshot_end_sample = max(84_992, 98_560).
+        let (text, count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 16_384, 98_560)
+            .unwrap();
+        assert_eq!(text, " Let's see the noise");
+        assert_eq!(count, 7);
     }
 
     #[test]
