@@ -130,6 +130,55 @@ this is less magical and less chatty. good.
 - cross-host capture latency is preserved but not calibrated.
 - docs under `~/workspace/docs/speech-core` contain older planning/spec history; useful archaeology, not current runtime source of truth.
 
+## manual testing commands
+
+These are the commands that actually exercise the seams right now.
+
+### speech-in only
+
+```bash
+speech-core-live-session
+```
+
+Captures your mic, sends audio to the daemon, and prints the live transcript plus `<EOU>` when a turn closes. Use `--debug-tui` to see VAD bars, fallback timer, and smart-turn probe chain.
+
+### speech-in + speech-out loop
+
+```bash
+speech-out-live-session \
+  --response-text "Lorem Ipsum is simply dummy text..." \
+  --steps 5 \
+  --speed 1.3 \
+  --voice M1 \
+  --play-command pw-play \
+  --trace-vad
+```
+
+This is the end-to-end harness. It captures your mic, speaks the response text after your turn closes, and shows the same debug TUI as `speech-core-live-session` with the spoken response appended. `--trace-vad` keeps the VAD energy bar visible.
+
+### golden tests
+
+The golden suite validates recording, assertion, and harness machinery with synthetic/mocked data. It is not a live microphone test. You have not needed it yet. When you do:
+
+```bash
+scripts/speech-core-golden.py --help
+scripts/speech-core-golden-assert.py --help
+```
+
+### session artifacts
+
+Every live session writes a directory under `~/.local/state/speech-core/session/`:
+
+```text
+mic.wav           captured microphone audio
+watch.jsonl       raw daemon events
+ui-events.jsonl   harness/TUI events
+trigger.log       speech-out dispatch decisions
+params.env        exact flags/env used
+```
+
+These are the exports. They let you replay or inspect a session after it ends.
+
 ## useful commands
 
 server daemon:
