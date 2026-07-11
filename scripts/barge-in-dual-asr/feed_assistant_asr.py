@@ -145,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--url", default=DEFAULT_CORE_WS)
     p.add_argument("--stream-id", default=ASSISTANT_STREAM_ID)
+    p.add_argument(
+        "--stream-session-id",
+        default=None,
+        help="Optional stream_session_id for the assistant.self_asr feed",
+    )
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument("--no-realtime", action="store_true")
     args = p.parse_args(argv)
@@ -153,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=args.repo_root,
         core_ws=args.url,
         stream_id=args.stream_id,
+        stream_session_id=args.stream_session_id,
         realtime=not args.no_realtime,
         out_dir=args.out_dir,
     )

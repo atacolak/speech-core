@@ -268,6 +268,21 @@ tts_echo_deadline_file="$run_dir/speech-out-echo-deadline"
 echo_suppress_secs="${SPEECH_OUT_ECHO_SUPPRESS_SECS:-2}"
 echo_suppress_enabled="${SPEECH_OUT_ECHO_SUPPRESS:-1}"
 
+# Assistant self-ASR (Nemotron B) — real path inside this live session only.
+# Tee captures WAV chunks that were actually handed to the local player.
+assistant_self_asr_enabled="${SPEECH_OUT_ASSISTANT_SELF_ASR:-1}"
+assistant_capture_dir="$run_dir/assistant_self_asr/played_chunks"
+assistant_manifest="$run_dir/assistant_self_asr/played_manifest.jsonl"
+assistant_b_watch_log="$run_dir/assistant_self_asr/b_watch.jsonl"
+assistant_cut_dir="$run_dir/assistant_self_asr"
+assistant_pad_words="${SPEECH_OUT_ASSISTANT_CUT_PAD_WORDS:-2}"
+assistant_b_feed_pid=""
+assistant_b_watch_pid=""
+tee_play_script="$script_dir/speech-out-tee-play.sh"
+if [[ ! -x "$tee_play_script" && -f "$tee_play_script" ]]; then
+  chmod +x "$tee_play_script" 2>/dev/null || true
+fi
+
 cat <<EOF_START
 speech-out developer live session
   speech-core ws: $core_ws_url
@@ -280,11 +295,13 @@ speech-out developer live session
   steps/speed:    $steps / $speed
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
+  assistant_B:    self-asr=$assistant_self_asr_enabled (tee play → Nemotron B drain on barge)
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
   live params:    $run_dir/params.env
 EOF_START
+mkdir -p "$assistant_capture_dir" "$assistant_cut_dir"
 if [[ -n "$reference" ]]; then echo "  reference:      $reference"; fi
 if [[ -n "$style" ]]; then echo "  style:          $style"; fi
 if [[ ${#record_arg[@]} -gt 0 ]]; then echo "  record_wav:     $record_wav"; fi
@@ -638,6 +655,107 @@ tts_active() {
 _speech_out_cancelled=0
 _speech_out_cancel_reason=""
 
+count_assistant_played_chunks() {
+  local n=0
+  if compgen -G "$assistant_capture_dir/chunk_*.wav" > /dev/null 2>&1; then
+    n="$(find "$assistant_capture_dir" -maxdepth 1 -name 'chunk_*.wav' 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  printf '%s' "${n:-0}"
+}
+
+# After barge: feed already-played assistant WAV into Nemotron B (separate stream).
+start_assistant_self_asr_drain() {
+  [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
+  local chunks merged b_session feed_py
+  chunks="$(count_assistant_played_chunks)"
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: start drain played_chunks=$chunks" >>"$trigger_log"
+  emit_ui_event "$(printf '{"event":"assistant_self_asr_drain_started","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","played_chunks":%s}' "$(diagnostic_mono_ns)" "$session_id" "$chunks")"
+
+  if (( chunks < 1 )); then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: no played chunks yet — cut will use pad fallback" >>"$trigger_log"
+    return 0
+  fi
+
+  merged="$assistant_cut_dir/assistant_played.wav"
+  # Merge tee-captured chunks (real audio that reached the player).
+  python3 "$script_dir/assistant-self-asr-finalize-cut.py" \
+    --intended-text "$(cat "$tts_expected_file" 2>/dev/null || true)" \
+    --out-dir "$assistant_cut_dir" \
+    --merge-chunks-dir "$assistant_capture_dir" \
+    --played-chunks "$chunks" \
+    --merge-only \
+    >>"$trigger_log" 2>&1 || true
+
+  if [[ ! -f "$merged" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: merge failed — no assistant_played.wav" >>"$trigger_log"
+    return 0
+  fi
+
+  b_session="${session_id}-assistant-self-asr"
+  feed_py="$script_dir/barge-in-dual-asr/feed_assistant_asr.py"
+  if [[ ! -f "$feed_py" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed helper missing at $feed_py" >>"$trigger_log"
+    return 0
+  fi
+
+  # Watch Nemotron B stream (separate stream_session_id).
+  : >"$assistant_b_watch_log"
+  "$bin_dir/speech-core-watch" \
+    --url "$core_ws_url" \
+    --stream-id "assistant.self_asr" \
+    --stream-session-id "$b_session" \
+    --mode jsonl \
+    >>"$assistant_b_watch_log" 2>>"$trigger_log" &
+  assistant_b_watch_pid=$!
+
+  # Feed merged WAV into speech-core as assistant.self_asr (Nemotron B).
+  python3 "$feed_py" \
+    "$merged" \
+    --url "$core_ws_url" \
+    --stream-id "assistant.self_asr" \
+    --stream-session-id "$b_session" \
+    --out-dir "$assistant_cut_dir/feed" \
+    >>"$trigger_log" 2>&1 &
+  assistant_b_feed_pid=$!
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid session=$b_session" >>"$trigger_log"
+}
+
+# At user transcript_committed: finalize truncated assistant message (drain primary / pad fallback).
+finalize_assistant_cut() {
+  [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
+  local intended chunks cut_line
+  intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
+  [[ -n "$intended" ]] || return 0
+  chunks="$(count_assistant_played_chunks)"
+
+  # Give B a brief moment to flush if feed is still running (user already spoke;
+  # this is inside the free window after user EOU).
+  if [[ -n "$assistant_b_feed_pid" ]] && kill -0 "$assistant_b_feed_pid" 2>/dev/null; then
+    local _w=0
+    while (( _w < 30 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
+      sleep 0.1
+      _w=$((_w + 1))
+    done
+  fi
+
+  cut_line="$(python3 "$script_dir/assistant-self-asr-finalize-cut.py" \
+    --intended-text "$intended" \
+    --out-dir "$assistant_cut_dir" \
+    --watch-jsonl "$assistant_b_watch_log" \
+    --played-chunks "$chunks" \
+    --pad-words "$assistant_pad_words" \
+    --merge-chunks-dir "$assistant_capture_dir" \
+    2>>"$trigger_log" | head -n1 || true)"
+
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: cut finalized: ${cut_line:-}" >>"$trigger_log"
+  emit_ui_event "$(printf '{"event":"assistant_turn_truncated","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","text":%s,"played_chunks":%s}' \
+    "$(diagnostic_mono_ns)" "$session_id" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${cut_line:-}")" "$chunks")"
+
+  # Stop B watch/feed if still running (best-effort).
+  if [[ -n "$assistant_b_feed_pid" ]]; then kill_tree_no_wait "$assistant_b_feed_pid" 2>/dev/null || true; assistant_b_feed_pid=""; fi
+  if [[ -n "$assistant_b_watch_pid" ]]; then kill_tree_no_wait "$assistant_b_watch_pid" 2>/dev/null || true; assistant_b_watch_pid=""; fi
+}
+
 cancel_speech_out() {
   local trigger="${1:-user_speech}"
   if ! tts_active; then
@@ -665,6 +783,11 @@ cancel_speech_out() {
   kill_tree "$pid"
   rm -f "$tts_pid_file"
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
+
+  # Real dual-Nemotron path: start draining assistant audio (already played) on B.
+  if [[ "$trigger" == "transcript_token_committed" || "$trigger" == "user_speech" ]]; then
+    start_assistant_self_asr_drain || true
+  fi
 }
 
 normalize_for_echo() {
@@ -759,6 +882,24 @@ run_speech_out() {
     current_reference="${SPEECH_OUT_REFERENCE:-$current_reference}"
     current_style="${SPEECH_OUT_STYLE:-$current_style}"
   fi
+  # Real assistant self-ASR capture: tee every WAV that speech-out hands to the
+  # local player into run_dir/assistant_self_asr/played_chunks/ (actual play path).
+  local effective_play_command="$play_command"
+  if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+    if [[ -x "$tee_play_script" || -f "$tee_play_script" ]]; then
+      mkdir -p "$assistant_capture_dir"
+      # Fresh capture for this utterance (do not mix prior turns).
+      rm -f "$assistant_capture_dir"/chunk_*.wav
+      : >"$assistant_manifest"
+      export SPEECH_OUT_TEE_REAL_PLAY="$play_command"
+      export SPEECH_OUT_TEE_CAPTURE_DIR="$assistant_capture_dir"
+      export SPEECH_OUT_TEE_MANIFEST="$assistant_manifest"
+      effective_play_command="$tee_play_script"
+    else
+      echo "[$(date --iso-8601=seconds)] assistant_self_asr: tee script missing; play without capture" >>"$trigger_log"
+    fi
+  fi
+
   local play_args=(
     play
     --url "$out_ws_url"
@@ -766,7 +907,7 @@ run_speech_out() {
     --lang "$current_lang"
     --steps "$current_steps"
     --speed "$current_speed"
-    --play-command "$play_command"
+    --play-command "$effective_play_command"
     --chunk-min-chars "$chunk_min_chars"
     --chunk-max-chars "$chunk_max_chars"
   )
@@ -883,6 +1024,9 @@ while IFS= read -r line; do
           # do not infer it from cumulative updates or revise it after this event.
           turn_text="$(printf '%s\n' "$line" | json_get_string text)"
           turn_committed_seen=1
+          # Finalize assistant truncated cut from Nemotron B drain (or pad fallback)
+          # before dispatching the next canned/response speak.
+          finalize_assistant_cut || true
           dispatch_turn_response transcript_committed
           ;;
         turn_closed)
