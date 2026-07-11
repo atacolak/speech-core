@@ -372,6 +372,11 @@ impl TuiModel {
                 // Authoritative per-turn committed transcript event. Applies
                 // only to a matching open turn; ignores closed turns and
                 // orphan events.
+                //
+                // The event carries the full turn text, but the TUI renders
+                // turn text as section deltas anchored at transcript_prefix.
+                // Compute the delta so the current section shows only the
+                // portion spoken since the last boundary/resume.
                 let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() {
                     return;
@@ -382,7 +387,13 @@ impl TuiModel {
                     .filter(|idx| !self.turns[*idx].closed)
                 {
                     self.set_turn_id(idx, value);
-                    self.turns[idx].text = normalized_text(text);
+                    let prefix = &self.turns[idx].transcript_prefix;
+                    let local = if text.starts_with(prefix) {
+                        &text[prefix.len()..]
+                    } else {
+                        text
+                    };
+                    self.turns[idx].text = normalized_text(local);
                 }
             }
             "turn_started" => {
