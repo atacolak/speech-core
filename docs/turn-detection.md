@@ -92,7 +92,7 @@ human filler / thinking-noise event:
 turn_human_hold reason=speech_like_audio_without_tokens
 ```
 
-this fires when vad keeps seeing speech-like audio but nemotron has not committed any new token for `SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS`. it is intentionally non-closing; consumers can use it later for a tiny tts nudge like "you good?" or a listening-status indicator.
+this fires when vad keeps seeing speech-like audio but nemotron has not committed any new token for `SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS` (7500ms in the installed profile). It immediately forces one degraded `turn_closed source=human_hold` after close-time model drain/alignment. The hold event is still interaction metadata, not user text; controllers dispatch the authoritative `transcript_committed` snapshot and must not treat `turn_human_hold` as a second conversation message.
 
 ## operator surface
 

@@ -293,9 +293,9 @@ the system hears sustained human-like audio,
 but the transcription model is not producing words.
 ```
 
-after 12 seconds of this condition, speech-in emits `turn_human_hold`.
+after 7500 milliseconds of this condition under the installed profile, speech-in emits `turn_human_hold` and immediately performs a degraded close with `source=human_hold`. Close-time model drain still runs first, so any trailing ASR tokens are committed before `turn_closed`.
 
-this is not an end-of-utterance. it is a side-channel signal. later, speech-out can use this to say a small nudge like “still listening” or “take your time,” but the important thing is that this is not confused with the main transcript/turn stream. agents should treat it as diagnostic or interaction metadata, not as a user message.
+`turn_human_hold` itself remains interaction metadata rather than user text: controllers must dispatch only the accompanying authoritative `transcript_committed` snapshot, and must not insert the hold diagnostic into the conversation as a second user message.
 
 ### retired Parakeet realtime EOU
 

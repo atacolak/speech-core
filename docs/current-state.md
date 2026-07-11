@@ -67,7 +67,7 @@ important translation:
 - vad ends speech after 3 smoothed stopping frames, roughly 96ms below stop threshold.
 - turn manager ignores vad segments whose current vad segment duration is under 400ms.
 - smart turn runs after vad speech_end. with the default 3-frame hangover the first probe is at about +96ms after the assumed end sample; if incomplete and no speech resumes, the geometric schedule preserves checks at +192ms, +384ms, +768ms, and +1536ms.
-- if speech-like vad islands continue for 7s after the last committed transcript token without new tokens, the daemon emits `turn_human_hold`; this does not close the turn.
+- if speech-like audio continues for 7500ms after the last committed transcript token without new tokens, the daemon emits `turn_human_hold` and immediately performs one degraded `source=human_hold` close after close-time model drain/alignment.
 - smart turn timeout/unavailable/error fails open to vad close.
 - parakeet realtime eou is disabled by default.
 
