@@ -548,6 +548,9 @@ impl TuiModel {
                     self.push_glyph(idx, "↺");
                     self.finalize_section(idx);
                     self.push_glyph(idx, "◖");
+                    // Anchor the transcript prefix so subsequent cumulative
+                    // transcript_update payloads render only the new delta.
+                    self.turns[idx].transcript_prefix = self.transcript.display.clone();
                 }
                 self.turns[idx].paused = false;
                 self.turns[idx].boundary = None;
@@ -2622,6 +2625,49 @@ mod tests {
         assert!(
             rendered.contains("◖ \"and more\""),
             "second section should only have delta: {rendered}"
+        );
+    }
+
+    #[test]
+    fn smart_turn_recheck_cancelled_cumulative_delta_renders_only_new_section() {
+        // Regression: when smart-turn probes exhaust and then resume, the new
+        // section must only render the transcript delta, not the entire cumulative
+        // text. Modeled on session 2f900030.
+        let mut model = TuiModel::default();
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":1,"committed_text":"So as LoreMIPS are","tentative_text":""}),
+        );
+        // Probes exhaust (turn is considered paused), then speech resumes.
+        apply(
+            &mut model,
+            json!({"event":"smart_turn_recheck_exhausted","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"smart_turn_recheck_cancelled","stream_session_id":"s","reason":"speech_resumed"}),
+        );
+        apply(
+            &mut model,
+            json!({"event":"transcript_update","stream_session_id":"s","revision":2,"committed_text":"So as LoreMIPS are way to find this","tentative_text":""}),
+        );
+
+        let rendered = model.render(false);
+        assert!(
+            rendered.contains("◖ \"So as LoreMIPS are\""),
+            "first section should contain initial text: {rendered}"
+        );
+        assert!(
+            rendered.contains("◖ \"way to find this\""),
+            "second section should only have delta: {rendered}"
+        );
+        assert!(
+            !rendered.contains("◖ \"So as LoreMIPS are way to find this\""),
+            "must not render cumulative text in resumed section: {rendered}"
         );
     }
 
