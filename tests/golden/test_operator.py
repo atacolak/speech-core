@@ -1736,6 +1736,175 @@ class TestPromotionTamperChecks(unittest.TestCase):
         self.assertEqual(code, golden.ExitCode.PASS)
 
 
+class TestGetKeyEOF(unittest.TestCase):
+    """_get_key() must raise EOFError on empty read / closed stdin."""
+
+    def test_get_key_raises_eof_on_empty_read_tty(self):
+        """In raw TTY mode, empty read(1) must raise EOFError."""
+        with patch.object(sys.stdin, "fileno", return_value=0), \
+             patch.object(sys.stdin, "read", return_value=""), \
+             patch("termios.tcgetattr"), \
+             patch("termios.tcsetattr"), \
+             patch("tty.setraw"):
+            with self.assertRaises(EOFError):
+                golden._get_key()
+
+    def test_get_key_raises_eof_on_empty_read_fallback(self):
+        """In line-buffered fallback, empty readline must raise EOFError."""
+        with patch.object(sys.stdin, "readline", return_value=""), \
+             patch("termios.tcgetattr", side_effect=ImportError):
+            with self.assertRaises(EOFError):
+                golden._get_key()
+
+    def test_get_key_returns_normal_char(self):
+        """Normal keypress returns the character."""
+        with patch.object(sys.stdin, "fileno", return_value=0), \
+             patch.object(sys.stdin, "read", return_value="a"), \
+             patch("termios.tcgetattr"), \
+             patch("termios.tcsetattr"), \
+             patch("tty.setraw"):
+            result = golden._get_key()
+            self.assertEqual(result, "a")
+
+    def test_get_key_returns_normal_char_fallback(self):
+        """Fallback returns stripped line."""
+        with patch.object(sys.stdin, "readline", return_value="q\n"), \
+             patch("termios.tcgetattr", side_effect=ImportError):
+            result = golden._get_key()
+            self.assertEqual(result, "q")
+
+
+class TestReviewLoopEOF(unittest.TestCase):
+    """_operator_review_loop must handle EOF (closed stdin) cleanly."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.take_dir = Path(self.tmp) / "take-001"
+        self.take_dir.mkdir()
+        _write_tone_wav(self.take_dir / "audio.wav", 1000)
+        golden.save_file({"test": True}, self.take_dir / "consent.json")
+        golden.save_file({"test": True}, self.take_dir / "privacy.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_review_loop_eof_aborts(self):
+        """EOFError from _get_key must cause RECORDER_ABORTED, not loop."""
+        quality = {
+            "passed": False,
+            "checks": [
+                {"name": "wav_exists", "passed": True},
+            ],
+            "failures": ["Test failure"],
+            "quality": {"duration_ms": 1000, "peak_dbfs": -4.0, "rms_dbfs": -12.0, "clipping_count": 0},
+            "event_count": 0,
+            "dry_run": False,
+        }
+        with patch.object(golden, "_get_key", side_effect=EOFError("stdin closed")):
+            code = golden._operator_review_loop(
+                self.take_dir, quality, "take"
+            )
+            self.assertEqual(code, golden.ExitCode.RECORDER_ABORTED)
+
+    def test_review_loop_eof_dry_run_aborts(self):
+        """EOF during dry-run review loop also aborts (no promotion)."""
+        quality = {
+            "passed": False,
+            "checks": [
+                {"name": "wav_exists", "passed": True},
+            ],
+            "failures": [],
+            "quality": {"duration_ms": 1000, "peak_dbfs": -96.0, "rms_dbfs": -96.0, "clipping_count": 0},
+            "event_count": 0,
+            "dry_run": True,
+        }
+        with patch.object(golden, "_get_key", side_effect=EOFError("stdin closed")):
+            code = golden._operator_review_loop(
+                self.take_dir, quality, "take"
+            )
+            self.assertEqual(code, golden.ExitCode.RECORDER_ABORTED)
+            # No review.json should be written (no accept)
+            review_path = self.take_dir / "review.json"
+            self.assertFalse(review_path.exists(),
+                            "EOF must not accept/promote — review.json should not exist")
+
+
+class TestSubprocessEOFRegression(unittest.TestCase):
+    """Black-box subprocess regression: EOF on stdin must not loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.manifest_path = REPO_ROOT / "tests" / "golden" / "manifest.yaml"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_operator_devnull_bounded_exit(self):
+        """operator --dry-run --scenario with /dev/null must exit within timeout."""
+        script = SCRIPT_DIR / "speech-core-golden.py"
+        out_dir = Path(self.tmp) / "runs"
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, str(script),
+                    "operator",
+                    "--manifest", str(self.manifest_path),
+                    "--scenario", "human-clean-complete",
+                    "--dry-run",
+                    "--out", str(out_dir),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("operator with /dev/null timed out — EOF loop not fixed")
+
+        # Must exit with nonzero (not PASS=0, which would indicate acceptance)
+        self.assertNotEqual(result.returncode, golden.ExitCode.PASS,
+                           "EOF on stdin must not result in PASS (no acceptance)")
+
+        # Verify no accepted review was written
+        take_dirs = list(out_dir.rglob("review.json")) if out_dir.exists() else []
+        for rev_path in take_dirs:
+            try:
+                review = json.loads(rev_path.read_text())
+                self.assertFalse(review.get("accepted", False),
+                                f"EOF on stdin must not produce accepted review at {rev_path}")
+            except Exception:
+                pass
+
+    def test_operator_devnull_no_promotion(self):
+        """operator --dry-run --scenario with /dev/null must not promote."""
+        script = SCRIPT_DIR / "speech-core-golden.py"
+        out_dir = Path(self.tmp) / "runs2"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(script),
+                "operator",
+                "--manifest", str(self.manifest_path),
+                "--scenario", "human-clean-complete",
+                "--dry-run",
+                "--out", str(out_dir),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+
+        # Exit must not be acceptance
+        self.assertNotEqual(result.returncode, 0)
+
+        # Also verify no explicit accept line in stdout
+        stdout_text = result.stdout.decode("utf-8", errors="replace")
+        self.assertNotIn("Accepted", stdout_text)
+        self.assertNotIn("Take accepted", stdout_text)
+
+
 # Pytest-style runner compatible with unittest
 if __name__ == "__main__":
     unittest.main()

@@ -536,7 +536,7 @@ def _cursor_home() -> None:
 
 
 def _get_key() -> str:
-    """Read a single keypress. Returns empty string on EOF."""
+    """Read a single keypress. Raises EOFError on EOF/closed stdin."""
     try:
         import termios
         import tty
@@ -545,6 +545,8 @@ def _get_key() -> str:
         try:
             tty.setraw(fd)
             ch = sys.stdin.read(1)
+            if not ch:
+                raise EOFError("stdin closed")
             # Handle escape sequences
             if ch == "\x1b":
                 extra = sys.stdin.read(2)
@@ -561,9 +563,12 @@ def _get_key() -> str:
             return ch
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except (ImportError, termios.error):
-        # Fallback: line-buffered
-        return sys.stdin.readline().strip()
+    except (ImportError, OSError):
+        # Fallback: line-buffered (ImportError: no termios; OSError: not a TTY)
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError("stdin closed")
+        return line.strip()
 
 
 def _countdown(seconds: int, label: str) -> None:
@@ -780,12 +785,16 @@ def guided_record(
     print()
 
     # Wait for start
-    while True:
-        key = _get_key()
-        if key.lower() == "q":
-            die(ExitCode.RECORDER_ABORTED, "Recorder aborted by operator.")
-        if key in ("\r", "\n", " "):
-            break
+    try:
+        while True:
+            key = _get_key()
+            if key.lower() == "q":
+                die(ExitCode.RECORDER_ABORTED, "Recorder aborted by operator.")
+            if key in ("\r", "\n", " "):
+                break
+    except EOFError:
+        print("\n  [ABORTED] stdin closed (EOF).")
+        return ExitCode.RECORDER_ABORTED
 
     # 3-2-1 READY countdown
     _countdown(3, "READY")
@@ -870,7 +879,7 @@ def guided_record(
                         print("Accepted early.")
                         elapsed = total_sec
                         break
-            except (ImportError, OSError):
+            except (ImportError, OSError, EOFError):
                 time.sleep(0.1)
 
         # ── Recording complete ──
@@ -963,9 +972,12 @@ def guided_record(
                 print(f"  Take left unreviewed: {take_dir}")
                 return ExitCode.PASS
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         _clear_screen()
-        print("\nRecorder interrupted.")
+        if isinstance(sys.exc_info()[1], EOFError):
+            print("\nRecorder aborted: stdin closed (EOF).")
+        else:
+            print("\nRecorder interrupted.")
         # Save partial provenance
         provenance["interrupted_at"] = datetime.now(timezone.utc).isoformat()
         save_file(provenance, provenance_path)
@@ -1467,6 +1479,9 @@ def _operator_real_capture(
                         return ExitCode.RECORDER_ABORTED, capture_info
                     elif key == " ":
                         pass  # toggle display
+            except EOFError:
+                _clear_screen()
+                return ExitCode.RECORDER_ABORTED, capture_info
             except (ImportError, OSError):
                 time.sleep(0.1)
 
