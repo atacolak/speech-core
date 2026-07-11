@@ -78,6 +78,9 @@ impl TurnManager {
         hello: &HelloState,
         writer: &mut DetectorWriter<'_>,
     ) -> Result<()> {
+        // Clear any prior tombstone so reconnect/reuse of the same
+        // stream_session_id is not permanently poisoned.
+        self.closed_sessions.remove(&hello.stream_session_id);
         self.sessions.insert(
             hello.stream_session_id.clone(),
             TurnSession::new(hello.clone()),
@@ -1191,40 +1194,6 @@ impl TurnManager {
                     generation: 0,
                 })
             })
-    }
-
-    /// Returns Some(session) if the session exists; None if the session was
-    /// already closed (tombstoned) and must not be re-created.
-    fn session_mut_no_recreate(
-        &mut self,
-        stream_id: &str,
-        stream_session_id: &str,
-        adapter_id: &str,
-    ) -> Option<&mut TurnSession> {
-        if self.closed_sessions.contains(stream_session_id) {
-            return None;
-        }
-        if !self.sessions.contains_key(stream_session_id) {
-            self.sessions.insert(
-                stream_session_id.to_owned(),
-                TurnSession::new(HelloState {
-                    adapter_id: adapter_id.to_owned(),
-                    stream_id: stream_id.to_owned(),
-                    stream_session_id: stream_session_id.to_owned(),
-                    source_kind: speech_core_protocol::SourceKind::Other,
-                    sample_rate_hz: 16_000,
-                    channels: 1,
-                    format: speech_core_protocol::PcmFormat::PcmF32Le,
-                    timestamp_provenance: speech_core_protocol::TimestampProvenance::uncalibrated(
-                        "unknown",
-                        speech_core_protocol::ClockDomain::Unknown,
-                        speech_core_protocol::TimestampQuality::Unknown,
-                    ),
-                    generation: 0,
-                }),
-            );
-        }
-        self.sessions.get_mut(stream_session_id)
     }
 }
 
@@ -2775,6 +2744,77 @@ mod tests {
     }
 
     #[test]
+    fn end_session_tombstone_cleared_on_explicit_start_same_id() {
+        // Regression: after TurnManager::end_session, a late token is
+        // suppressed. But if start_session is called again with the same
+        // stream_session_id (reconnect/reuse), the tombstone must be
+        // cleared so new transcript tokens can start a valid turn.
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(vad_end(0, 16_000, 17_920));
+        let _events = harness.drain_events();
+        assert!(!actions.is_empty(), "vad_end should close a turn");
+
+        // End the session via the manager.
+        {
+            let mut writer = DetectorWriter::new(&harness.logger, harness.runtime.handle());
+            harness
+                .manager
+                .end_session(SESSION_ID, "test_cleanup", &mut writer)
+                .expect("end_session should succeed");
+        }
+        harness.drain_events();
+
+        // Late token after end_session: must be suppressed.
+        let late_actions = harness.send(transcript_token(0, 3_200, 3_200));
+        assert!(late_actions.is_empty(), "late token must be suppressed");
+
+        // Explicit start_session with the same stream_session_id.
+        {
+            let mut writer = DetectorWriter::new(&harness.logger, harness.runtime.handle());
+            let hello = HelloState {
+                adapter_id: ADAPTER_ID.into(),
+                stream_id: STREAM_ID.into(),
+                stream_session_id: SESSION_ID.into(),
+                source_kind: speech_core_protocol::SourceKind::Synthetic,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                format: speech_core_protocol::PcmFormat::PcmF32Le,
+                timestamp_provenance: speech_core_protocol::TimestampProvenance::uncalibrated(
+                    "test",
+                    speech_core_protocol::ClockDomain::HostMonotonic,
+                    speech_core_protocol::TimestampQuality::SyntheticScheduled,
+                ),
+                generation: 1,
+            };
+            harness
+                .manager
+                .start_session(&hello, &mut writer)
+                .expect("start_session should succeed");
+        }
+        harness.drain_events();
+
+        // New transcript token with same ID after explicit start: must be
+        // accepted and start a valid turn.
+        let new_actions = harness.send(transcript_token(32_000, 32_000, 32_000));
+        let new_events = harness.drain_events();
+        assert!(
+            new_actions.is_empty(),
+            "a plain transcript token should not produce actions; got {new_actions:#?}"
+        );
+        assert!(
+            find_event(&new_events, "turn_started").is_some(),
+            "expected turn_started event after explicit start; got events: {new_events:#?}"
+        );
+        assert_no_event(&new_events, "turn_closed");
+    }
+
+    #[test]
     fn per_turn_committed_snapshot_isolates_punctuation_by_turn_boundaries() {
         // Verifies that punctuation tokens arriving after a turn close are
         // included in the correct turn's snapshot and do not leak into the
@@ -2905,6 +2945,187 @@ mod tests {
         assert_eq!(start, 32_000);
         assert_eq!(end, 49_920);
         assert_eq!(baseline, 2);
+    }
+
+    #[test]
+    fn immediate_tail_punctuation_not_collected_across_turn_boundaries() {
+        // Adversarial regression: index 0 "hello" inside turn 1, index 1 "world"
+        // inside turn 2, index 2 "." after world. The old implementation filtered
+        // every token with index > last_idx that is punctuation, so turn 1 would
+        // incorrectly collect the "." from index 2 by jumping over "world" at
+        // index 1. The immediate-tail walk must stop at "world" (the first
+        // speech-evidence token after last_selected) and never reach ".".
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        // Turn 1 token.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "hello".into(),
+                start_sample: 0,
+                end_sample: 8_000,
+            },
+        );
+        // Turn 2 token (different turn, arrives later).
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: "world".into(),
+                start_sample: 32_000,
+                end_sample: 40_000,
+            },
+        );
+        // Late punctuation arrives after world.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 2,
+                text: ".".into(),
+                start_sample: 40_000,
+                end_sample: 40_240,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "helloworld.", 3, 2);
+
+        // Turn 1 snapshot: baseline 0, turn boundaries 0..16_000.
+        // Selected: index 0 "hello" (0-8000, inside). Index 1 "world" starts at
+        // 32000 which is outside turn 1's end_sample (16_000).
+        let (turn1_text, turn1_count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 0, 16_000)
+            .unwrap();
+        // Must NOT collect "." from index 2 by jumping over "world" at index 1.
+        assert_eq!(turn1_text, "hello");
+        assert_eq!(turn1_count, 1);
+
+        // Turn 2 snapshot: baseline 1, turn boundaries 32_000..48_000.
+        let (turn2_text, turn2_count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 1, 32_000, 48_000)
+            .unwrap();
+        // Turn 2 gets "world" plus its immediate trailing "."
+        assert_eq!(turn2_text, "world.");
+        assert_eq!(turn2_count, 2);
+    }
+
+    #[test]
+    fn immediate_tail_includes_punctuation_when_consecutive() {
+        // Proves that the immediate-tail walk includes a punctuation token
+        // when it is the very next index after the last selected token.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "hello".into(),
+                start_sample: 0,
+                end_sample: 8_000,
+            },
+        );
+        // "." immediately follows "hello" at index 1.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: ".".into(),
+                start_sample: 8_000,
+                end_sample: 8_240,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "hello.", 2, 1);
+
+        let (text, count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 0, 16_000)
+            .unwrap();
+        assert_eq!(text, "hello.");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn immediate_tail_includes_multiple_consecutive_punctuation() {
+        // Proves that multiple consecutive punctuation tokens (e.g. "?!")
+        // are all included by the immediate-tail walk as long as each
+        // successive index is punctuation-only.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "what".into(),
+                start_sample: 0,
+                end_sample: 8_000,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: "?".into(),
+                start_sample: 8_000,
+                end_sample: 8_240,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 2,
+                text: "!".into(),
+                start_sample: 8_240,
+                end_sample: 8_480,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "what?!", 3, 2);
+
+        let (text, count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 0, 16_000)
+            .unwrap();
+        assert_eq!(text, "what?!");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn immediate_tail_stops_at_index_gap() {
+        // Proves the walk stops at the first index gap, even if a later
+        // index holds a punctuation token. The punctuation token must be
+        // outside the turn boundary so it is not selected by the main
+        // filter; only the trailing-punctuation walk could reach it.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: "hi".into(),
+                start_sample: 0,
+                end_sample: 4_000,
+            },
+        );
+        // Index 1 is missing (gap). Index 2 is punctuation, but it starts
+        // outside the turn boundary so only the trailing walk could reach it.
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 2,
+                text: ".".into(),
+                start_sample: 12_000,
+                end_sample: 12_240,
+            },
+        );
+        progress.update_committed_text(SESSION_ID, "hi.", 2, 2);
+
+        // Turn boundary ends at 8_000 (before the "." token).
+        let (text, count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 0, 8_000)
+            .unwrap();
+        // Index 1 is missing → gap → walk stops before reaching index 2.
+        assert_eq!(text, "hi");
+        assert_eq!(count, 1);
     }
 
     #[test]

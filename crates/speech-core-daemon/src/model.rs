@@ -243,19 +243,6 @@ impl ModelProgressMap {
         }
     }
 
-    /// Get the latest committed text snapshot (full cumulative text).
-    pub fn committed_text_snapshot(&self, session_id: &str) -> Option<(String, u32, i32)> {
-        self.inner.lock().ok().and_then(|map| {
-            map.get(session_id).map(|state| {
-                (
-                    state.last_committed_text.clone(),
-                    state.committed_token_count,
-                    state.revision,
-                )
-            })
-        })
-    }
-
     /// Record a committed token snapshot. Called from the model worker for every
     /// committed token (including punctuation).
     pub fn record_token_snapshot(&self, session_id: &str, snapshot: CommittedTokenSnapshot) {
@@ -302,21 +289,38 @@ impl ModelProgressMap {
                             && t.start_sample <= turn_end_sample
                     })
                     .collect();
-                // Include trailing punctuation tokens: if the last selected token is
-                // speech-evidence, also include any immediately-following punctuation
-                // tokens whose start_sample is at/after the last selected end_sample.
+                // Include immediate trailing punctuation tokens: after the
+                // in-boundary selected tokens, walk committed tokens in
+                // token-index order starting at precisely last_selected.index + 1.
+                // Include only consecutive punctuation-only tokens that satisfy
+                // the defined tail/boundary condition. Stop at the first index
+                // gap, first speech-evidence token, or token that cannot belong
+                // to the closing tail. This avoids jumping over a later turn's
+                // speech-evidence tokens to grab dangling punctuation.
                 if let Some(last_selected) = selected.last() {
                     let last_end = last_selected.end_sample;
-                    let last_idx = last_selected.index;
-                    let mut extra: Vec<&CommittedTokenSnapshot> = state
-                        .committed_tokens
-                        .iter()
-                        .filter(|t| {
-                            t.index > last_idx
-                                && t.start_sample >= last_end
-                                && !t.text.chars().any(|ch| ch.is_alphanumeric())
-                        })
-                        .collect();
+                    let mut expected_idx = last_selected.index + 1;
+                    let mut extra: Vec<&CommittedTokenSnapshot> = Vec::new();
+                    for t in state.committed_tokens.iter() {
+                        if t.index < expected_idx {
+                            continue;
+                        }
+                        if t.index != expected_idx {
+                            // Index gap: stop walking.
+                            break;
+                        }
+                        // Speech-evidence token (any alphanumeric): stop walking.
+                        if t.text.chars().any(|ch| ch.is_alphanumeric()) {
+                            break;
+                        }
+                        // Punctuation token must start at/after the last
+                        // selected token's end to belong to this tail.
+                        if t.start_sample < last_end {
+                            break;
+                        }
+                        extra.push(t);
+                        expected_idx += 1;
+                    }
                     selected.append(&mut extra);
                 }
                 let token_count = selected.len() as u32;
