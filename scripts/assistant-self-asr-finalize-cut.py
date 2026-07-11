@@ -14,8 +14,21 @@ import sys
 import wave
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
-_DUAL = _REPO / "scripts" / "barge-in-dual-asr"
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent
+# Support both repo layout (scripts/ + scripts/barge-in-dual-asr/) and
+# client install layout (~/.local/libexec/speech-core/ + .../barge-in-dual-asr/).
+_DUAL_CANDIDATES = [
+    Path(p)
+    for p in (
+        __import__("os").environ.get("SPEECH_CORE_DUAL_ASR_DIR"),
+        _HERE / "barge-in-dual-asr",
+        _REPO / "scripts" / "barge-in-dual-asr",
+        _HERE.parent / "barge-in-dual-asr",
+    )
+    if p
+]
+_DUAL = next((p for p in _DUAL_CANDIDATES if (p / "cut.py").is_file()), _DUAL_CANDIDATES[0])
 if str(_DUAL) not in sys.path:
     sys.path.insert(0, str(_DUAL))
 

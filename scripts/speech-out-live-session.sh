@@ -278,10 +278,61 @@ assistant_cut_dir="$run_dir/assistant_self_asr"
 assistant_pad_words="${SPEECH_OUT_ASSISTANT_CUT_PAD_WORDS:-2}"
 assistant_b_feed_pid=""
 assistant_b_watch_pid=""
-tee_play_script="$script_dir/speech-out-tee-play.sh"
+
+# Helpers may live next to this script (~/.local/bin) or under libexec when
+# installed via client deploy (not a full git checkout on the laptop).
+libexec_dir="${SPEECH_CORE_LIBEXEC_DIR:-$HOME/.local/libexec/speech-core}"
+helper_dir="${SPEECH_CORE_HELPER_DIR:-$script_dir}"
+if [[ ! -f "$helper_dir/speech-out-tee-play.sh" && -f "$libexec_dir/speech-out-tee-play.sh" ]]; then
+  helper_dir="$libexec_dir"
+fi
+dual_asr_dir="${SPEECH_CORE_DUAL_ASR_DIR:-}"
+if [[ -z "$dual_asr_dir" ]]; then
+  if [[ -d "$helper_dir/barge-in-dual-asr" ]]; then
+    dual_asr_dir="$helper_dir/barge-in-dual-asr"
+  elif [[ -d "$script_dir/barge-in-dual-asr" ]]; then
+    dual_asr_dir="$script_dir/barge-in-dual-asr"
+  else
+    dual_asr_dir="$libexec_dir/barge-in-dual-asr"
+  fi
+fi
+tee_play_script="$helper_dir/speech-out-tee-play.sh"
+finalize_cut_py="$helper_dir/assistant-self-asr-finalize-cut.py"
+if [[ ! -f "$finalize_cut_py" && -f "$libexec_dir/assistant-self-asr-finalize-cut.py" ]]; then
+  finalize_cut_py="$libexec_dir/assistant-self-asr-finalize-cut.py"
+fi
 if [[ ! -x "$tee_play_script" && -f "$tee_play_script" ]]; then
   chmod +x "$tee_play_script" 2>/dev/null || true
 fi
+if [[ -f "$finalize_cut_py" ]]; then
+  chmod +x "$finalize_cut_py" 2>/dev/null || true
+fi
+
+# NixOS laptops often have no `python3` on bare PATH; resolve a real interpreter.
+resolve_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  local cand
+  for cand in \
+    "${SPEECH_CORE_PYTHON3:-}" \
+    "$HOME/.nix-profile/bin/python3" \
+    /etc/profiles/per-user/"$USER"/bin/python3 \
+    /run/current-system/sw/bin/python3; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    printf '%s' "$cand"
+    return 0
+  done
+  # Last resort: any python3 in the nix store (first match).
+  cand="$(ls -1 /nix/store/*python3*-env/bin/python3 2>/dev/null | head -n1 || true)"
+  if [[ -n "$cand" && -x "$cand" ]]; then
+    printf '%s' "$cand"
+    return 0
+  fi
+  return 1
+}
+PYTHON3_BIN="$(resolve_python3 || true)"
 
 cat <<EOF_START
 speech-out developer live session
@@ -677,8 +728,16 @@ start_assistant_self_asr_drain() {
   fi
 
   merged="$assistant_cut_dir/assistant_played.wav"
+  if [[ -z "${PYTHON3_BIN:-}" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: no python3 found; cut will use pad fallback only" >>"$trigger_log"
+    return 0
+  fi
+  if [[ ! -f "$finalize_cut_py" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: finalize helper missing at $finalize_cut_py" >>"$trigger_log"
+    return 0
+  fi
   # Merge tee-captured chunks (real audio that reached the player).
-  python3 "$script_dir/assistant-self-asr-finalize-cut.py" \
+  "$PYTHON3_BIN" "$finalize_cut_py" \
     --intended-text "$(cat "$tts_expected_file" 2>/dev/null || true)" \
     --out-dir "$assistant_cut_dir" \
     --merge-chunks-dir "$assistant_capture_dir" \
@@ -692,7 +751,7 @@ start_assistant_self_asr_drain() {
   fi
 
   b_session="${session_id}-assistant-self-asr"
-  feed_py="$script_dir/barge-in-dual-asr/feed_assistant_asr.py"
+  feed_py="$dual_asr_dir/feed_assistant_asr.py"
   if [[ ! -f "$feed_py" ]]; then
     echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed helper missing at $feed_py" >>"$trigger_log"
     return 0
@@ -709,7 +768,7 @@ start_assistant_self_asr_drain() {
   assistant_b_watch_pid=$!
 
   # Feed merged WAV into speech-core as assistant.self_asr (Nemotron B).
-  python3 "$feed_py" \
+  "$PYTHON3_BIN" "$feed_py" \
     "$merged" \
     --url "$core_ws_url" \
     --stream-id "assistant.self_asr" \
@@ -738,7 +797,11 @@ finalize_assistant_cut() {
     done
   fi
 
-  cut_line="$(python3 "$script_dir/assistant-self-asr-finalize-cut.py" \
+  if [[ -z "${PYTHON3_BIN:-}" || ! -f "$finalize_cut_py" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: cannot finalize cut (python/helper missing)" >>"$trigger_log"
+    return 0
+  fi
+  cut_line="$("$PYTHON3_BIN" "$finalize_cut_py" \
     --intended-text "$intended" \
     --out-dir "$assistant_cut_dir" \
     --watch-jsonl "$assistant_b_watch_log" \
@@ -748,8 +811,10 @@ finalize_assistant_cut() {
     2>>"$trigger_log" | head -n1 || true)"
 
   echo "[$(date --iso-8601=seconds)] assistant_self_asr: cut finalized: ${cut_line:-}" >>"$trigger_log"
+  local cut_json
+  cut_json="$("$PYTHON3_BIN" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${cut_line:-}" 2>/dev/null || printf '""')"
   emit_ui_event "$(printf '{"event":"assistant_turn_truncated","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","text":%s,"played_chunks":%s}' \
-    "$(diagnostic_mono_ns)" "$session_id" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${cut_line:-}")" "$chunks")"
+    "$(diagnostic_mono_ns)" "$session_id" "$cut_json" "$chunks")"
 
   # Stop B watch/feed if still running (best-effort).
   if [[ -n "$assistant_b_feed_pid" ]]; then kill_tree_no_wait "$assistant_b_feed_pid" 2>/dev/null || true; assistant_b_feed_pid=""; fi
