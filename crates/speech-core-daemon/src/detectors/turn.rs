@@ -304,12 +304,20 @@ impl TurnManager {
                                 daemon_mono_ns: now_mono_ns(),
                             })?;
                             if human_hold_silence_samples > 0 {
+                                // Human-hold is per turn, not per session. A new
+                                // turn must never inherit an old turn's token age.
+                                let turn_start_sample = session
+                                    .open_turn
+                                    .as_ref()
+                                    .map(|turn| turn.start_sample)
+                                    .unwrap_or(start_sample);
                                 let token_anchor = model_progress
                                     .as_ref()
                                     .and_then(|progress| {
                                         progress.last_token_end_sample(&stream_session_id)
                                     })
-                                    .unwrap_or(start_sample);
+                                    .unwrap_or(turn_start_sample)
+                                    .max(turn_start_sample);
                                 let samples_without_tokens =
                                     decision_sample.saturating_sub(token_anchor);
                                 if samples_without_tokens >= human_hold_silence_samples
@@ -433,10 +441,19 @@ impl TurnManager {
                 if human_hold_silence_samples == 0 || session.open_turn.is_none() {
                     return Ok(Vec::new());
                 }
+                // Human-hold is per turn, not per session. Clamp the model's
+                // session-wide last-token anchor to this open turn's start so a
+                // fresh barge-in cannot immediately inherit seconds of old age.
+                let turn_start_sample = session
+                    .open_turn
+                    .as_ref()
+                    .map(|turn| turn.start_sample)
+                    .unwrap_or(start_sample);
                 let token_anchor = model_progress
                     .as_ref()
                     .and_then(|progress| progress.last_token_end_sample(&stream_session_id))
-                    .unwrap_or(start_sample);
+                    .unwrap_or(turn_start_sample)
+                    .max(turn_start_sample);
                 let samples_without_tokens = decision_sample.saturating_sub(token_anchor);
                 let hold_progress_ms = samples_to_ms(samples_without_tokens);
                 let open_turn_id = session.open_turn.as_ref().map(|t| t.turn_id.clone());
@@ -577,9 +594,10 @@ impl TurnManager {
                 if session.open_turn.is_none() {
                     session.start_turn(start_sample, "transcript", writer)?;
                     if let Some(ref progress) = mp_baseline {
-                        session.current_turn_start_token_count = progress
-                            .snapshot_token_count_at_turn_start(&stream_session_id)
-                            .unwrap_or(0);
+                        // The model records this token snapshot before emitting
+                        // TranscriptTokenCommitted. Use its index as the baseline
+                        // so the first token that opened the turn is included.
+                        session.current_turn_start_token_count = token_index;
                         if let Some(turn) = session.open_turn.as_ref() {
                             progress.set_current_turn_id(
                                 &stream_session_id,
@@ -592,7 +610,6 @@ impl TurnManager {
                 // A new token resets the hold timer naturally: ModelProgressMap now
                 // reports this end_sample. Keep last_human_hold_token_anchor solely
                 // as a duplicate-fire guard for a hold that already emitted.
-                let _ = token_index;
                 Ok(Vec::new())
             }
             DetectorSignal::VadLowSilence {
@@ -1054,9 +1071,22 @@ impl TurnManager {
         self.closed_sessions.insert(stream_session_id.to_owned());
         if let Some(mut session) = self.sessions.remove(stream_session_id) {
             if let Some(turn) = session.open_turn.take() {
-                let end_sample = session.last_vad_end_sample.unwrap_or(turn.start_sample);
                 let turn_start_sample = turn.start_sample;
                 let mp_ref = self.config.model_progress.as_ref();
+                // A transcript-started turn may have no VAD end of its own. Do
+                // not reuse an older turn's cached VAD boundary; close at the
+                // newest token in this turn, or at the turn start if empty.
+                let token_end_sample = mp_ref
+                    .and_then(|progress| progress.last_token_end_sample(stream_session_id))
+                    .filter(|sample| *sample >= turn_start_sample);
+                let vad_end_sample = session
+                    .last_vad_end_sample
+                    .filter(|sample| *sample >= turn_start_sample);
+                let end_sample = token_end_sample
+                    .into_iter()
+                    .chain(vad_end_sample)
+                    .max()
+                    .unwrap_or(turn_start_sample);
                 session.close_specific_turn(
                     turn.turn_id,
                     "session_end",
@@ -2508,6 +2538,35 @@ mod tests {
     }
 
     #[test]
+    fn fresh_turn_does_not_inherit_previous_token_age_for_human_hold() {
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.record_token(SESSION_ID, 40_000);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            human_hold_silence_ms: 7_500,
+            model_progress: Some(progress),
+            ..Default::default()
+        });
+
+        // Mirrors the live failure: a new barge-in starts long after the
+        // previous turn's last token. Presence only 256ms into this new turn
+        // must not inherit the old session-wide token age and close instantly.
+        harness.send(vad_start(176_128, 179_712));
+        harness.drain_events();
+        let actions = harness.send(vad_presence(176_128, 180_224));
+        let events = harness.drain_events();
+
+        assert!(actions.is_empty());
+        assert_no_event(&events, "turn_human_hold");
+        assert_no_event(&events, "turn_closed");
+        let hold = find_event(&events, "turn_hold").expect("hold progress should be emitted");
+        assert_eq!(
+            hold.get("hold_progress_ms").and_then(Value::as_u64),
+            Some(256)
+        );
+    }
+
+    #[test]
     fn continuous_presence_human_hold_closes_once_and_stale_segment_cannot_reopen() {
         let mut harness = TurnHarness::new(TurnManagerConfig {
             human_hold_silence_ms: 1_000,
@@ -2701,6 +2760,50 @@ mod tests {
                 .iter()
                 .any(|e| e.get("event").and_then(Value::as_str) == Some("turn_eou_candidate")),
             "stale fallback should not emit eou candidate: {stale_events:#?}"
+        );
+    }
+
+    #[test]
+    fn transcript_started_turn_commits_first_token_at_session_end_without_stale_vad_boundary() {
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " cool".into(),
+                start_sample: 216_320,
+                end_sample: 217_600,
+            },
+        );
+        progress.record_token(SESSION_ID, 217_600);
+        progress.update_committed_text(SESSION_ID, " cool", 1, 1);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            model_progress: Some(progress),
+            ..Default::default()
+        });
+
+        harness.send(transcript_token(216_320, 217_600, 217_600));
+        harness.drain_events();
+        {
+            let mut writer = DetectorWriter::new(&harness.logger, harness.runtime.handle());
+            harness
+                .manager
+                .end_session(SESSION_ID, "test_cleanup", &mut writer)
+                .expect("end_session should succeed");
+        }
+        let events = harness.drain_events();
+        let committed = find_event(&events, "transcript_committed")
+            .expect("session end should commit the transcript-started turn");
+        assert_eq!(committed.get("text").and_then(Value::as_str), Some(" cool"));
+        assert_eq!(
+            committed.get("end_sample").and_then(Value::as_u64),
+            Some(217_600)
+        );
+        let closed = find_event(&events, "turn_closed").expect("turn should close");
+        assert_eq!(
+            closed.get("end_sample").and_then(Value::as_u64),
+            Some(217_600)
         );
     }
 

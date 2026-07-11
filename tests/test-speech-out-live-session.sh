@@ -530,6 +530,23 @@ fi
 
 echo ""
 
+# ── T11: first Nemotron speech token controls barge-in ─────────────────
+
+echo "=== T11: first alphanumeric token cancels; VAD alone does not ==="
+
+if grep -q 'if tts_active; then' "$HARNESS" && grep -q 'cancel_speech_out transcript_token_committed' "$HARNESS"; then
+  pass "T11: active speech-out cancels on the first speech-evidence token"
+else
+  fail "T11: first-token cancellation" "token handler still waits for accumulated transcript evidence"
+fi
+if ! grep -q 'vad_speech_start)' "$HARNESS"; then
+  pass "T11: VAD events do not participate in playback cancellation"
+else
+  fail "T11: VAD playback policy" "vad_speech_start still has a playback-policy handler"
+fi
+
+echo ""
+
 # ── T9: run_play signal handling (Rust side) ────────────────────────────
 
 echo "=== T9: run_play signal → Cancel (Rust) ==="

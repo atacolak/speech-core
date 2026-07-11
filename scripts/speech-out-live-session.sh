@@ -822,7 +822,6 @@ dispatch_turn_response() {
 
 turn_text=""
 turn_committed_seen=0
-barge_vad_seen=0
 # ── JSONL watcher topology ──────────────────────────────────────────────
 # Owned, explicit topology: the watcher binary writes to a named FIFO;
 # the consumer while-loop reads from the same FIFO.  Each side gets
@@ -856,23 +855,15 @@ while IFS= read -r line; do
 ' "$line" | json_get_string text)"
           if is_speech_evidence_text "$token"; then
             turn_text+="$token"
-            if suppress_self_echo_if_needed "$turn_text" transcript_token_committed; then
-              :
-            elif tts_active && has_non_echo_transcript_evidence "$turn_text"; then
-              # Transcript is authoritative barge-in evidence. The self-echo guard
-              # above keeps pure speaker loopback from cancelling TTS, so don't
-              # also require VAD: VAD is exactly the component that can lag or miss
-              # when the user starts talking over speaker playback.
-              cancel_speech_out transcript_token_committed
-            elif [[ "$barge_vad_seen" == 1 ]]; then
+            if tts_active; then
+              # The first alphanumeric Nemotron token is authoritative barge-in
+              # evidence. VAD alone never controls playback, and we do not wait
+              # for accumulated text or echo classification before cancelling.
               cancel_speech_out transcript_token_committed
             fi
           else
             echo "[$(date --iso-8601=seconds)] ignore punctuation-only transcript token: $(printf '%q' "$token")" >>"$trigger_log"
           fi
-          ;;
-        vad_speech_start)
-          barge_vad_seen=1
           ;;
         transcript_committed|turn_transcript_committed)
           # Authoritative controller dispatch seam. Closed-turn text is immutable;
@@ -882,7 +873,6 @@ while IFS= read -r line; do
           dispatch_turn_response transcript_committed
           ;;
         turn_closed)
-          barge_vad_seen=0
           # Backward compatibility for older daemons that do not emit
           # transcript_committed. New daemons dispatch exactly once above.
           if [[ "$turn_committed_seen" != "1" ]]; then

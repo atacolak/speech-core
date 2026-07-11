@@ -14,8 +14,8 @@ use speech_core_protocol::{
 use std::f32::consts::TAU;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -308,15 +308,26 @@ async fn run_cpal(
     let mut source_sample_start = 0_u64;
     let mut last_total_dropped_samples = 0_u64;
     let mut pending_gap: Option<SourceSampleGap> = None;
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown_requested);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        shutdown_flag.store(true, Ordering::Release);
+    });
 
     loop {
-        if args.frames.is_some_and(|max| seq >= max) {
+        if shutdown_requested.load(Ordering::Acquire) || args.frames.is_some_and(|max| seq >= max) {
             break;
         }
 
-        let captured = receiver
-            .recv()
-            .map_err(|_| anyhow!("cpal capture channel closed"))?;
+        let captured = match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(captured) => captured,
+            Err(RecvTimeoutError::Timeout) if shutdown_requested.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("cpal capture channel closed"));
+            }
+        };
 
         if captured.total_dropped_samples > last_total_dropped_samples {
             let buffered_to_discard = chunker.discard_buffered_sample_frames() as u64;
@@ -374,6 +385,23 @@ async fn run_cpal(
     drop(capture);
     drop(recorder);
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt()).expect("installing SIGINT listener");
+    let mut terminate = signal(SignalKind::terminate()).expect("installing SIGTERM listener");
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn connect_ws(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
