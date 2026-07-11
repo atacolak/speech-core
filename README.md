@@ -1,516 +1,85 @@
 # speech-core
 
-`speech-core` is the local speech substrate for realtime human/agent interaction.
-
-this repository is organized around two seams:
+Real-time speech substrate for human/agent interaction.
 
 ```text
-speech-in   = the ear: microphone audio -> transcript + turn events
-agent loop  = the brain/router: decides what to do with a completed turn
-speech-out  = the mouth: text -> audible speech
+speech-in   → microphone audio → transcript + turn events
+speech-out  → text → audible speech
+agent loop  → decides what to do with a completed turn
 ```
 
-right now the mature seam is **speech-in**. it listens to live microphone audio, transcribes speech, tracks acoustic speech presence, and decides when a user utterance is ready to hand to an agent.
+The mature seam is **speech-in**. It runs a separate **speech-core-daemon** that ingests timestamped PCM, transcribes with Nemotron, detects voice activity with Silero, semantically endpoints with smart-turn v3, and emits immutable per-turn transcripts.
 
-`speech-out` is the next seam: a separate output path for local text-to-speech, playback, cancellation, and barge-in. it should not live inside the speech-in daemon. input and output are both transformations over data, but their failure modes are different. speech-in must stay low-latency and cannot be blocked by synthesis, playback queues, voice model loading, or output-device nonsense. speech-out must be allowed to own model warmup, utterance queues, audio playback, and interruption.
+**speech-out** is a separate TTS/playback daemon. Input and output do not share a process because their failure modes differ: speech-in must stay low-latency; speech-out owns model warmup, queues, and interruption.
 
-## environment
-
-| var | used by | why |
-|-----|---------|-----|
-| `SPEECH_CORE_WS_URL` | client scripts, adapter | `ws://<server>:8765/ws/audio-ingress` — where the speech-in daemon listens |
-| `SPEECH_OUT_WS_URL` | client scripts, speech-out | `ws://<server>:8788/ws/speech-out` — where the speech-out daemon listens |
-| `SPEECH_CORE_MODEL_PATH` | daemon | path to nemotron GGUF model file |
-| `SPEECH_CORE_VAD_MODEL_PATH` | daemon | path to silero VAD ONNX model (bundled in `models/`) |
-| `SPEECH_CORE_SMART_TURN_MODEL_PATH` | daemon | path to smart-turn-v3 ONNX model |
-| `SPEECH_CORE_LOG_MAX_BYTES` | daemon | rotate `events.jsonl` after this many bytes; default 256MiB, `0` disables |
-| `SPEECH_CORE_LOG_MAX_FILES` | daemon | retained JSONL files including active log; default 8 |
-| `SPEECH_CORE_LOG_FLUSH_INTERVAL_MS` | daemon | periodic durable JSONL flush interval; default 1000ms |
-| `SPEECH_CORE_LOG_FLUSH_BATCH_LINES` | daemon | flush after this many durable events; default 256 |
-
-install scripts write these into `~/.config/speech-core/client.env` and `daemon.env`.
-
-## current operational docs
-
-start here if you are continuing work in a new session:
+## Components
 
 ```text
-docs/current-state.md      current runtime, commands, what works/does not
-docs/turn-detection.md    exact `<EOU>` trigger and tuning knobs
-docs/seams.md             component boundaries and contracts
-docs/session-handoff.md   compact context for the next assistant session
+speech-in
+  speech-core-daemon      ASR + VAD + turn detection
+  speech-core-mic-adapter CPAL mic → websocket
+  speech-core-file-adapter WAV replay → websocket
+  speech-core-watch       transcript/event subscriber + TUI
+  speech-core-protocol    shared messages
+
+speech-out
+  speech-out              TTS + playback streaming
 ```
 
-short version: speech-in currently turns live audio into `transcript_update`, `turn_closed`, and diagnostic side-channel events. silero vad proposes acoustic boundaries; smart-turn v3 checks whether those boundaries sound semantically complete; tiny vad islands under 400ms are ignored; a longer 2500ms acoustic fallback prevents the turn from hanging forever.
+## Core invariants
 
-## workspace
+- A turn, once closed, is immutable. Late punctuation or finalization events do not revise operator-visible state.
+- `transcript_committed` is the authoritative per-turn snapshot. It is emitted after model drain and before `turn_closed`. Controllers dispatch on it.
+- `transcript_finalized` is diagnostic-only.
+- VAD proposes boundaries; smart-turn checks semantic completion; a 2500 ms acoustic fallback prevents hangs.
+- Sustained speech-like audio without ASR tokens for 7500 ms emits `turn_human_hold` and forces a degraded close.
+- RMS energy gating is available server-side as an onset veto. It is currently a fixed-threshold gate and is intentionally conservative.
 
-two peer daemons: one for hearing, one for speaking. the laptop runs adapters and a subscriber; the server runs daemons and models.
+## Environment
 
-```text
-  speech-in (the ear)                 speech-out (the mouth)
-  ──────────────────                  ──────────────────────
-  speech-core-daemon                  speech-out
-    └─ ASR + VAD + turn detection       └─ TTS + playback streaming
+| variable | purpose |
+|----------|---------|
+| `SPEECH_CORE_WS_URL` | `ws://host:8765/ws/audio-ingress` |
+| `SPEECH_OUT_WS_URL` | `ws://host:8788/ws/speech-out` |
+| `SPEECH_CORE_MODEL_PATH` | Nemotron GGUF |
+| `SPEECH_CORE_VAD_MODEL_PATH` | Silero VAD ONNX |
+| `SPEECH_CORE_SMART_TURN_MODEL_PATH` | smart-turn-v3 ONNX |
 
-  speech-core-mic-adapter
-    └─ CPAL mic → websocket
-  speech-core-file-adapter
-    └─ WAV replay → websocket
-  speech-core-watch
-    └─ transcript/event subscriber
+Install scripts write these to `~/.config/speech-core/daemon.env` and `client.env`.
 
-  speech-core-protocol
-    └─ shared: frame envelope, control messages, timing
-```
+## Run
 
-crate names keep the `speech-core-*` prefix because they are installed binaries and script targets. the seam names are the conceptual API: `speech-in` for ingestion/endpointing and `speech-out` for utterance/playback.
-
-The protocol preserves timing provenance required by `docs/speech-core/10-adapter-transport-architecture.md`:
-
-```text
-stream_id
-stream_session_id        # generated by adapter per process/run unless supplied
-adapter_id
-source_kind
-seq
-format                  # pcm_s16le or pcm_f32le
-sample_rate_hz
-channels
-source_sample_start
-sample_count
-source_capture_mono_ns   # adapter-clock timestamp; see timing semantics below
-adapter_send_mono_ns     # adapter-clock timestamp; see timing semantics below
-timestamp_provenance
-preceding_source_gap
-payload
-```
-
-The daemon stamps:
-
-```text
-ingress_receive_mono_ns       # daemon monotonic clock
-ingress_queue_enter_mono_ns   # daemon monotonic clock
-ingress_queue_exit_mono_ns    # daemon monotonic clock
-ingress_queue_depth_frames    # transport queue depth; model queue is separate and only enabled with --model-path
-frames_seen_in_session
-sequence_gap
-sample_gap
-capture_to_ingress            # value is null unless clocks are comparable and timestamp quality is source_capture
-adapter_send_to_ingress       # value is null unless clocks are comparable
-```
-
-## Timing semantics and limitations
-
-`source_capture_mono_ns` uses `timestamp_semantics=first_sample`: it denotes the first sample in the frame, not the frame end.
-
-For cpal capture, the adapter uses `InputCallbackInfo::timestamp()` when it can derive `capture -> callback` duration. In that case the frame is marked `timestamp_quality=source_capture`. If the backend timestamp cannot be related safely, the adapter falls back to local callback receive time and marks `timestamp_quality=callback_receive`.
-
-When a cpal callback contains enough samples for multiple 20 ms frames, only the first frame uses the callback anchor directly. Later frame timestamps are derived from the sample offset and configured sample rate. This avoids assigning one callback timestamp to several audio frames.
-
-Adapter monotonic clocks and daemon monotonic clocks are not assumed comparable across hosts. By default `clock_comparability=uncalibrated`, so JSONL latency measurements are represented as objects like:
-
-```json
-"capture_to_ingress": {"value_ms": null, "status": "uncalibrated", "uncertainty_ms": null}
-```
-
-Raw adapter timestamps are still preserved. The daemon only computes `capture_to_ingress.value_ms` when provenance says clocks are comparable **and** `timestamp_quality=source_capture` with `timestamp_semantics=first_sample`. Comparable clocks with `timestamp_quality=callback_receive`, `synthetic_scheduled`, or `unknown` still produce `capture_to_ingress.value_ms=null` because those are not true capture latency. `adapter_send_to_ingress` only needs clock comparability because send time is an adapter-side event, not a device-capture claim. The current adapter does not perform offset calibration.
-
-## Drops, gaps, and sessions
-
-The adapter generates a `stream_session_id` at startup and sends it in `hello` and every frame. The daemon requires `hello` before binary audio, validates frame metadata against the hello, and treats adapter restarts with the same `stream_id` as new sessions.
-
-The cpal callback boundary tracks buffers dropped because the adapter capture channel is full. Dropped sample counts are added to `source_sample_start`, and the next sent frame includes `preceding_source_gap`. The daemon emits/logs `audio_sample_gap` when it sees either a sample-clock discontinuity or explicit adapter-declared source gap.
-
-Sequence gaps and sample-clock gaps are separate: `audio_gap` reports missing frame sequence numbers; `audio_sample_gap` reports discontinuities in `source_sample_start`.
-
-## Binary audio envelope
-
-WebSocket binary messages use a simple self-delimiting envelope:
-
-```text
-4 bytes magic: SCF1
-1 byte version: 1
-4 bytes big-endian JSON header length
-N bytes JSON AudioFrameHeader
-remaining bytes PCM payload
-```
-
-JSON control messages are sent as WebSocket text messages. `hello` is required for adapter/session identification; server acknowledgements and metric events are also sent as JSON text.
-
-## Run on the server with synthetic adapter
-
-From the repo root:
+Server:
 
 ```bash
-cargo run -p speech-core-daemon -- --bind 127.0.0.1:8765 --log-dir ./logs
-```
-
-In another shell:
-
-```bash
-cargo run -p speech-core-mic-adapter -- \
-  --synthetic \
-  --url ws://127.0.0.1:8765/ws/audio-ingress \
-  --stream-id server.synthetic \
-  --adapter-id server.synthetic.1 \
-  --frames 50
-```
-
-For a synthetic tone instead of silence:
-
-```bash
-cargo run -p speech-core-mic-adapter -- \
-  --synthetic \
-  --synthetic-signal tone \
-  --tone-hz 440 \
-  --frames 50
-```
-
-Inspect daemon events:
-
-```bash
-tail -f ./logs/events.jsonl
-```
-
-On startup the daemon emits one `runtime_provenance` event. It includes a concise `runtime_id`, binary version, event schema version, build/git identity when available (`unknown` if the build environment cannot provide it), a stable fingerprint over redacted effective config, and model artifact paths/fingerprints where practical. `speech-core-watch --verbose` and replay/TUI modes preserve and display the concise runtime/build/config IDs.
-
-Durable JSONL writes are buffered through a logger task so websocket broadcast remains immediate and async hot paths do not flush every event. The default log policy flushes every second or 256 durable events, flushes on graceful shutdown, filters very high-volume per-frame ingest/VAD hold diagnostics from durable JSONL while still broadcasting them live, and rotates `events.jsonl` at 256MiB with 8 files retained (`events.1.jsonl`, ...). Very abrupt process termination can still lose the last unflushed batch; use lower `SPEECH_CORE_LOG_FLUSH_INTERVAL_MS` / `SPEECH_CORE_LOG_FLUSH_BATCH_LINES` when that tradeoff matters.
-
-A typical live `audio_frame_ingested` event includes raw adapter timestamps, timestamp provenance, null/uncalibrated cross-host latency fields, `sequence_gap`, `sample_gap`, and transport queue depth.
-
-## Optional Nemotron streaming model integration
-
-The daemon can opt into the external transcribe.cpp backend with `--model-path`. Omit this flag to preserve the fast transport-only behavior.
-
-```bash
-cargo run -p speech-core-daemon -- \
-  --bind 127.0.0.1:8765 \
-  --log-dir ./logs \
-  --model-path ~/workspace/external/transcribe.cpp/models/nemotron-speech-streaming-en-0.6b-Q4_K_M.gguf \
-  --stream-chunk-ms 160 \
-  --att-context-right 1
-```
-
-Model v1 accepts 16 kHz mono PCM only. `pcm_f32le` is fed directly; `pcm_s16le` is explicitly converted to f32 before transcribe.cpp. Other sample rates/channel counts are rejected with `model_error` events rather than being silently fed to the model.
-
-When enabled, model work runs on a bounded worker queue so websocket receive does not execute transcribe.cpp calls inline. Each `stream_session_id` gets its own transcribe.cpp streaming session; worker execution is serialized to respect the backend's non-thread-safe session/active-stream constraints.
-
-Additional JSONL event names include:
-
-```text
-model_session_start
-model_chunk_processed
-transcript_token_committed
-transcript_update
-transcript_committed
-transcript_finalized
-model_error
-```
-
-`transcript_token_committed` events include stream/session/adapter ids, token index/id/text, token t0/t1 ms, probability when available, source sample coverage estimates derived from token timestamps at 16 kHz, model timing fields, and `alignment_quality: "token"` when token timestamps are valid. `transcript_committed` is the authoritative immutable per-turn snapshot: it is emitted after close-time model drain and before `turn_closed`, and is the controller dispatch trigger. `transcript_finalized` is diagnostic-only and must not revise a committed/closed turn. Cross-host capture latency remains nullable/uncalibrated; this slice does not implement clock calibration.
-
-## speech-in turn detection
-
-`speech-in` turns live microphone audio into structured conversation events.
-
-```text
-microphone audio
-  -> timestamped pcm frames
-  -> websocket ingress
-  -> nemotron streaming transcription
-  -> silero voice activity detection
-  -> smart-turn v3 semantic endpointing
-  -> transcript_update + turn_closed events
-```
-
-the goal is not merely to detect sound. the goal is to detect human utterances well enough that an agent can respond naturally.
-
-that means speech-in has to answer several different questions:
-
-```text
-is there speech-like audio?
-is this speech segment long enough to be human speech rather than a click or flap?
-did the transcription model produce words?
-does the current audio/text sound semantically complete?
-if it does not sound complete yet, should we check again after a little more silence?
-if the system hears human-like sound for a long time but gets no words, should it report that as a hold/debug condition?
-```
-
-### vad policy: acoustic speech presence
-
-silero vad is used as the acoustic speech-presence sensor. it gives the system a low-latency signal that says, approximately, “this sounds like speech” or “this no longer sounds like speech.”
-
-current installed default policy:
-
-```text
-SPEECH_CORE_VAD_THRESHOLD=0.5
-SPEECH_CORE_VAD_HANGOVER_FRAMES=3        # 3 native silero frames ≈ 96ms
-SPEECH_CORE_VAD_SMOOTHING_ALPHA=0.1
-SPEECH_CORE_VAD_STOP_THRESHOLD=0.2
-SPEECH_CORE_VAD_FALLBACK_THRESHOLD=0.1
-SPEECH_CORE_VAD_ACOUSTIC_FALLBACK_SILENCE_MS=2500
-SPEECH_CORE_TURN_MIN_VAD_SPEECH_MS=400   # suppress short mic clicks / noise bursts
-SPEECH_CORE_TURN_VAD_CLOSE_ENABLED=true
-SPEECH_CORE_SMART_TURN_RECHECK_OFFSETS_MS=96,192,384,768,1536
-SPEECH_CORE_TURN_HUMAN_HOLD_SILENCE_MS=7500
-SPEECH_CORE_EOU_MODEL_DIR=               # empty: Parakeet realtime EOU worker disabled
-SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=false
-```
-
-silero runs on its native 512-sample inference window at 16khz, about 32ms. the smoothing matters because raw vad probability can flap during breath, plosives, room noise, or low-energy syllables. instead of treating each raw probability spike as truth, speech-in smooths the probabilities and uses that smoothed state to reduce tiny speech islands and false boundaries.
-
-the minimum speech duration matters too. vad islands under 400ms are not allowed to become real turn candidates. this protects the semantic endpointing layer from being asked to close a “turn” that was only a click, breath, or detector blip.
-
-### smart-turn policy: semantic endpointing
-
-smart-turn v3 is used as the semantic endpointing model. vad tells us there may be a boundary. smart-turn asks a different question:
-
-```text
-does this sound like the user has finished their utterance?
-```
-
-a pause is not always an ending. humans pause mid-sentence. they think, restart, breathe, and make filler sounds. speech-in treats vad silence as a candidate boundary, not as final conversational truth.
-
-the smart-turn model appears to perform best when it gets a small amount of silence after the acoustic boundary, around the low-hundreds of milliseconds range. the current system uses an aggressive early pre-check at about 96ms to test lower-latency behavior, then repeats checks on a geometric schedule:
-
-```text
-96ms, 192ms, 384ms, 768ms, 1536ms
-```
-
-these are offsets after the acoustic end sample.
-
-if smart-turn says the utterance is semantically complete, speech-in closes the turn early. if it says incomplete, the system waits and checks again. this is meant to handle speech where the first pause is not the real end.
-
-there is also an acoustic fallback. if the user stops producing human-like speech and smart-turn still does not confidently close the turn, the system can close after a longer silence window (2500 milliseconds, installed profile; code-default 3500ms) instead of hanging forever.
-
-### human hold event
-
-there is a separate diagnostic event for a weird but important state:
-
-```text
-the system hears sustained human-like audio,
-but the transcription model is not producing words.
-```
-
-after 7500 milliseconds of this condition under the installed profile, speech-in emits `turn_human_hold` and immediately performs a degraded close with `source=human_hold`. Close-time model drain still runs first, so any trailing ASR tokens are committed before `turn_closed`.
-
-`turn_human_hold` itself remains interaction metadata rather than user text: controllers must dispatch only the accompanying authoritative `transcript_committed` snapshot, and must not insert the hold diagnostic into the conversation as a second user message.
-
-### retired Parakeet realtime EOU
-
-Parakeet realtime EOU is retired for now. live laptop tests showed many raw `<EOU>` tokens on silence/background state, and model EOU often arrived late relative to silero speech_end. the code remains in-tree for experiments, but it is not part of the default runtime. to re-enable it intentionally:
-
-```bash
-SPEECH_CORE_EOU_MODEL_DIR=~/workspace/external/parakeet-eou/realtime_eou_120m-v1-onnx \
-SPEECH_CORE_TURN_MODEL_EOU_CLOSE_ENABLED=true \
 ./scripts/install-speech-core-daemon.sh
+systemctl --user restart speech-core-daemon
 ```
 
-If enabled, Parakeet realtime EOU consumes 160 ms / 2560-sample chunks and emits:
-
-```text
-eou_session_start
-eou_chunk_processed
-eou_token_detected
-eou_session_end
-```
-
-The daemon still uses modular detector plumbing: detectors emit evidence, and the turn manager is the only component that promotes evidence into `turn_eou` / `turn_closed`.
-
-The default live watcher now prints transcript text as it appears and prints a clean boundary marker on accepted turn close:
-
-```text
-hello this is a test
-<EOU>
-```
-
-Replay a wav through the daemon for repeatable detector testing:
-
-```bash
-cargo run -p speech-core-file-adapter -- \
-  --url ws://127.0.0.1:8765/ws/audio-ingress \
-  --realtime \
-  --append-silence-ms 3000 \
-  --hold-open-ms 2500 \
-  ~/workspace/external/transcribe.cpp/samples/jfk.wav
-```
-
-`--hold-open-ms` keeps the websocket open after replayed samples finish, which prevents session-end silence flushing from being mistaken for normal live-mic behavior during latency probes.
-
-## Install and persistence
-
-Install the the server daemon as a user systemd service:
-
-```bash
-cd speech-core
-./scripts/install-speech-core-daemon.sh
-```
-
-This installs:
-
-```text
-~/.local/bin/speech-core-daemon
-~/.local/bin/speech-core-watch
-~/.local/bin/speech-core-file-adapter
-~/.config/speech-core/daemon.env
-~/.config/systemd/user/speech-core-daemon.service
-~/.local/state/speech-core/logs/events.jsonl
-```
-
-Useful daemon commands:
-
-```bash
-systemctl --user status speech-core-daemon.service
-systemctl --user restart speech-core-daemon.service
-journalctl --user -u speech-core-daemon.service -f
-```
-
-Install the laptop client after syncing the workspace there:
-
-```bash
-cd /tmp/speech-core-native-build
-./scripts/install-speech-core-client.sh
-```
-
-This installs:
-
-```text
-~/.local/bin/speech-core-mic-adapter
-~/.local/bin/speech-core-watch
-~/.local/bin/speech-core-live-session
-~/.config/speech-core/client.env
-~/.config/systemd/user/speech-core-mic-adapter.service
-```
-
-Interactive laptop command:
-
-```bash
-speech-core-live-session
-```
-
-Always-on mic streaming exists but is intentionally not enabled by default:
-
-```bash
-systemctl --user enable --now speech-core-mic-adapter.service
-systemctl --user status speech-core-mic-adapter.service
-```
-
-## Live transcript session
-
-Start the daemon on the server with the Nemotron model:
-
-```bash
-cd speech-core
-./scripts/start-speech-core-daemon.sh
-```
-
-This prints the JSONL log directory and listens on `0.0.0.0:8765` by default.
-
-On the laptop, run:
-
-```bash
-cd /tmp/speech-core-native-build
-SPEECH_CORE_WS_URL=ws://<server-address>:8765/ws/audio-ingress ./scripts/speech-core-live-session.sh
-```
-
-The session script starts a live transcript watcher and the CPAL mic adapter with one generated `stream_session_id`. Transcript updates are printed as soon as the daemon emits `transcript_update` events. Press `ctrl-c` to stop capture; the script waits briefly for final model/session events.
-
-For raw daemon events instead of transcript text:
-
-```bash
-cd /tmp/speech-core-native-build
-target/debug/speech-core-watch \
-  --url ws://<server-address>:8765/ws/audio-ingress \
-  --stream-id laptop.live_mic \
-  --mode jsonl
-```
-
-## Headless dry run without daemon
-
-This path does not use cpal and does not connect to WebSocket unless `--connect` is also provided:
-
-```bash
-cargo run -p speech-core-mic-adapter -- --dry-run --frames 5
-```
-
-Use this on remote/headless machines to verify the adapter binary and frame construction without audio hardware.
-
-## Real cpal adapter on the laptop
-
-the laptop is NixOS, so do not copy a generic dynamically linked Linux binary from the server and expect it to execute directly. It may fail with the NixOS stub loader (`could not start dynamically linked executable`). Build the adapter on the laptop instead:
+Laptop (NixOS — build natively):
 
 ```bash
 ./scripts/speech-core-sync-build-adapter.sh
+speech-core-live-session
+speech-out-live-session --response-text "hello"
 ```
 
-That rsyncs this workspace to `/tmp/speech-core-native-build` on the laptop and runs:
+Inspect events:
 
 ```bash
-nix-shell --run 'cargo build -p speech-core-mic-adapter -p speech-core-watch'
+tail -f ~/.local/state/speech-core/logs/events.jsonl
 ```
 
-The resulting binary can be run directly on the laptop:
+## Documentation
 
-```bash
-/tmp/speech-core-native-build/target/debug/speech-core-mic-adapter --help
-```
+- `docs/current-state.md` — what works right now
+- `docs/turn-detection.md` — exact EOU triggers and tuning knobs
+- `docs/seams.md` — component boundaries and contracts
+- `docs/speech-output.md` — speech-out protocol and cancellation
 
-List input devices:
+## What we are doing next
 
-```bash
-/tmp/speech-core-native-build/target/debug/speech-core-mic-adapter --list-devices
-```
-
-Run the daemon on the server, listening on the Tailscale-facing address or all interfaces as appropriate:
-
-```bash
-cargo run -p speech-core-daemon -- --bind 0.0.0.0:8765 --log-dir ./logs
-```
-
-Run the native adapter on the laptop:
-
-```bash
-/tmp/speech-core-native-build/target/debug/speech-core-mic-adapter \
-  --url ws://<server>:8765/ws/audio-ingress \
-  --stream-id laptop.default_mic \
-  --adapter-id laptop.cpal.default \
-  --sample-rate-hz 16000 \
-  --channels 1
-```
-
-Select a device by substring if needed:
-
-```bash
-/tmp/speech-core-native-build/target/debug/speech-core-mic-adapter \
-  --device "USB" \
-  --url ws://<server>:8765/ws/audio-ingress \
-  --stream-id laptop.usb_mic
-```
-
-### Current v1 real-capture limitation
-
-The real cpal path is intentionally conservative and does **not** resample or downmix yet. It asks cpal for the wire sample rate/channel count directly, defaulting to 16 kHz mono. If the device does not support that exact shape, the adapter exits with a clear error. Synthetic mode remains the portable smoke-test path.
-
-The adapter currently does not implement a clock offset calibration handshake. From laptop to server, cross-host latency values should remain `status=uncalibrated`/`value_ms=null` until calibration is added.
-
-## Development checks
-
-```bash
-cargo fmt --all
-cargo test --workspace
-cargo check --workspace
-```
-
-## Non-goals for this scaffold
-
-- no cross-host clock calibration yet;
-- no Discord adapter yet;
-- no browser adapter yet;
-- no QUIC/WebRTC transport yet;
-- no daemon config loader yet beyond CLI flags.
-
-
-### speech-out live test harness
-
-`speech-out-live-session` mirrors `speech-core-live-session --debug-tui` by default. It keeps the speech-in observability surface — VAD bars, pause glyphs, smart-turn probe glyphs, close markers — and appends the generated speech-out response below the completed turn. This is the preferred manual harness for feeling end-to-end latency and seeing which seam is responsible for delay.
+- Controller skeleton: consume `transcript_committed`, dispatch agent turns, and manage assistant/user turn alternation.
+- Barge-in alignment: when the user interrupts assistant playback, cut the assistant transcript at the sample where user speech began.
+- Adaptive RMS gate: replace the fixed threshold with a noise-floor-relative onset veto, especially during TTS playback.
+- Monolith cleanup: split `turn.rs`, `speech-core-watch/src/main.rs`, and `speech-core-golden.py` into smaller modules once the controller contract is stable.
