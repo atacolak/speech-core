@@ -908,7 +908,13 @@ impl TuiModel {
                     .get("hangover_frames")
                     .and_then(|v| v.as_u64())
                     .unwrap_or_default();
-                self.push_vad_bar(0, probability, smoothed, silence, hangover);
+                let energy_rms = value.get("energy_rms").and_then(|v| v.as_f64());
+                let energy_threshold = value.get("energy_threshold").and_then(|v| v.as_f64());
+                let energy_gated = value
+                    .get("energy_gated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.push_vad_bar(0, probability, smoothed, silence, hangover, energy_rms, energy_threshold, energy_gated);
                 // Update fallback timer bar from vad_meter.
                 let fallback_progress = value
                     .get("fallback_progress_ms")
@@ -1219,6 +1225,9 @@ impl TuiModel {
         smoothed: f64,
         silence: u64,
         hangover: u64,
+        energy_rms: Option<f64>,
+        energy_threshold: Option<f64>,
+        energy_gated: bool,
     ) {
         let raw = bar8(probability);
         let smooth = bar8(smoothed);
@@ -1227,8 +1236,20 @@ impl TuiModel {
         } else {
             format!("{}/{}", silence.min(hangover), hangover)
         };
+        let energy_part = if let Some(rms) = energy_rms {
+            let threshold = energy_threshold.unwrap_or(0.0);
+            // Scale the energy bar relative to a fixed upper bound (10x the
+            // configured threshold). This makes the threshold position stable
+            // and shows headroom above the gate.
+            let upper_bound = if threshold > 0.0 { threshold * 10.0 } else { 1.0 };
+            let energy_bar = bar8(rms / upper_bound);
+            let gate_indicator = if energy_gated { "🔒" } else { "  " };
+            format!("energy:{energy_bar} {rms:.3}/{upper_bound:.3} (thr {threshold:.3}) {gate_indicator}  ")
+        } else {
+            String::new()
+        };
         self.live_vad_bar =
-            format!("raw:{raw} {probability:.2}  smooth:{smooth} {smoothed:.2}  stop:{quota}");
+            format!("{energy_part}raw:{raw} {probability:.2}  smooth:{smooth} {smoothed:.2}  stop:{quota}");
     }
 
     fn push_fallback_bar(&mut self, progress_ms: u64, target_ms: u64) {

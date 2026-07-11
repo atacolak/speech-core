@@ -698,6 +698,7 @@ impl VadSession {
             } else {
                 None
             },
+            energy_threshold: self.config.energy_threshold,
             energy_gated,
             ingress_receive_mono_ns,
             detector_start_mono_ns: model_start_mono_ns,
@@ -814,6 +815,7 @@ struct VadMeterEvent {
     fallback_progress_ms: u32,
     fallback_target_ms: u32,
     energy_rms: Option<f32>,
+    energy_threshold: f32,
     energy_gated: bool,
     ingress_receive_mono_ns: u64,
     detector_start_mono_ns: u64,
