@@ -1741,7 +1741,8 @@ class TestGetKeyEOF(unittest.TestCase):
 
     def test_get_key_raises_eof_on_empty_read_tty(self):
         """In raw TTY mode, empty read(1) must raise EOFError."""
-        with patch.object(sys.stdin, "fileno", return_value=0), \
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stdin, "fileno", return_value=0), \
              patch.object(sys.stdin, "read", return_value=""), \
              patch("termios.tcgetattr"), \
              patch("termios.tcsetattr"), \
@@ -1758,7 +1759,8 @@ class TestGetKeyEOF(unittest.TestCase):
 
     def test_get_key_returns_normal_char(self):
         """Normal keypress returns the character."""
-        with patch.object(sys.stdin, "fileno", return_value=0), \
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+             patch.object(sys.stdin, "fileno", return_value=0), \
              patch.object(sys.stdin, "read", return_value="a"), \
              patch("termios.tcgetattr"), \
              patch("termios.tcsetattr"), \
@@ -1865,6 +1867,9 @@ class TestSubprocessEOFRegression(unittest.TestCase):
         # Must exit with nonzero (not PASS=0, which would indicate acceptance)
         self.assertNotEqual(result.returncode, golden.ExitCode.PASS,
                            "EOF on stdin must not result in PASS (no acceptance)")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        self.assertNotIn("Traceback", stderr_text,
+                         f"EOF must exit cleanly without traceback: {stderr_text}")
 
         # Verify no accepted review was written
         take_dirs = list(out_dir.rglob("review.json")) if out_dir.exists() else []

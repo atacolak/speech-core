@@ -537,38 +537,50 @@ def _cursor_home() -> None:
 
 def _get_key() -> str:
     """Read a single keypress. Raises EOFError on EOF/closed stdin."""
-    try:
-        import termios
-        import tty
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if not ch:
-                raise EOFError("stdin closed")
-            # Handle escape sequences
-            if ch == "\x1b":
-                extra = sys.stdin.read(2)
-                if extra == "[A":
-                    return "UP"
-                elif extra == "[B":
-                    return "DOWN"
-                elif extra == "[C":
-                    return "RIGHT"
-                elif extra == "[D":
-                    return "LEFT"
-                else:
-                    return "ESC"
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except (ImportError, OSError):
-        # Fallback: line-buffered (ImportError: no termios; OSError: not a TTY)
+    def read_line_fallback() -> str:
         line = sys.stdin.readline()
         if not line:
             raise EOFError("stdin closed")
         return line.strip()
+
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return read_line_fallback()
+
+    # Pipes and /dev/null are not terminals. Avoid attempting tcgetattr on
+    # them so explicit noninteractive dry-run automation exits cleanly on EOF
+    # instead of leaking a termios traceback.
+    if not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+        return read_line_fallback()
+
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        return read_line_fallback()
+
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if not ch:
+            raise EOFError("stdin closed")
+        # Handle escape sequences
+        if ch == "\x1b":
+            extra = sys.stdin.read(2)
+            if extra == "[A":
+                return "UP"
+            elif extra == "[B":
+                return "DOWN"
+            elif extra == "[C":
+                return "RIGHT"
+            elif extra == "[D":
+                return "LEFT"
+            return "ESC"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _countdown(seconds: int, label: str) -> None:
