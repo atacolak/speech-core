@@ -434,7 +434,10 @@ keyboard_loop() {
 # Prefer /dev/tty for interactive sessions; fall back to stdin if it is a terminal;
 # otherwise leave keyboard disabled.
 _keyboard_fd=""
-if [[ -r /dev/tty && -c /dev/tty ]]; then
+# The subshell owns both the redirection and its diagnostic output. Without
+# this wrapper, bash itself reports `/dev/tty: No such device or address`
+# before `stty`'s redirection is applied when no controlling terminal exists.
+if [[ -r /dev/tty && -c /dev/tty ]] && (stty -g </dev/tty) &>/dev/null; then
   _keyboard_fd=/dev/tty
 elif [[ -t 0 ]]; then
   _keyboard_fd=/dev/stdin
@@ -444,7 +447,9 @@ if [[ -n "$_keyboard_fd" ]]; then
   keyboard_pid=$!
 else
   keyboard_pid=""
-  echo "keyboard: no tty available — j/k/h/l/q controls disabled (set SPEECH_OUT_NO_TTY_OK=1 to suppress this message)" >&2
+  if [[ "${SPEECH_OUT_NO_TTY_OK:-0}" != "1" && "${SPEECH_OUT_NO_TTY_OK:-0}" != "true" && "${SPEECH_OUT_NO_TTY_OK:-0}" != "yes" ]]; then
+    echo "keyboard: no tty available — j/k/h/l/q controls disabled (set SPEECH_OUT_NO_TTY_OK=1 to suppress this message)" >&2
+  fi
 fi
 
 # ── Process management ──────────────────────────────────────────────────
@@ -818,12 +823,26 @@ dispatch_turn_response() {
 turn_text=""
 turn_committed_seen=0
 barge_vad_seen=0
+# ── JSONL watcher topology ──────────────────────────────────────────────
+# Owned, explicit topology: the watcher binary writes to a named FIFO;
+# the consumer while-loop reads from the same FIFO.  Each side gets
+# its own PID so cleanup can kill_tree the actual binary directly.
+# The previous pipe-based approach captured a pipeline subshell PID
+# that did not reliably own the watcher binary.
+
+watch_fifo="$run_dir/watch.fifo"
+rm -f "$watch_fifo"
+mkfifo "$watch_fifo"
+
 "$bin_dir/speech-core-watch" \
   --url "$core_ws_url" \
   --stream-id "$stream_id" \
   --stream-session-id "$session_id" \
   --mode jsonl \
-  | while IFS= read -r line; do
+  > "$watch_fifo" &
+watch_pid=$!
+
+while IFS= read -r line; do
       printf '%s\n' "$line" >>"$watch_log"
       emit_ui_event "$line"
       event="$(printf '%s\n' "$line" | json_get_string event)"
@@ -873,8 +892,8 @@ barge_vad_seen=0
           turn_committed_seen=0
           ;;
       esac
-    done &
-watch_pid=$!
+    done < "$watch_fifo" &
+consumer_pid=$!
 
 # ── Cleanup and signal handling ─────────────────────────────────────────
 #
@@ -938,6 +957,13 @@ cleanup() {
     keyboard_pid=""
   fi
 
+  # Terminate JSONL consumer first (closes the FIFO read end so the
+  # watcher sees a broken pipe and exits cleanly).
+  if [[ -n "${consumer_pid:-}" ]]; then
+    kill_tree "$consumer_pid"
+    wait "$consumer_pid" 2>/dev/null || true
+  fi
+
   # Terminate watchers.
   if [[ -n "${watch_pid:-}" ]]; then
     kill_tree "$watch_pid"
@@ -952,7 +978,7 @@ cleanup() {
   reap_stale_session_processes "$session_id" || true
 
   # Clean up named pipes.
-  rm -f "$event_fifo" "$param_update_fifo" 2>/dev/null || true
+  rm -f "$event_fifo" "$param_update_fifo" "$watch_fifo" 2>/dev/null || true
 
   echo
   echo "session ended"
