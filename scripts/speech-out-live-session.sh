@@ -819,23 +819,23 @@ finalize_assistant_cut() {
   [[ -n "$intended" ]] || return 0
   chunks="$(count_assistant_played_chunks)"
 
-  # Wait for Nemotron B feed to finish (realtime playback of teed audio can take
-  # several seconds). Then allow a short drain window for transcript commits.
+  # Wait for Nemotron B feed only when this function is run (prefer background
+  # so user-turn dispatch is never blocked). Cap wait tightly — partial B text
+  # is enough for force-align; pad fallback covers the rest.
   if [[ -n "$assistant_b_feed_pid" ]] && kill -0 "$assistant_b_feed_pid" 2>/dev/null; then
     local _w=0
-    # Up to ~20s for feed (wav length + silence + hold).
-    while (( _w < 200 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
-      sleep 0.1
+    while (( _w < 80 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
+      sleep 0.05
       _w=$((_w + 1))
     done
   fi
-  # Extra settle for detector → watch jsonl after feed exits.
+  # Brief settle for watch jsonl; do not stall if empty.
   local _s=0
-  while (( _s < 30 )); do
-    if [[ -s "$assistant_b_watch_log" ]] && rg -q '"event":"transcript_committed"|"event":"turn_transcript_committed"|"event":"transcript_update"' "$assistant_b_watch_log" 2>/dev/null; then
+  while (( _s < 20 )); do
+    if [[ -s "$assistant_b_watch_log" ]] && rg -q '"event":"transcript_update"|"event":"transcript_committed"|"event":"turn_transcript_committed"' "$assistant_b_watch_log" 2>/dev/null; then
       break
     fi
-    sleep 0.1
+    sleep 0.05
     _s=$((_s + 1))
   done
 
@@ -1154,10 +1154,11 @@ while IFS= read -r line; do
           # do not infer it from cumulative updates or revise it after this event.
           turn_text="$(printf '%s\n' "$line" | json_get_string text)"
           turn_committed_seen=1
-          # Finalize assistant truncated cut from Nemotron B drain (or pad fallback)
-          # before dispatching the next canned/response speak.
-          finalize_assistant_cut || true
+          # CRITICAL LATENCY: dispatch speech-out immediately. Never block the
+          # next assistant reply on Nemotron B cut finalization. Cut updates the
+          # TUI asynchronously (grey/white) when B drain is ready.
           dispatch_turn_response transcript_committed
+          finalize_assistant_cut &
           ;;
         turn_closed)
           # Backward compatibility for older daemons that do not emit
