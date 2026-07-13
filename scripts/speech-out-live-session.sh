@@ -265,6 +265,9 @@ trigger_log="$run_dir/trigger.log"
 tts_pid_file="$run_dir/speech-out-play.pid"
 tts_expected_file="$run_dir/speech-out-expected.txt"
 tts_echo_deadline_file="$run_dir/speech-out-echo-deadline"
+# Wall-clock ms when current speech-out play child was spawned (for barge trim).
+assistant_play_start_ms_file="$run_dir/assistant_play_start_ms"
+assistant_play_start_ms=0
 echo_suppress_secs="${SPEECH_OUT_ECHO_SUPPRESS_SECS:-2}"
 echo_suppress_enabled="${SPEECH_OUT_ECHO_SUPPRESS:-1}"
 
@@ -779,6 +782,47 @@ start_assistant_self_asr_drain() {
     return 0
   fi
 
+  # Trim to audio actually audible before barge. Teed chunks are full TTS
+  # buffers (often the whole sentence); without trim, B ASR greys everything
+  # and steals Nemotron CPU while the user is speaking.
+  local start_ms now_ms elapsed_ms feed_wav
+  start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+  now_ms="$(($(date +%s%N) / 1000000))"
+  if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
+    elapsed_ms=$((now_ms - start_ms))
+  else
+    elapsed_ms=1500
+  fi
+  # Small pad so we don't cut the last half-word; clamp to [200ms, full].
+  if (( elapsed_ms < 200 )); then elapsed_ms=200; fi
+  feed_wav="$assistant_cut_dir/assistant_played_trimmed.wav"
+  "$PYTHON3_BIN" - <<PY >>"$trigger_log" 2>&1 || true
+import wave
+from pathlib import Path
+src = Path("$merged")
+dst = Path("$feed_wav")
+ms = int("$elapsed_ms")
+with wave.open(str(src), "rb") as w:
+    rate = w.getframerate()
+    ch = w.getnchannels()
+    sw = w.getsampwidth()
+    total = w.getnframes()
+    keep = min(total, max(1, int(rate * (ms / 1000.0))))
+    frames = w.readframes(keep)
+with wave.open(str(dst), "wb") as out:
+    out.setnchannels(ch)
+    out.setsampwidth(sw)
+    out.setframerate(rate)
+    out.writeframes(frames)
+print(f"assistant_self_asr: trim played_ms={ms} keep_frames={keep}/{total} rate={rate}")
+PY
+  if [[ -f "$feed_wav" && -s "$feed_wav" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: using trimmed feed elapsed_ms=$elapsed_ms" >>"$trigger_log"
+  else
+    feed_wav="$merged"
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: trim failed; feeding full merged wav" >>"$trigger_log"
+  fi
+
   b_session="${session_id}-assistant-self-asr"
   feed_py="$dual_asr_dir/feed_assistant_asr.py"
   if [[ ! -f "$feed_py" ]]; then
@@ -796,11 +840,10 @@ start_assistant_self_asr_drain() {
     >>"$assistant_b_watch_log" 2>>"$trigger_log" &
   assistant_b_watch_pid=$!
 
-  # Feed merged WAV into speech-core as assistant.self_asr (Nemotron B).
-  # --no-realtime: still real PCM, but push faster than wall-clock so B can
-  # drain during the user's barge speech window.
+  # Feed trimmed WAV into speech-core as assistant.self_asr (Nemotron B).
+  # --no-realtime: push faster than wall-clock so B finishes during user barge.
   "$PYTHON3_BIN" "$feed_py" \
-    "$merged" \
+    "$feed_wav" \
     --url "$core_ws_url" \
     --stream-id "assistant.self_asr" \
     --stream-session-id "$b_session" \
@@ -808,7 +851,7 @@ start_assistant_self_asr_drain() {
     --no-realtime \
     >>"$trigger_log" 2>&1 &
   assistant_b_feed_pid=$!
-  echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid session=$b_session" >>"$trigger_log"
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid session=$b_session elapsed_ms=$elapsed_ms" >>"$trigger_log"
 }
 
 # At user transcript_committed: finalize truncated assistant message (drain primary / pad fallback).
@@ -1059,6 +1102,10 @@ run_speech_out() {
     done) &
   local child_pid=$!
   printf '%s\n' "$child_pid" >"$tts_pid_file"
+  # Mark play start for barge-time trim of teed assistant audio (B feed must not
+  # include unheard tail of the full TTS chunk).
+  assistant_play_start_ms="$(($(date +%s%N) / 1000000))"
+  printf '%s\n' "$assistant_play_start_ms" >"$assistant_play_start_ms_file"
 
   # Block until the child exits (or is killed by cancel_speech_out).
   local rc=0
