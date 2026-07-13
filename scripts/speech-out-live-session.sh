@@ -480,6 +480,29 @@ select_param() {
   emit_params_event
 }
 
+# Global TTY restore state. keyboard_loop puts the tty into raw/-echo;
+# if that background job is killed (session failure, Ctrl-C, watch disconnect),
+# it never restores. cleanup() always restores from these globals.
+_tty_saved_stty=""
+_tty_restore_fd=""
+
+restore_tty() {
+  # Always try to leave the user's terminal usable after this harness.
+  # Prefer the saved mode; fall back to sane cooked settings.
+  local fd="${_tty_restore_fd:-/dev/tty}"
+  if [[ -n "${_tty_saved_stty:-}" ]]; then
+    stty "$_tty_saved_stty" <"$fd" 2>/dev/null || stty sane <"$fd" 2>/dev/null || true
+  else
+    stty sane <"$fd" 2>/dev/null || true
+  fi
+  # Also reset common alternate-screen / cursor mess from TUI watchers.
+  if [[ -w "$fd" ]]; then
+    printf '\033[?25h\033[0m\033[?1049l' >"$fd" 2>/dev/null || true
+  fi
+  # Best-effort even if fd is wrong.
+  stty sane 2>/dev/null || true
+}
+
 keyboard_loop() {
   local input_fd="$1"
   if [[ ! -r "$input_fd" ]]; then
@@ -488,12 +511,17 @@ keyboard_loop() {
   fi
   emit_params_event
   local key
-  # Save terminal settings so we can restore on exit.
+  # Save terminal settings so we can restore on exit (also stored globally
+  # so cleanup can restore if this job is killed mid-loop).
   local saved_stty
   saved_stty="$(stty -g <"$input_fd" 2>/dev/null || true)"
   if [[ -n "$saved_stty" ]]; then
+    _tty_saved_stty="$saved_stty"
+    _tty_restore_fd="$input_fd"
     stty raw -echo min 1 time 0 <"$input_fd" 2>/dev/null || true
   fi
+  # Ensure restore even if this background job is killed via EXIT/INT/TERM.
+  trap 'restore_tty' EXIT INT TERM
   while IFS= read -rsn1 -t 0.25 key <"$input_fd" 2>/dev/null; do
     [[ -z "$key" ]] && continue
     case "$key" in
@@ -505,10 +533,8 @@ keyboard_loop() {
       $'\x03') kill -INT $$ 2>/dev/null || true; break ;;  # Ctrl-C
     esac
   done
-  # Restore terminal.
-  if [[ -n "$saved_stty" ]]; then
-    stty "$saved_stty" <"$input_fd" 2>/dev/null || true
-  fi
+  restore_tty
+  trap - EXIT INT TERM
 }
 
 # Resolve the best keyboard input file descriptor.
@@ -524,6 +550,9 @@ elif [[ -t 0 ]]; then
   _keyboard_fd=/dev/stdin
 fi
 if [[ -n "$_keyboard_fd" ]]; then
+  # Capture cooked mode in the parent *before* the background job flips raw.
+  _tty_saved_stty="$(stty -g <"$_keyboard_fd" 2>/dev/null || true)"
+  _tty_restore_fd="$_keyboard_fd"
   keyboard_loop "$_keyboard_fd" &
   keyboard_pid=$!
 else
@@ -1162,12 +1191,15 @@ cleanup() {
   # Close the event fifo writer so watchers see EOF.
   exec 3>&- 2>/dev/null || true
 
-  # Terminate keyboard loop.
+  # Terminate keyboard loop, then force TTY restore. Killing the keyboard
+  # job can skip its local restore path (SIGKILL / race), which left the
+  # user's shell with echo off after connection failures.
   if [[ -n "${keyboard_pid:-}" ]]; then
     kill_tree "$keyboard_pid"
     wait "$keyboard_pid" 2>/dev/null || true
     keyboard_pid=""
   fi
+  restore_tty
 
   # Terminate JSONL consumer first (closes the FIFO read end so the
   # watcher sees a broken pipe and exits cleanly).
