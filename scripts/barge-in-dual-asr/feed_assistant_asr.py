@@ -37,6 +37,91 @@ def find_file_adapter(repo_root: Path) -> str | None:
     return None
 
 
+def _wav_probe(path: Path) -> tuple[int, int, int] | None:
+    """Return (nchannels, framerate, sampwidth) or None."""
+    import wave
+
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getnchannels(), w.getframerate(), w.getsampwidth()
+    except Exception:
+        return None
+
+
+def ensure_pcm16_mono_16k(wav_path: Path, out_dir: Path) -> tuple[Path, dict[str, Any]]:
+    """Normalize assistant capture to 16 kHz mono PCM16 for speech-core-file-adapter.
+
+    Supertonic emits 44.1 kHz; Nemotron ingress requires 16 kHz mono.
+    Prefer ffmpeg when available; fall back to stdlib wave linear resample.
+    """
+    meta: dict[str, Any] = {"source": str(wav_path)}
+    probe = _wav_probe(wav_path)
+    if probe is not None:
+        ch, rate, width = probe
+        meta.update({"src_channels": ch, "src_rate": rate, "src_width": width})
+        if ch == 1 and rate == 16_000 and width == 2:
+            meta["resampled"] = False
+            return wav_path, meta
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / "assistant_played_16k.wav"
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(wav_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
+            str(dest),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        meta["ffmpeg_rc"] = proc.returncode
+        if proc.returncode == 0 and dest.is_file() and dest.stat().st_size > 44:
+            meta["resampled"] = True
+            meta["method"] = "ffmpeg"
+            meta["dest"] = str(dest)
+            return dest, meta
+        meta["ffmpeg_err"] = (proc.stderr or proc.stdout or "").strip()[:500]
+
+    # stdlib fallback: linear resample PCM16/mono-or-mix
+    import audioop
+    import wave
+
+    with wave.open(str(wav_path), "rb") as src:
+        ch = src.getnchannels()
+        rate = src.getframerate()
+        width = src.getsampwidth()
+        nframes = src.getnframes()
+        raw = src.readframes(nframes)
+    if ch > 1:
+        raw = audioop.tomono(raw, width, 0.5, 0.5)
+        ch = 1
+    if width != 2:
+        raw = audioop.lin2lin(raw, width, 2)
+        width = 2
+    if rate != 16_000:
+        raw, _ = audioop.ratecv(raw, width, 1, rate, 16_000, None)
+        rate = 16_000
+    with wave.open(str(dest), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(16_000)
+        out.writeframes(raw)
+    meta["resampled"] = True
+    meta["method"] = "audioop"
+    meta["dest"] = str(dest)
+    return dest, meta
+
+
 def feed_wav_to_assistant_stream(
     wav_path: Path,
     *,
@@ -71,6 +156,11 @@ def feed_wav_to_assistant_stream(
     stdout_path = out_dir / "file-adapter.out"
     stderr_path = out_dir / "file-adapter.err"
 
+    feed_wav, resample_meta = ensure_pcm16_mono_16k(wav_path, out_dir)
+    (out_dir / "resample_meta.json").write_text(
+        json.dumps(resample_meta, indent=2) + "\n", encoding="utf-8"
+    )
+
     cmd = [
         adapter,
         "--url",
@@ -87,7 +177,7 @@ def feed_wav_to_assistant_stream(
         str(append_silence_ms),
         "--hold-open-ms",
         str(hold_open_ms),
-        str(wav_path),
+        str(feed_wav),
     ]
     if realtime:
         cmd.insert(-1, "--realtime")
@@ -107,6 +197,8 @@ def feed_wav_to_assistant_stream(
             "error": "file-adapter timed out",
             "cmd": cmd,
             "stream_session_id": session,
+            "resample": resample_meta,
+            "feed_wav": str(feed_wav),
         }
     elapsed_ms = int((time.monotonic() - started) * 1000)
     stdout_path.write_text(proc.stdout or "", encoding="utf-8")
@@ -120,6 +212,8 @@ def feed_wav_to_assistant_stream(
         "stream_session_id": session,
         "adapter_id": adapter_id,
         "wav": str(wav_path),
+        "feed_wav": str(feed_wav),
+        "resample": resample_meta,
         "elapsed_ms": elapsed_ms,
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),

@@ -268,6 +268,11 @@ struct SpeechOutLine {
     text: String,
     chunks: Vec<String>,
     glyphs: Vec<String>,
+    /// When set, render [0..cut) dim grey (spoken/heard before barge) and
+    /// [cut..) normal white (not spoken / cancelled remainder of intended).
+    /// `text` remains the full intended assistant utterance.
+    cut_prefix: Option<String>,
+    cut_source: Option<String>,
 }
 
 impl TuiModel {
@@ -597,6 +602,8 @@ impl TuiModel {
                     text: text.trim().to_owned(),
                     chunks: Vec::new(),
                     glyphs: vec!["⏳".to_owned()],
+                    cut_prefix: None,
+                    cut_source: None,
                 });
                 self.note_event(value, "speech-out request queued".to_owned());
             }
@@ -612,6 +619,8 @@ impl TuiModel {
                             text: text.trim().to_owned(),
                             chunks: Vec::new(),
                             glyphs: Vec::new(),
+                            cut_prefix: None,
+                            cut_source: None,
                         });
                     } else if let Some(output) = self.turns[idx].outputs.last_mut() {
                         output.text = text.trim().to_owned();
@@ -801,6 +810,72 @@ impl TuiModel {
                     .and_then(|v| v.as_str())
                     .unwrap_or("user_speech");
                 self.note_event(value, format!("speech-out cancel requested: {trigger}"));
+            }
+            // Dual-Nemotron cut: spoken prefix (assistant self-ASR / pad fallback)
+            // is dim grey; unsaid remainder of intended text stays normal white.
+            "assistant_turn_truncated" if self.speech_out_ui => {
+                let intended = value
+                    .get("intended_text")
+                    .or_else(|| value.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let spoken = value
+                    .get("spoken_prefix")
+                    .or_else(|| value.get("cut_text"))
+                    .or_else(|| value.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let source = value
+                    .get("primary_cut_source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("fallback")
+                    .to_owned();
+                let idx = self.last_turn_for_output();
+                let full_text = if intended.is_empty() {
+                    spoken.clone()
+                } else {
+                    intended
+                };
+                if let Some(output) = self.turns[idx].outputs.last_mut() {
+                    if !full_text.is_empty() {
+                        output.text = full_text;
+                    }
+                    output.cut_prefix = if spoken.is_empty() {
+                        None
+                    } else {
+                        Some(spoken.clone())
+                    };
+                    output.cut_source = Some(source.clone());
+                    if output
+                        .glyphs
+                        .last()
+                        .is_none_or(|g| g != "✂" && g != "⏹")
+                    {
+                        output.glyphs.push("✂".to_owned());
+                    }
+                } else if !full_text.is_empty() {
+                    self.turns[idx].outputs.push(SpeechOutLine {
+                        text: full_text,
+                        chunks: Vec::new(),
+                        glyphs: vec!["✂".to_owned()],
+                        cut_prefix: if spoken.is_empty() {
+                            None
+                        } else {
+                            Some(spoken.clone())
+                        },
+                        cut_source: Some(source.clone()),
+                    });
+                }
+                let note = if spoken.is_empty() {
+                    format!("assistant cut ({source}): empty")
+                } else {
+                    format!("assistant cut ({source}): {spoken}")
+                };
+                self.note_event(value, note);
             }
             "speech_out_cancel_ack" | "speech_out_cancel_acknowledged" if self.speech_out_ui => {
                 let idx = self.last_turn_for_output();
@@ -1215,6 +1290,8 @@ impl TuiModel {
                 text: "∅".to_owned(),
                 chunks: Vec::new(),
                 glyphs: Vec::new(),
+                cut_prefix: None,
+                cut_source: None,
             });
         }
         let output = self.turns[idx].outputs.last_mut().expect("output exists");
@@ -1434,12 +1511,16 @@ impl TuiTurn {
             out.push_str("  ");
             out.push_str(&glyphs);
             out.push('"');
-            out.push_str(&normalized_speech_out_text(output));
+            out.push_str(&render_speech_out_text(output));
             out.push('"');
         }
         out
     }
 }
+
+/// Dim/grey ANSI for the spoken assistant prefix (what was actually heard / cut).
+const ANSI_DIM: &str = "\u{1b}[2m";
+const ANSI_RESET: &str = "\u{1b}[0m";
 
 fn normalized_speech_out_text(output: &SpeechOutLine) -> String {
     if output.chunks.is_empty() {
@@ -1451,6 +1532,69 @@ fn normalized_speech_out_text(output: &SpeechOutLine) -> String {
         .map(|chunk| normalized_text(chunk))
         .collect::<Vec<_>>()
         .join(" ✂ ")
+}
+
+/// Render assistant line: spoken/cut prefix dim grey, unsaid remainder normal.
+fn render_speech_out_text(output: &SpeechOutLine) -> String {
+    let full = normalized_speech_out_text(output);
+    let Some(prefix_raw) = output.cut_prefix.as_ref() else {
+        return full;
+    };
+    let prefix = normalized_text(prefix_raw);
+    if prefix.is_empty() {
+        return full;
+    }
+    // Match prefix as word-aligned start of full intended text when possible.
+    let (spoken, rest) = split_spoken_remainder(&full, &prefix);
+    if rest.is_empty() {
+        // Entire line was spoken (or cut covers full intended).
+        return format!("{ANSI_DIM}{spoken}{ANSI_RESET}");
+    }
+    if spoken.is_empty() {
+        return full;
+    }
+    format!("{ANSI_DIM}{spoken}{ANSI_RESET}{rest}")
+}
+
+fn split_spoken_remainder(full: &str, spoken_prefix: &str) -> (String, String) {
+    let full_n = full.trim_start();
+    let spoken_n = spoken_prefix.trim();
+    if spoken_n.is_empty() {
+        return (String::new(), full_n.to_owned());
+    }
+    // Exact prefix match (case-sensitive after normalize).
+    if full_n.starts_with(spoken_n) {
+        let rest = full_n[spoken_n.len()..].to_owned();
+        return (spoken_n.to_owned(), rest);
+    }
+    // Case-insensitive word-prefix match against intended words.
+    let full_words: Vec<&str> = full_n.split_whitespace().collect();
+    let spoken_words: Vec<&str> = spoken_n.split_whitespace().collect();
+    if spoken_words.is_empty() || full_words.is_empty() {
+        return (spoken_n.to_owned(), format!(" {full_n}"));
+    }
+    let mut matched = 0usize;
+    for (i, sw) in spoken_words.iter().enumerate() {
+        if i >= full_words.len() {
+            break;
+        }
+        if full_words[i].eq_ignore_ascii_case(sw) {
+            matched += 1;
+        } else {
+            break;
+        }
+    }
+    if matched == 0 {
+        // Fallback: dim the ASR cut text and show full intended after a marker.
+        return (spoken_n.to_owned(), format!(" | {full_n}"));
+    }
+    let spoken = full_words[..matched].join(" ");
+    let rest = if matched < full_words.len() {
+        format!(" {}", full_words[matched..].join(" "))
+    } else {
+        String::new()
+    };
+    (spoken, rest)
 }
 
 fn render_section(section: &TuiSection) -> String {
@@ -2610,6 +2754,42 @@ mod tests {
         assert!(rendered.contains(
             "speech-out terminal: cancelled e2e=101.0ms first-audio=85.0ms cancel=10.0ms"
         ));
+    }
+
+    #[test]
+    fn assistant_turn_truncated_dims_spoken_prefix() {
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({
+                "event": "speech_out_request_received",
+                "utterance_id": "u",
+                "diagnostic_mono_ns": 1_000_000_000_u64,
+                "text": "This is a long assistant reply so you can barge in",
+                "num_chunks": 1
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "assistant_turn_truncated",
+                "diagnostic_mono_ns": 2_000_000_000_u64,
+                "intended_text": "This is a long assistant reply so you can barge in",
+                "spoken_prefix": "This is a long assistant reply",
+                "cut_text": "This is a long assistant reply",
+                "primary_cut_source": "drain",
+                "played_chunks": 1
+            }),
+        );
+        let rendered = model.render(true);
+        assert!(
+            rendered.contains("\u{1b}[2mThis is a long assistant reply\u{1b}[0m so you can barge in"),
+            "spoken prefix must be dim, remainder normal white; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("assistant cut (drain): This is a long assistant reply"),
+            "seam note must include cut text; got:\n{rendered}"
+        );
     }
 
     #[test]

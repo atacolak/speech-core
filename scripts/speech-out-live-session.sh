@@ -797,12 +797,15 @@ start_assistant_self_asr_drain() {
   assistant_b_watch_pid=$!
 
   # Feed merged WAV into speech-core as assistant.self_asr (Nemotron B).
+  # --no-realtime: still real PCM, but push faster than wall-clock so B can
+  # drain during the user's barge speech window.
   "$PYTHON3_BIN" "$feed_py" \
     "$merged" \
     --url "$core_ws_url" \
     --stream-id "assistant.self_asr" \
     --stream-session-id "$b_session" \
     --out-dir "$assistant_cut_dir/feed" \
+    --no-realtime \
     >>"$trigger_log" 2>&1 &
   assistant_b_feed_pid=$!
   echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid session=$b_session" >>"$trigger_log"
@@ -811,20 +814,30 @@ start_assistant_self_asr_drain() {
 # At user transcript_committed: finalize truncated assistant message (drain primary / pad fallback).
 finalize_assistant_cut() {
   [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
-  local intended chunks cut_line
+  local intended chunks cut_line cut_source drained_text
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
   [[ -n "$intended" ]] || return 0
   chunks="$(count_assistant_played_chunks)"
 
-  # Give B a brief moment to flush if feed is still running (user already spoke;
-  # this is inside the free window after user EOU).
+  # Wait for Nemotron B feed to finish (realtime playback of teed audio can take
+  # several seconds). Then allow a short drain window for transcript commits.
   if [[ -n "$assistant_b_feed_pid" ]] && kill -0 "$assistant_b_feed_pid" 2>/dev/null; then
     local _w=0
-    while (( _w < 30 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
+    # Up to ~20s for feed (wav length + silence + hold).
+    while (( _w < 200 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
       sleep 0.1
       _w=$((_w + 1))
     done
   fi
+  # Extra settle for detector → watch jsonl after feed exits.
+  local _s=0
+  while (( _s < 30 )); do
+    if [[ -s "$assistant_b_watch_log" ]] && rg -q '"event":"transcript_committed"|"event":"turn_transcript_committed"|"event":"transcript_update"' "$assistant_b_watch_log" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    _s=$((_s + 1))
+  done
 
   if [[ -z "${PYTHON3_BIN:-}" || ! -f "$finalize_cut_py" ]]; then
     echo "[$(date --iso-8601=seconds)] assistant_self_asr: cannot finalize cut (python/helper missing)" >>"$trigger_log"
@@ -839,11 +852,34 @@ finalize_assistant_cut() {
     --merge-chunks-dir "$assistant_capture_dir" \
     2>>"$trigger_log" | head -n1 || true)"
 
-  echo "[$(date --iso-8601=seconds)] assistant_self_asr: cut finalized: ${cut_line:-}" >>"$trigger_log"
-  local cut_json
-  cut_json="$("$PYTHON3_BIN" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${cut_line:-}" 2>/dev/null || printf '""')"
-  emit_ui_event "$(printf '{"event":"assistant_turn_truncated","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","text":%s,"played_chunks":%s}' \
-    "$(diagnostic_mono_ns)" "$session_id" "$cut_json" "$chunks")"
+  cut_source="fallback"
+  drained_text=""
+  if [[ -f "$assistant_cut_dir/metrics.json" ]]; then
+    cut_source="$("$PYTHON3_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("primary_cut_source","fallback"))' "$assistant_cut_dir/metrics.json" 2>/dev/null || echo fallback)"
+    drained_text="$("$PYTHON3_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("drained_asr_text","") or "")' "$assistant_cut_dir/metrics.json" 2>/dev/null || true)"
+  fi
+
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: cut finalized source=$cut_source: ${cut_line:-}" >>"$trigger_log"
+  # Rich event for TUI: intended full text + spoken/cut prefix (grey) + remainder (white).
+  local payload mono_ns
+  mono_ns="$(diagnostic_mono_ns)"
+  payload="$("$PYTHON3_BIN" -c '
+import json, sys
+print(json.dumps({
+  "event": "assistant_turn_truncated",
+  "diagnostic_mono_ns": int(sys.argv[1]),
+  "diagnostic_clock_origin": "harness_local_monotonic",
+  "stream_session_id": sys.argv[2],
+  "text": sys.argv[3],
+  "intended_text": sys.argv[4],
+  "cut_text": sys.argv[3],
+  "spoken_prefix": sys.argv[3],
+  "drained_asr_text": sys.argv[5],
+  "primary_cut_source": sys.argv[6],
+  "played_chunks": int(sys.argv[7]),
+}, ensure_ascii=False))
+' "$mono_ns" "$session_id" "${cut_line:-}" "$intended" "$drained_text" "$cut_source" "${chunks:-0}")"
+  emit_ui_event "$payload"
 
   # Stop B watch/feed if still running (best-effort).
   if [[ -n "$assistant_b_feed_pid" ]]; then kill_tree_no_wait "$assistant_b_feed_pid" 2>/dev/null || true; assistant_b_feed_pid=""; fi
