@@ -173,8 +173,10 @@ frame_ms="${SPEECH_CORE_FRAME_MS:-20}"
 run_base="${SPEECH_OUT_RUN_BASE:-${SPEECH_CORE_RUN_DIR:-$HOME/.local/state/speech-core/session}}"
 record_audio="${SPEECH_CORE_RECORD_AUDIO:-1}"
 response_text="${SPEECH_OUT_LIVE_RESPONSE_TEXT:-heard you.}"
-steps="${SPEECH_OUT_STEPS:-5}"
-speed="${SPEECH_OUT_SPEED:-1.30}"
+# Quality defaults: more diffusion steps = less robotic Supertonic; speed 1.0 is
+# natural pace (1.30 was a latency-oriented default that sounds rushed/robotic).
+steps="${SPEECH_OUT_STEPS:-12}"
+speed="${SPEECH_OUT_SPEED:-1.00}"
 voice="${SPEECH_OUT_VOICE:-M1}"
 lang="${SPEECH_OUT_LANG:-en}"
 reference="${SPEECH_OUT_REFERENCE:-}"
