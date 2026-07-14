@@ -124,7 +124,11 @@ def _window_waveform(waveform, sample_rate: int, played_ms: int) -> tuple[Any, i
         "audio_ms_full": audio_ms,
         "played_ms_used": use_played,
     }
-    if window_ms <= 0 or use_played <= window_ms:
+    # Prefer full-prefix alignment for short played spans: tail+assumed-words
+    # stitching is a latency optimization for long replies and systematically
+    # over-commits remaining targets when the window is only ~2s.
+    prefix_prefer_ms = 5000
+    if window_ms <= 0 or use_played <= max(window_ms, prefix_prefer_ms):
         # Full prefix up to played (+pad) — short clips or window disabled.
         end_s = min(total_samples, int((use_played + _WINDOW_PAD_MS) * sample_rate / 1000.0))
         end_s = max(end_s, min(total_samples, int(0.05 * sample_rate)))
@@ -428,9 +432,20 @@ def align_ctc_forced(
         full = wav.unsqueeze(0)
         windowed, offset_ms, win_meta = _window_waveform(full, sr, use_played)
         assumed = _assumed_spoken_words(words, offset_ms, use_played, speed)
-        window_words = words[assumed:]
         # played_ms relative to window start for the sub-aligner
         local_played = max(0, use_played - offset_ms)
+        # CRITICAL: do NOT force-align ALL remaining words into the tail window.
+        # Forced align will pack every target into the window, so word ends fill
+        # the whole window and the cut looks like "almost everything was spoken".
+        # Only align the words that could plausibly fit in local_played (+pad).
+        wps = max(0.8, 2.5 * max(0.5, float(speed)))
+        n_fit = max(1, int(round((max(local_played, 80) / 1000.0) * wps)) + 2)
+        window_words = words[assumed : assumed + n_fit]
+        win_meta = {
+            **win_meta,
+            "window_target_cap": n_fit,
+            "window_targets": len(window_words),
+        }
 
         waveform = windowed
         if pack.get("normalize_waveform") or (

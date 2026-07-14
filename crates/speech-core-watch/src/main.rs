@@ -276,6 +276,9 @@ struct SpeechOutLine {
     /// `text` remains the full intended assistant utterance.
     cut_prefix: Option<String>,
     cut_source: Option<String>,
+    /// Ownership keys so async CTC truncate cannot paint the next reply.
+    utterance_id: Option<String>,
+    cut_gen: Option<String>,
 }
 
 impl TuiModel {
@@ -600,6 +603,11 @@ impl TuiModel {
             }
             "speech_out_request_queued" if self.speech_out_ui => {
                 let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let utt = value
+                    .get("utterance_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
                 let idx = self.last_turn_for_output();
                 self.turns[idx].outputs.push(SpeechOutLine {
                     text: text.trim().to_owned(),
@@ -607,15 +615,29 @@ impl TuiModel {
                     glyphs: vec!["⏳".to_owned()],
                     cut_prefix: None,
                     cut_source: None,
+                    utterance_id: utt,
+                    cut_gen: None,
                 });
                 self.note_event(value, "speech-out request queued".to_owned());
             }
             "speech_out_request_received" if self.speech_out_ui => {
                 let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let utt = value
+                    .get("utterance_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
                 let idx = self.last_turn_for_output();
                 if !text.trim().is_empty() {
                     let needs_new_output = self.turns[idx].outputs.last().is_none_or(|output| {
-                        !output.text.trim().is_empty() && output.text != text.trim()
+                        let different_text =
+                            !output.text.trim().is_empty() && output.text != text.trim();
+                        let different_utt = match (&utt, &output.utterance_id) {
+                            (Some(a), Some(b)) => a != b,
+                            (Some(_), None) => !output.text.trim().is_empty(),
+                            _ => false,
+                        };
+                        different_text || different_utt
                     });
                     if needs_new_output {
                         self.turns[idx].outputs.push(SpeechOutLine {
@@ -624,10 +646,19 @@ impl TuiModel {
                             glyphs: Vec::new(),
                             cut_prefix: None,
                             cut_source: None,
+                            utterance_id: utt.clone(),
+                            cut_gen: None,
                         });
                     } else if let Some(output) = self.turns[idx].outputs.last_mut() {
                         output.text = text.trim().to_owned();
+                        if utt.is_some() {
+                            output.utterance_id = utt.clone();
+                        }
                     }
+                } else if let (Some(u), Some(output)) =
+                    (utt.as_ref(), self.turns[idx].outputs.last_mut())
+                {
+                    output.utterance_id = Some(u.clone());
                 }
                 self.push_output_glyph(idx, "⇢");
                 let mut note = "speech-out request received".to_owned();
@@ -837,48 +868,132 @@ impl TuiModel {
                     .and_then(|v| v.as_str())
                     .unwrap_or("fallback")
                     .to_owned();
-                let idx = self.last_turn_for_output();
-                let full_text = if intended.is_empty() {
-                    spoken.clone()
+                let event_utt = value
+                    .get("utterance_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let event_gen = value.get("cut_gen").and_then(|v| match v {
+                    Value::String(s) => {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_owned())
+                        }
+                    }
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+                let played_ms = value
+                    .get("played_ms")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64)))
+                    .unwrap_or(0);
+                if source != "approx_wallclock" && played_ms == 0 && spoken.is_empty() {
+                    self.note_event(
+                        value,
+                        format!("ignored stale truncate ({source}) played_ms=0"),
+                    );
                 } else {
-                    intended
-                };
-                if let Some(output) = self.turns[idx].outputs.last_mut() {
-                    if !full_text.is_empty() {
-                        output.text = full_text;
-                    }
-                    output.cut_prefix = if spoken.is_empty() {
-                        None
+                    let idx = self.last_turn_for_output();
+                    let full_text = if intended.is_empty() {
+                        spoken.clone()
                     } else {
-                        Some(spoken.clone())
+                        intended
                     };
-                    output.cut_source = Some(source.clone());
-                    if output
-                        .glyphs
-                        .last()
-                        .is_none_or(|g| g != "✂" && g != "⏹")
-                    {
-                        output.glyphs.push("✂".to_owned());
+                    let mut target: Option<usize> = None;
+                    if let Some(ref u) = event_utt {
+                        target = self.turns[idx]
+                            .outputs
+                            .iter()
+                            .rposition(|o| o.utterance_id.as_deref() == Some(u.as_str()));
                     }
-                } else if !full_text.is_empty() {
-                    self.turns[idx].outputs.push(SpeechOutLine {
-                        text: full_text,
-                        chunks: Vec::new(),
-                        glyphs: vec!["✂".to_owned()],
-                        cut_prefix: if spoken.is_empty() {
+                    if target.is_none() {
+                        if let Some(ref g) = event_gen {
+                            if g != "0" {
+                                target = self.turns[idx].outputs.iter().rposition(|o| {
+                                    o.cut_gen.as_deref() == Some(g.as_str())
+                                });
+                            }
+                        }
+                    }
+                    if target.is_none() {
+                        if let Some(output) = self.turns[idx].outputs.last() {
+                            let free = output.utterance_id.is_none()
+                                && (output.cut_gen.is_none()
+                                    || output.cut_gen.as_deref() == Some("0"));
+                            let same_utt = match (&event_utt, &output.utterance_id) {
+                                (Some(a), Some(b)) => a == b,
+                                _ => false,
+                            };
+                            if free || same_utt {
+                                target =
+                                    Some(self.turns[idx].outputs.len().saturating_sub(1));
+                            }
+                        }
+                    }
+                    if let Some(oi) = target {
+                        let output = &mut self.turns[idx].outputs[oi];
+                        if !full_text.is_empty() {
+                            output.text = full_text.clone();
+                        }
+                        output.cut_prefix = if spoken.is_empty() {
                             None
                         } else {
                             Some(spoken.clone())
-                        },
-                        cut_source: Some(source.clone()),
-                    });
+                        };
+                        output.cut_source = Some(source.clone());
+                        if event_utt.is_some() {
+                            output.utterance_id = event_utt.clone();
+                        }
+                        if event_gen.is_some() {
+                            output.cut_gen = event_gen.clone();
+                        }
+                        if output
+                            .glyphs
+                            .last()
+                            .is_none_or(|g| g != "✂" && g != "⏹")
+                        {
+                            output.glyphs.push("✂".to_owned());
+                        }
+                    } else if !full_text.is_empty() {
+                        let last_owned = self.turns[idx].outputs.last().is_some_and(|o| {
+                            o.utterance_id.is_some()
+                                && event_utt
+                                    .as_ref()
+                                    .is_some_and(|u| o.utterance_id.as_ref() != Some(u))
+                        });
+                        if last_owned {
+                            self.note_event(
+                                value,
+                                format!(
+                                    "ignored truncate for other utterance ({source}): {}",
+                                    event_utt.as_deref().unwrap_or("?")
+                                ),
+                            );
+                        } else {
+                            self.turns[idx].outputs.push(SpeechOutLine {
+                                text: full_text,
+                                chunks: Vec::new(),
+                                glyphs: vec!["✂".to_owned()],
+                                cut_prefix: if spoken.is_empty() {
+                                    None
+                                } else {
+                                    Some(spoken.clone())
+                                },
+                                cut_source: Some(source.clone()),
+                                utterance_id: event_utt.clone(),
+                                cut_gen: event_gen.clone(),
+                            });
+                        }
+                    }
+                    let note = if spoken.is_empty() {
+                        format!("assistant cut ({source}): empty")
+                    } else {
+                        format!("assistant cut ({source}): {spoken}")
+                    };
+                    self.note_event(value, note);
                 }
-                let note = if spoken.is_empty() {
-                    format!("assistant cut ({source}): empty")
-                } else {
-                    format!("assistant cut ({source}): {spoken}")
-                };
-                self.note_event(value, note);
             }
             "speech_out_cancel_ack" | "speech_out_cancel_acknowledged" if self.speech_out_ui => {
                 let idx = self.last_turn_for_output();
@@ -1313,6 +1428,8 @@ impl TuiModel {
                 glyphs: Vec::new(),
                 cut_prefix: None,
                 cut_source: None,
+                utterance_id: None,
+                cut_gen: None,
             });
         }
         let output = self.turns[idx].outputs.last_mut().expect("output exists");
@@ -2825,6 +2942,84 @@ mod tests {
             "seam note must include cut text; got:\n{rendered}"
         );
     }
+
+
+    #[test]
+    fn assistant_turn_truncated_ignores_other_utterance() {
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({
+                "event": "speech_out_request_received",
+                "utterance_id": "utt-a",
+                "diagnostic_mono_ns": 1_000_000_000_u64,
+                "text": "First assistant reply that was barged",
+                "num_chunks": 1
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "assistant_turn_truncated",
+                "utterance_id": "utt-a",
+                "cut_gen": "1",
+                "diagnostic_mono_ns": 2_000_000_000_u64,
+                "intended_text": "First assistant reply that was barged",
+                "spoken_prefix": "First assistant reply",
+                "primary_cut_source": "approx_wallclock",
+                "played_ms": 1200
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "speech_out_request_received",
+                "utterance_id": "utt-b",
+                "diagnostic_mono_ns": 3_000_000_000_u64,
+                "text": "Second assistant reply after barge",
+                "num_chunks": 1
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "assistant_turn_truncated",
+                "utterance_id": "utt-a",
+                "cut_gen": "1",
+                "diagnostic_mono_ns": 4_000_000_000_u64,
+                "intended_text": "First assistant reply that was barged",
+                "spoken_prefix": "First assistant reply that was barged",
+                "primary_cut_source": "ctc_forced",
+                "played_ms": 1200
+            }),
+        );
+        let rendered = model.render(true);
+        assert!(
+            rendered.contains("Second assistant reply after barge"),
+            "second reply must remain; got:
+{rendered}"
+        );
+        let idx = model.last_turn_for_output();
+        assert!(
+            model.turns[idx]
+                .outputs
+                .iter()
+                .any(|o| o.text.contains("Second assistant reply") && o.cut_prefix.is_none()),
+            "utt-b must stay uncut; outputs={:?}",
+            model.turns[idx].outputs
+        );
+        assert!(
+            model.turns.iter().any(|t| {
+                t.outputs.iter().any(|o| {
+                    o.utterance_id.as_deref() == Some("utt-a")
+                        && o.cut_prefix.as_deref()
+                            == Some("First assistant reply that was barged")
+                })
+            }),
+            "utt-a should receive its own CTC refine"
+        );
+    }
+
 
     #[test]
     fn pause_resume_cumulative_delta_renders_only_new_section() {

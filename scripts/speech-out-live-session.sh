@@ -132,34 +132,59 @@ if [[ -n "$incoming_vad_energy_enabled" ]]; then SPEECH_CORE_VAD_ENERGY_ENABLED=
 if [[ -n "$incoming_vad_energy_threshold" ]]; then SPEECH_CORE_VAD_ENERGY_THRESHOLD="$incoming_vad_energy_threshold"; fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
+# When installed as ~/.local/bin/speech-out-live-session, script_dir is NOT the repo.
+# Prefer explicit libexec (client install) over guessing repo_root from parent of bin/.
+libexec_dir="${SPEECH_CORE_LIBEXEC_DIR:-$HOME/.local/libexec/speech-core}"
+if [[ -d "$script_dir/../crates" ]]; then
+  repo_root="$(cd "$script_dir/.." && pwd)"
+elif [[ -d "$script_dir/../../speech-core/crates" ]]; then
+  repo_root="$(cd "$script_dir/../../speech-core" && pwd)"
+elif [[ -d "$HOME/workspace/speech-core/crates" ]]; then
+  repo_root="$HOME/workspace/speech-core"
+else
+  repo_root=""
+fi
 
 bin_triple_runs() {
   local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
   [[ -x "$dir/speech-core-mic-adapter" && -x "$dir/speech-core-watch" && -x "$dir/speech-out" ]] || return 1
   "$dir/speech-core-mic-adapter" --help >/dev/null 2>&1 || return 1
   "$dir/speech-core-watch" --help >/dev/null 2>&1 || return 1
   "$dir/speech-out" --help >/dev/null 2>&1 || return 1
 }
 
-if bin_triple_runs "$script_dir"; then
+bin_dir=""
+# 1) Client install path (sfnix dogfood): real ELF binaries under libexec.
+if bin_triple_runs "$libexec_dir"; then
+  bin_dir="$libexec_dir"
+# 2) Same directory as this script (dev: scripts/ next to target, or fat install).
+elif bin_triple_runs "$script_dir"; then
   bin_dir="$script_dir"
-else
-  cd "$repo_root"
-  if ! bin_triple_runs "$repo_root/target/debug"; then
-    echo "building native live-session binaries..." >&2
+# 3) Repo debug build — only if we found a real checkout with shell.nix/Cargo.toml.
+elif [[ -n "$repo_root" ]] && bin_triple_runs "$repo_root/target/debug"; then
+  bin_dir="$repo_root/target/debug"
+elif [[ -n "$repo_root" && -f "$repo_root/Cargo.toml" ]]; then
+  echo "building native live-session binaries in $repo_root ..." >&2
+  (
+    cd "$repo_root"
     rm -f target/debug/speech-core-mic-adapter target/debug/speech-core-watch target/debug/speech-out
-    if command -v nix-shell >/dev/null 2>&1; then
+    if [[ -f "$repo_root/shell.nix" || -f "$repo_root/default.nix" ]] && command -v nix-shell >/dev/null 2>&1; then
       nix-shell --run 'cargo build -p speech-core-mic-adapter -p speech-core-watch -p speech-out'
     else
       cargo build -p speech-core-mic-adapter -p speech-core-watch -p speech-out
     fi
+  )
+  if bin_triple_runs "$repo_root/target/debug"; then
+    bin_dir="$repo_root/target/debug"
   fi
-  if ! bin_triple_runs "$repo_root/target/debug"; then
-    echo "speech-out live-session binaries still do not run after native rebuild" >&2
-    exit 1
-  fi
-  bin_dir="$repo_root/target/debug"
+fi
+
+if [[ -z "$bin_dir" ]]; then
+  echo "speech-out-live-session: no runnable binary triple found." >&2
+  echo "  looked in: libexec=$libexec_dir script_dir=$script_dir repo_root=${repo_root:-n/a}" >&2
+  echo "  install client binaries to $SPEECH_CORE_LIBEXEC_DIR (default: ~/.local/libexec/speech-core)." >&2
+  exit 1
 fi
 
 core_ws_url="${SPEECH_CORE_WS_URL:-}"
@@ -302,6 +327,13 @@ align_prefer_remote=-1  # -1 unknown, 0 local torch ok, 1 force remote TCP (cach
 align_worker_pid=""
 align_worker_started_here=0
 align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
+# CUPE live transcript-position tracker (experimental). SPEECH_OUT_CUPE_LIVE=1
+# CUPE ears + online DP only — NOT full BFA ~0.8s Viterbi. Does not replace wav2vec2 barge GT.
+cupe_live_enabled="${SPEECH_OUT_CUPE_LIVE:-0}"
+cupe_live_script=""
+cupe_live_pid=""
+cupe_live_events=""
+cupe_live_log=""
 # Host-local retained TTS WAV (speech-out daemon writes here; no SCP for align).
 retain_dir_remote="${SPEECH_OUT_RETAIN_DIR_REMOTE:-/tmp/speech-out-retain}"
 assistant_utterance_id_file="$run_dir/assistant_utterance_id"
@@ -346,6 +378,16 @@ for cand in \
   "$repo_root/scripts/barge_in_align/align_worker.py" \
   /home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py; do
   if [[ -f "$cand" ]]; then align_worker_script="$cand"; break; fi
+done
+
+cupe_live_script=""
+for cand in \
+  "$helper_dir/align_spike/cupe_live_track.py" \
+  "$libexec_dir/align_spike/cupe_live_track.py" \
+  "$script_dir/align_spike/cupe_live_track.py" \
+  "$repo_root/scripts/align_spike/cupe_live_track.py" \
+  /home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py; do
+  if [[ -f "$cand" ]]; then cupe_live_script="$cand"; break; fi
 done
 if [[ -z "${align_python:-}" ]]; then
   for cand in \
@@ -426,6 +468,7 @@ speech-out developer live session
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
   assistant_cut:  backend=$align_backend window_ms=$align_window_ms warm_sock=$align_sock (nemotron_B=$assistant_self_asr_enabled)
+  cupe_live:      enabled=$cupe_live_enabled script=${cupe_live_script:-n/a}
   align:          py=${align_python:-n/a} worker=${align_worker_script:-n/a} tcp=${align_tcp_target:-auto}:$align_tcp_port
   run_dir:        $run_dir
   watch_log:      $watch_log
@@ -825,11 +868,24 @@ count_assistant_played_chunks() {
 }
 
 emit_assistant_truncated_event() {
-  local cut_text="$1" source="$2" confidence="${3:-low}" intended played_ms words mono_ns payload
+  local cut_text="$1" source="$2" confidence="${3:-low}" intended played_ms words mono_ns payload utt gen
+  # Optional 4th arg: explicit played_ms snapshot (async CTC must not re-read wiped files).
+  played_ms="${4:-}"
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
-  played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  if [[ -z "$played_ms" ]]; then
+    played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  fi
+  if ! [[ "$played_ms" =~ ^[0-9]+$ ]]; then played_ms=0; fi
+  # Never emit ground-truth truncate with zero play duration (stale lifecycle race).
+  if [[ "$source" != "approx_wallclock" && "$played_ms" -le 0 ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: skip emit source=$source played_ms=$played_ms (stale/empty)" >>"$trigger_log"
+    return 0
+  fi
   words="$(printf '%s' "$cut_text" | awk '{print NF}')"
   mono_ns="$(diagnostic_mono_ns)"
+  utt="$(cat "$assistant_utterance_id_file" 2>/dev/null || true)"
+  gen="$(cat "$assistant_cut_dir/barge_cut_gen" 2>/dev/null || true)"
+  [[ -n "$gen" ]] || gen="${assistant_active_gen:-0}"
   [[ -n "${PYTHON3_BIN:-}" && -n "$intended" ]] || return 0
   payload="$("$PYTHON3_BIN" -c '
 import json, sys
@@ -846,9 +902,10 @@ print(json.dumps({
   "played_ms": int(sys.argv[6]),
   "estimated_words": int(sys.argv[7]),
   "confidence": sys.argv[8],
-  "cut_gen": sys.argv[9],
+  "cut_gen": str(sys.argv[9]),
+  "utterance_id": sys.argv[10],
 }, ensure_ascii=False))
-' "$mono_ns" "$session_id" "$cut_text" "$intended" "$source" "${played_ms:-0}" "${words:-0}" "$confidence" "${assistant_active_gen:-0}")" || payload=""
+' "$mono_ns" "$session_id" "$cut_text" "$intended" "$source" "${played_ms:-0}" "${words:-0}" "$confidence" "${gen:-0}" "${utt:-}")" || payload=""
   [[ -n "$payload" ]] && emit_ui_event "$payload"
 }
 
@@ -989,9 +1046,33 @@ latest_assistant_wav() {
   printf '%s' "$f"
 }
 
+
 record_barge_played_ms() {
-  local start_ms now_ms barge_ms
-  start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+  local start_ms now_ms barge_ms hear_ms tee_ms cap
+  hear_ms="$(cat "$assistant_cut_dir/hear_start_ms" 2>/dev/null || true)"
+  if [[ "$hear_ms" =~ ^[0-9]+$ ]] && (( hear_ms > 0 )); then
+    start_ms="$hear_ms"
+  else
+    tee_ms=""
+    if [[ -f "$assistant_manifest" && -n "${PYTHON3_BIN:-}" ]]; then
+      tee_ms="$("$PYTHON3_BIN" -c 'import json,sys
+ms=""
+for line in open(sys.argv[1]):
+  line=line.strip()
+  if not line: continue
+  try: d=json.loads(line)
+  except Exception: continue
+  if d.get("event")=="assistant_chunk_played":
+    ms=str(d.get("mono_ms") or ""); break
+print(ms)' "$assistant_manifest" 2>/dev/null || true)"
+    fi
+    if [[ "$tee_ms" =~ ^[0-9]+$ ]] && (( tee_ms > 0 )); then
+      start_ms="$tee_ms"
+      printf '%s\n' "$tee_ms" >"$assistant_cut_dir/hear_start_ms"
+    else
+      start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+    fi
+  fi
   now_ms="$(($(date +%s%N) / 1000000))"
   if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
     barge_ms=$((now_ms - start_ms))
@@ -999,12 +1080,39 @@ record_barge_played_ms() {
     barge_ms=800
   fi
   if (( barge_ms < 80 )); then barge_ms=80; fi
+  # Cap by audio duration / speed so TTFA cannot force a full-sentence cut.
+  if [[ -n "${PYTHON3_BIN:-}" ]]; then
+    cap="$("$PYTHON3_BIN" -c '
+import sys, wave, os
+speed=float(sys.argv[1] or 1.0)
+for p in sys.argv[2:]:
+  if not p or not os.path.isfile(p):
+    continue
+  try:
+    with wave.open(p,"rb") as w:
+      ms=int(1000.0*w.getnframes()/max(1,w.getframerate()))
+    print(max(80, int(ms/max(0.5,speed))+120))
+    raise SystemExit
+  except Exception as e:
+    if isinstance(e, SystemExit):
+      raise
+    continue
+print("")
+' "$speed" \
+      "$(cat "$assistant_retained_path_file" 2>/dev/null || true)" \
+      "$(ls -1 "$assistant_capture_dir"/chunk_*.wav 2>/dev/null | sort | tail -n1)" \
+      "${retain_dir_remote}/latest.wav" 2>/dev/null || true)"
+    if [[ "$cap" =~ ^[0-9]+$ ]] && (( barge_ms > cap )); then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: clamp played_ms $barge_ms -> $cap (audio/speed cap)" >>"$trigger_log"
+      barge_ms=$cap
+    fi
+  fi
   printf '%s\n' "$barge_ms" >"$assistant_barge_played_ms_file"
   printf '%s\n' "$now_ms" >"$assistant_cut_dir/barge_mono_ms"
   printf '%s' "$barge_ms"
 }
 
-# --- Warm CTC align worker (model stays loaded; no cold python per barge) ---
+# --- Warm CTC# --- Warm CTC align worker (model stays loaded; no cold python per barge) ---
 # Bash TCP client: avoids ~100–500ms python process spawn per barge on the laptop.
 align_tcp_host_port() {
   local target="${1:-$align_tcp_target}"
@@ -1188,11 +1296,252 @@ stop_align_worker_if_ours() {
 
 # CTC forced align on teed clip (audio + intended text). Ground-truth cut.
 # Prefers warm worker (local or remote). Falls back to one-shot python only if needed.
+
+cupe_live_on() {
+  [[ "$cupe_live_enabled" == "1" || "$cupe_live_enabled" == "true" || "$cupe_live_enabled" == "yes" ]]
+}
+
+cupe_worker_tcp_target() {
+  local host
+  if [[ -n "${SPEECH_OUT_CUPE_TCP:-}" ]]; then
+    printf '%s' "$SPEECH_OUT_CUPE_TCP"
+    return 0
+  fi
+  host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+  [[ -n "$host" ]] || host=127.0.0.1
+  printf '%s:%s' "$host" "${SPEECH_OUT_CUPE_TCP_PORT:-8792}"
+}
+
+ensure_cupe_warm_worker() {
+  local target host port remote_py remote_script remote_sock
+  target="$(cupe_worker_tcp_target)"
+  host="${target%%:*}"
+  port="${target##*:}"
+  if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+    return 0
+  fi
+  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+  remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-/home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
+  remote_sock="${SPEECH_OUT_CUPE_SOCK_REMOTE:-/tmp/speech-core-cupe-live.sock}"
+  echo "[$(date --iso-8601=seconds)] cupe_live: starting warm worker $host:$port" >>"$trigger_log"
+  # Prefer local start when we are the speech host (dogfood host == core).
+  if [[ -f "$remote_script" && -x "$remote_py" ]]; then
+    pkill -f 'cupe_live_track.py --serve' 2>/dev/null || true
+    PYTHONPATH="/tmp/align-spike/bournemouth-forced-aligner:${PYTHONPATH:-}" \
+      nohup "$remote_py" "$remote_script" --serve --sock "$remote_sock" --tcp-bind 0.0.0.0 --tcp-port "$port" \
+      >/tmp/speech-core-cupe-worker.log 2>&1 &
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+      "pkill -f 'cupe_live_track.py --serve' 2>/dev/null || true; \
+       PYTHONPATH=/tmp/align-spike/bournemouth-forced-aligner:\$PYTHONPATH \
+       nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_script") \
+         --serve --sock $(printf '%q' "$remote_sock") --tcp-bind 0.0.0.0 --tcp-port ${port} \
+         >/tmp/speech-core-cupe-worker.log 2>&1 &" \
+      >>"$trigger_log" 2>&1 || true
+  fi
+  local i
+  for i in $(seq 1 60); do
+    if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+      echo "[$(date --iso-8601=seconds)] cupe_live: warm worker ready $host:$port" >>"$trigger_log"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[$(date --iso-8601=seconds)] cupe_live: warm worker FAILED $host:$port" >>"$trigger_log"
+  return 1
+}
+
+start_cupe_live_tracker() {
+  local intended wav_hint speed_now target play_ms py host remote_events remote_stop
+  cupe_live_on || return 0
+  [[ -n "$cupe_live_script" && -f "$cupe_live_script" ]] || {
+    echo "[$(date --iso-8601=seconds)] cupe_live: script missing" >>"$trigger_log"
+    return 1
+  }
+  intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
+  [[ -n "${intended//[[:space:]]/}" ]] || return 1
+  # Retained/teed WAV already has Supertonic speed baked into sample duration.
+  # CUPE realtime drip must use speed=1.0 against that file, or it races to the
+  # end (wall*1.3) and the karaoke cursor finishes before you hear the words.
+  speed_now="1.0"
+  mkdir -p "$assistant_cut_dir"
+  cupe_live_events="$assistant_cut_dir/cupe_live.jsonl"
+  cupe_live_log="$assistant_cut_dir/cupe_live.log"
+  : >"$cupe_live_events"
+  : >"$cupe_live_log"
+  rm -f "$assistant_cut_dir/cupe_live.stop" 2>/dev/null || true
+
+  play_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+  wav_hint="$(cat "$assistant_retained_path_file" 2>/dev/null || true)"
+  if [[ -z "$wav_hint" ]]; then
+    wav_hint="${retain_dir_remote}/latest.wav"
+  fi
+
+  # Warm worker is best-effort and must never block speech-out spawn.
+  # If not up yet, start in background; first track may cold-wait on connect.
+  ensure_cupe_warm_worker >/dev/null 2>&1 &
+
+  target="$(cupe_worker_tcp_target)"
+  host="${target%%:*}"
+  py="${align_python:-${SPEECH_CORE_ALIGN_PYTHON:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}}"
+  if [[ ! -x "$py" ]]; then py="${PYTHON3_BIN:-python3}"; fi
+
+  remote_events="/tmp/speech-core-cupe-live-${session_id}.jsonl"
+  remote_stop="/tmp/speech-core-cupe-live-${session_id}.stop"
+  rm -f "$remote_stop" 2>/dev/null || true
+  # if host is remote and we can ssh, clear stop there too
+  if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" "rm -f $(printf '%q' "$remote_stop")" 2>/dev/null || true
+  fi
+  printf '%s\n' "$remote_events" >"$assistant_cut_dir/cupe_live.remote_events"
+  printf '%s\n' "$remote_stop" >"$assistant_cut_dir/cupe_live.remote_stop"
+  printf '%s\n' "$host" >"$assistant_cut_dir/cupe_live.remote_host"
+
+  (
+    # Wait briefly for warm worker, then track with wall-clock + follow.
+    local _w=0
+    while (( _w < 80 )); do
+      if (echo >/dev/tcp/"${target%%:*}"/"${target##*:}") >/dev/null 2>&1; then break; fi
+      sleep 0.1
+      _w=$((_w + 1))
+    done
+    remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+    remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-/home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
+    ps_ms="${play_ms:-0}"
+    if [[ -f "$assistant_cut_dir/hear_start_ms" ]]; then
+      ps_ms="$(cat "$assistant_cut_dir/hear_start_ms" 2>/dev/null || echo "$ps_ms")"
+    fi
+    if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+        "PYTHONPATH=/tmp/align-spike/bournemouth-forced-aligner:\$PYTHONPATH \
+         $(printf '%q' "$remote_py") $(printf '%q' "$remote_script") \
+           --tcp 127.0.0.1:${target##*:} \
+           --text $(printf '%q' "$intended") \
+           --wav $(printf '%q' "$wav_hint") \
+           --events $(printf '%q' "$remote_events") \
+           --realtime --follow --speed $(printf '%q' "$speed_now") \
+           --wait-s 25 --chunk-ms 80 \
+           --play-start-mono-ms $(printf '%q' "${ps_ms:-0}") \
+           --stop-file $(printf '%q' "$remote_stop")" \
+        >>"$cupe_live_log" 2>&1
+    else
+      PYTHONPATH="/tmp/align-spike/bournemouth-forced-aligner:${PYTHONPATH:-}" \
+        "$remote_py" "$remote_script" \
+          --tcp "$target" \
+          --text "$intended" \
+          --wav "$wav_hint" \
+          --events "$remote_events" \
+          --realtime \
+          --follow \
+          --speed "$speed_now" \
+          --wait-s 25 \
+          --chunk-ms 80 \
+          --play-start-mono-ms "${ps_ms:-0}" \
+          --stop-file "$remote_stop" \
+          >>"$cupe_live_log" 2>&1
+    fi
+  ) &
+  cupe_live_pid=$!
+  printf '%s\n' "$cupe_live_pid" >"$assistant_cut_dir/cupe_live.pid"
+
+  # Lightweight event mirror + TUI cursor (local file if same host).
+  (
+    local last_sz=0 last_word="" line w
+    for _i in $(seq 1 800); do
+      if [[ -f "$assistant_cut_dir/cupe_live.stop" ]]; then break; fi
+      if [[ -f "$remote_events" ]]; then
+        cp -f "$remote_events" "$cupe_live_events" 2>/dev/null || true
+      elif [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" \
+          "test -f $(printf '%q' "$remote_events") && cat $(printf '%q' "$remote_events")" \
+          2>/dev/null >"$cupe_live_events" || true
+      fi
+      if [[ -f "$cupe_live_events" && -n "${PYTHON3_BIN:-}" ]]; then
+        local sz
+        sz=$(wc -c <"$cupe_live_events" 2>/dev/null | tr -d ' ' || echo 0)
+        if [[ "$sz" != "$last_sz" && "$sz" -gt 0 ]]; then
+          last_sz=$sz
+          line="$(grep -E '"event": "(word_started|word_committed|cupe_live_finished)"' "$cupe_live_events" 2>/dev/null | tail -n1 || true)"
+          if [[ -n "$line" ]]; then
+            line="$("$PYTHON3_BIN" -c 'import json,sys,time; d=json.loads(sys.argv[1]); d["diagnostic_mono_ns"]=time.time_ns(); d["diagnostic_clock_origin"]="harness_local_monotonic"; d["stream_session_id"]=sys.argv[2]; print(json.dumps(d))' "$line" "$session_id" 2>/dev/null || true)"
+            [[ -n "$line" ]] && emit_ui_event "$line"
+          fi
+          line="$(grep -E '"event": "alignment_position_updated"' "$cupe_live_events" 2>/dev/null | tail -n1 || true)"
+          if [[ -n "$line" ]]; then
+            w="$("$PYTHON3_BIN" -c 'import json,sys; print(json.loads(sys.argv[1]).get("word") or "")' "$line" 2>/dev/null || true)"
+            if [[ -n "$w" && "$w" != "$last_word" ]]; then
+              last_word="$w"
+              emit_ui_event "$("$PYTHON3_BIN" -c 'import json,sys,time; print(json.dumps({"event":"cupe_word_cursor","diagnostic_mono_ns":time.time_ns(),"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":sys.argv[1],"word":sys.argv[2],"source":"cupe_online_dp"}))' "$session_id" "$w")"
+            fi
+          fi
+        fi
+      fi
+      sleep 0.15
+    done
+  ) >>"$cupe_live_log" 2>&1 &
+
+  echo "[$(date --iso-8601=seconds)] cupe_live: track via warm $target pid=$cupe_live_pid wav=$wav_hint play_ms=$play_ms" >>"$trigger_log"
+  emit_ui_event "$(printf '{"event":"cupe_live_started","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","tcp":"%s"}' \
+    "$(diagnostic_mono_ns)" "$session_id" "$target")" || true
+}
+
+stop_cupe_live_tracker() {
+  local pid host remote_stop remote_events
+  pid="${cupe_live_pid:-}"
+  if [[ -z "$pid" ]]; then
+    pid="$(cat "$assistant_cut_dir/cupe_live.pid" 2>/dev/null || true)"
+  fi
+  : >"$assistant_cut_dir/cupe_live.stop" 2>/dev/null || true
+  host="$(cat "$assistant_cut_dir/cupe_live.remote_host" 2>/dev/null || true)"
+  remote_stop="$(cat "$assistant_cut_dir/cupe_live.remote_stop" 2>/dev/null || true)"
+  remote_events="$(cat "$assistant_cut_dir/cupe_live.remote_events" 2>/dev/null || true)"
+  if [[ -n "$remote_stop" ]]; then
+    touch "$remote_stop" 2>/dev/null || true
+    if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+      ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" \
+        "touch $(printf '%q' "$remote_stop")" >>"$trigger_log" 2>&1 || true
+    fi
+  fi
+  if [[ -n "$remote_events" ]]; then
+    if [[ -f "$remote_events" ]]; then
+      cp -f "$remote_events" "${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" 2>/dev/null || true
+    elif [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
+      ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" "cat $(printf '%q' "$remote_events") 2>/dev/null" \
+        >"${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    local _w=0
+    while (( _w < 40 )) && kill -0 "$pid" 2>/dev/null; do
+      sleep 0.05
+      _w=$((_w + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  fi
+  cupe_live_pid=""
+  if [[ -f "${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" ]]; then
+    local last
+    last="$(tail -n 1 "${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" 2>/dev/null || true)"
+    if [[ -n "$last" ]]; then
+      echo "[$(date --iso-8601=seconds)] cupe_live: last $last" >>"$trigger_log"
+      emit_ui_event "$last" 2>/dev/null || true
+    fi
+  fi
+  echo "[$(date --iso-8601=seconds)] cupe_live: stopped" >>"$trigger_log"
+}
+
+
 finalize_assistant_cut_ctc() {
   local intended played_ms wav out_json cut_line backend conf lat path_used
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
   [[ -n "$intended" ]] || return 0
-  played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  played_ms="$(cat "$assistant_cut_dir/barge_played_ms_snapshot" 2>/dev/null || true)"
+  if [[ -z "$played_ms" ]]; then
+    played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  fi
   if ! [[ "$played_ms" =~ ^[0-9]+$ ]]; then played_ms=0; fi
   wav="$(latest_assistant_wav)"
   mkdir -p "$assistant_cut_dir"
@@ -1356,10 +1705,36 @@ finalize_assistant_cut_ctc() {
   fi
   [[ -n "$cut_line" ]] || return 1
 
+  # Guard: CTC must not explode past provisional wall-clock by more than +2 words.
+  # Window-stitch bugs used to overwrite a good mid-sentence grey with nearly full text.
+  local prov
+  prov="$(cat "$assistant_cut_dir/production_cut_text" 2>/dev/null || true)"
+  if [[ -n "$prov" && -n "${PYTHON3_BIN:-}" ]]; then
+    local clamped
+    clamped="$("$PYTHON3_BIN" -c '
+import sys
+ctc, prov, intended = sys.argv[1], sys.argv[2], sys.argv[3]
+cw, pw, iw = ctc.split(), prov.split(), intended.split()
+if not cw:
+    print(prov or ctc); raise SystemExit
+if len(cw) <= len(pw) + 2:
+    print(ctc); raise SystemExit
+if len(pw) + 2 < max(1, len(iw) - 1) and len(cw) >= len(iw) - 1:
+    n = min(len(iw), len(pw) + 2)
+    print(" ".join(iw[:n])); raise SystemExit
+n = min(len(cw), len(pw) + 2, len(iw))
+print(" ".join(iw[:n]) if n else ctc)
+' "$cut_line" "$prov" "$intended" 2>/dev/null || true)"
+    if [[ -n "$clamped" && "$clamped" != "$cut_line" ]]; then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: clamp ctc vs provisional: '$cut_line' -> '$clamped'" >>"$trigger_log"
+      cut_line="$clamped"
+    fi
+  fi
+
   printf '%s\n' "$cut_line" >"$assistant_cut_dir/production_cut_text"
   printf '%s\n' "$intended" >"$assistant_cut_dir/assistant_intended.txt"
   echo "[$(date --iso-8601=seconds)] assistant_cut: ground_truth source=$backend path=$path_used played_ms=$played_ms align_ms=$lat wall_ms=$((t1-t0)) window_ms=$align_window_ms cut=$cut_line" >>"$trigger_log"
-  emit_assistant_truncated_event "$cut_line" "$backend" "high"
+  emit_assistant_truncated_event "$cut_line" "$backend" "high" "$played_ms"
   return 0
 }
 
@@ -1484,13 +1859,13 @@ cancel_speech_out() {
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
 
   if [[ "$trigger" == "transcript_token_committed" || "$trigger" == "user_speech" ]]; then
-    # Freeze play duration for cut.
+    # Freeze play duration + gen ownership for cut BEFORE any slow stop work.
     record_barge_played_ms >/dev/null || true
-    # Legacy Nemotron B only when explicitly enabled.
-    if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
-      stop_assistant_live_b || true
-    fi
-    # 1) provisional greying immediately (wall-clock)
+    mkdir -p "$assistant_cut_dir"
+    printf '%s\n' "${assistant_active_gen:-0}" >"$assistant_cut_dir/barge_cut_gen"
+    # Snapshot played_ms for async CTC (files may be cleared by next speak).
+    cp -f "$assistant_barge_played_ms_file" "$assistant_cut_dir/barge_played_ms_snapshot" 2>/dev/null || true
+    # 1) provisional greying IMMEDIATELY (wall-clock) — do not wait on CUPE stop.
     finalize_assistant_cut_approx || true
     # 2) ground truth: CTC forced align (async) — default product path
     if [[ "$align_backend" == "ctc_forced" ]]; then
@@ -1498,7 +1873,13 @@ cancel_speech_out() {
     elif [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
       finalize_assistant_cut_from_live_b &
     fi
+    # 3) Slow cleanup after UI cut is already out.
+    stop_cupe_live_tracker || true
+    if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+      stop_assistant_live_b || true
+    fi
   elif [[ "$trigger" == "session_end" || "$trigger" == "new_response" ]]; then
+    stop_cupe_live_tracker || true
     if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
       stop_assistant_live_b || true
     fi
@@ -1608,6 +1989,9 @@ run_speech_out() {
   if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
     need_tee=1
   fi
+  if cupe_live_on; then
+    need_tee=1
+  fi
   if (( need_tee == 1 )); then
     if [[ -x "$tee_play_script" || -f "$tee_play_script" ]]; then
       mkdir -p "$assistant_capture_dir"
@@ -1676,6 +2060,17 @@ run_speech_out() {
   utt_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
   printf '%s\n' "$utt_id" >"$assistant_utterance_id_file"
   rm -f "$assistant_retained_path_file" 2>/dev/null || true
+  # New utterance lifecycle: clear clocks BEFORE spawn so playback_started can
+  # write a fresh hear_start without being deleted, and bump cut gen for TUI ownership.
+  assistant_cut_gen=$((assistant_cut_gen + 1))
+  assistant_active_gen="$assistant_cut_gen"
+  mkdir -p "$assistant_cut_dir"
+  printf '%s\n' "$assistant_active_gen" >"$assistant_cut_dir/current_gen"
+  rm -f "$assistant_barge_played_ms_file" \
+        "$assistant_cut_dir/hear_start_ms" \
+        "$assistant_cut_dir/barge_cut_gen" \
+        "$assistant_cut_dir/barge_played_ms_snapshot" \
+        "$assistant_cut_dir/production_cut_text" 2>/dev/null || true
   play_args+=(--utterance-id "$utt_id")
   printf '%s\n' "$current_response_text" >"$tts_expected_file"
   echo 0 >"$tts_echo_deadline_file"
@@ -1702,6 +2097,16 @@ run_speech_out() {
 print(p)' "$out_line" >"$assistant_retained_path_file" 2>/dev/null || true
           fi
         fi
+        if [[ "$out_line" == *'"speech_out_playback_started"'* || "$out_line" == *'speech_out_playback_started'* ]]; then
+          if [[ ! -f "$assistant_cut_dir/hear_start_ms" ]]; then
+            printf '%s\n' "$(($(date +%s%N) / 1000000))" >"$assistant_cut_dir/hear_start_ms"
+            cp -f "$assistant_cut_dir/hear_start_ms" "$assistant_play_start_ms_file" 2>/dev/null || true
+            echo "[$(date --iso-8601=seconds)] assistant_cut: hear_start marked (playback_started)" >>"$trigger_log"
+            if cupe_live_on; then
+              start_cupe_live_tracker || true
+            fi
+          fi
+        fi
       elif [[ "$out_line" == Error:* || "$out_line" == error:* || "$out_line" == *"playback failed"* ]]; then
         if [[ -n "${PYTHON3_BIN:-}" ]]; then
           emit_ui_event "$("$PYTHON3_BIN" -c 'import json,sys; print(json.dumps({"event":"operator_alert","diagnostic_mono_ns":0,"diagnostic_clock_origin":"harness_local_monotonic","message":sys.argv[1]}))' "$out_line")"
@@ -1710,11 +2115,12 @@ print(p)' "$out_line" >"$assistant_retained_path_file" 2>/dev/null || true
     done) &
   local child_pid=$!
   printf '%s\n' "$child_pid" >"$tts_pid_file"
-  # Mark play start for barge-time trim of teed assistant audio (B feed must not
-  # include unheard tail of the full TTS chunk).
+  # Spawn-mark only (TTFA not included). True hear clock is playback_started.
+  # Do NOT clear hear_start_ms here — that raced with the stderr reader and
+  # deleted a valid hear clock, inflating played_ms to full-sentence cuts.
   assistant_play_start_ms="$(($(date +%s%N) / 1000000))"
   printf '%s\n' "$assistant_play_start_ms" >"$assistant_play_start_ms_file"
-  rm -f "$assistant_barge_played_ms_file"
+  # CUPE starts on speech_out_playback_started (true hear clock), not process spawn.
 
   # Block until the child exits (or is killed by cancel_speech_out).
   local rc=0
@@ -1732,6 +2138,7 @@ print(p)' "$out_line" >"$assistant_retained_path_file" 2>/dev/null || true
   done
 
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
+  stop_cupe_live_tracker || true
   # Only remove the pid file if it still points to *our* child —
   # a newer dispatch may have already overwritten it.
   if [[ "$(cat "$tts_pid_file" 2>/dev/null || true)" == "$child_pid" ]]; then
