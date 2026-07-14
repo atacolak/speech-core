@@ -277,13 +277,20 @@ echo_suppress_enabled="${SPEECH_OUT_ECHO_SUPPRESS:-1}"
 # Tee captures WAV chunks that were actually handed to the local player.
 # Dual-instance assistant self-ASR (optional): feed teed assistant audio into a
 # SECOND speech-core-daemon process (default ws port 8766), not the mic daemon.
-# When off, cut is cheap wall-clock word estimate only (no Nemotron B).
+# Nemotron B dual-instance: OFF by default (too heavy on CPU; mic starvation).
+# Cut path is cheap forced align (CTC) or wall-clock — not a second Nemotron.
 assistant_self_asr_enabled="${SPEECH_OUT_ASSISTANT_SELF_ASR:-0}"
 assistant_capture_dir="$run_dir/assistant_self_asr/played_chunks"
 assistant_manifest="$run_dir/assistant_self_asr/played_manifest.jsonl"
 assistant_b_watch_log="$run_dir/assistant_self_asr/b_watch.jsonl"
 assistant_cut_dir="$run_dir/assistant_self_asr"
 assistant_pad_words="${SPEECH_OUT_ASSISTANT_CUT_PAD_WORDS:-2}"
+# Align backend: ctc_forced (default) | approx_wallclock
+# ctc uses played audio + intended text (torchaudio MMS_FA). Not text-only.
+align_backend="${SPEECH_OUT_ALIGN_BACKEND:-ctc_forced}"
+align_python="${SPEECH_CORE_ALIGN_PYTHON:-}"
+align_remote="${SPEECH_OUT_ALIGN_REMOTE:-auto}"  # auto|1|0 — ssh to core host if no local torch
+align_script=""
 assistant_b_feed_pid=""
 assistant_b_watch_pid=""
 assistant_cut_gen=0
@@ -306,7 +313,32 @@ helper_dir="${SPEECH_CORE_HELPER_DIR:-$script_dir}"
 if [[ ! -f "$helper_dir/speech-out-tee-play.sh" && -f "$libexec_dir/speech-out-tee-play.sh" ]]; then
   helper_dir="$libexec_dir"
 fi
+# CTC / aligner package (scripts/barge_in_align)
+align_script=""
+for cand in \
+  "$helper_dir/barge_in_align/run_align.py" \
+  "$libexec_dir/barge_in_align/run_align.py" \
+  "$script_dir/barge_in_align/run_align.py" \
+  "$repo_root/scripts/barge_in_align/run_align.py"; do
+  if [[ -f "$cand" ]]; then align_script="$cand"; break; fi
+done
+if [[ -z "$align_python" ]]; then
+  for cand in \
+    "$HOME/workspace/.venvs/pyannote-cpu/bin/python" \
+    /home/sf/workspace/.venvs/pyannote-cpu/bin/python \
+    "${SPEECH_CORE_PYTHON3:-}" \
+    "$PYTHON3_BIN"; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    align_python="$cand"
+    break
+  done
+fi
+if [[ -z "$align_python" ]]; then
+  align_python="${PYTHON3_BIN:-python3}"
+fi
+
 dual_asr_dir="${SPEECH_CORE_DUAL_ASR_DIR:-}"
+
 if [[ -z "$dual_asr_dir" ]]; then
   if [[ -d "$helper_dir/barge-in-dual-asr" ]]; then
     dual_asr_dir="$helper_dir/barge-in-dual-asr"
@@ -366,7 +398,7 @@ speech-out developer live session
   steps/speed:    $steps / $speed
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
-  assistant_cut:  LIVE dual-instance B during TTS (enabled=$assistant_self_asr_enabled url=${assistant_self_asr_ws_url:-n/a}); approx provisional only
+  assistant_cut:  backend=$align_backend (nemotron_B=$assistant_self_asr_enabled) align_py=${align_python:-n/a} script=${align_script:-n/a}
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
@@ -909,7 +941,123 @@ stop_assistant_live_b() {
   echo "[$(date --iso-8601=seconds)] assistant_self_asr: live residual_drain_ms=$residual_ms gen=${assistant_active_gen:-?}" >>"$trigger_log"
 }
 
-# Provisional approx cut (immediate UI). Ground truth is live B drain.
+# Latest teed wav (full TTS chunk as handed to the speaker).
+latest_assistant_wav() {
+  local f=""
+  if compgen -G "$assistant_capture_dir/chunk_*.wav" > /dev/null 2>&1; then
+    f="$(ls -1 "$assistant_capture_dir"/chunk_*.wav 2>/dev/null | sort | tail -n1)"
+  fi
+  # Prefer 16k follow sibling if present (same index under live-*/follow)
+  local follow_dir
+  follow_dir="$(cat "$assistant_cut_dir/current_follow_dir" 2>/dev/null || true)"
+  if [[ -n "$follow_dir" && -d "$follow_dir" ]]; then
+    local ff
+    ff="$(ls -1 "$follow_dir"/chunk_*.wav 2>/dev/null | sort | tail -n1 || true)"
+    if [[ -n "$ff" && -f "$ff" ]]; then
+      printf '%s' "$ff"
+      return 0
+    fi
+  fi
+  printf '%s' "$f"
+}
+
+record_barge_played_ms() {
+  local start_ms now_ms barge_ms
+  start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+  now_ms="$(($(date +%s%N) / 1000000))"
+  if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
+    barge_ms=$((now_ms - start_ms))
+  else
+    barge_ms=800
+  fi
+  if (( barge_ms < 80 )); then barge_ms=80; fi
+  printf '%s\n' "$barge_ms" >"$assistant_barge_played_ms_file"
+  printf '%s\n' "$now_ms" >"$assistant_cut_dir/barge_mono_ms"
+  printf '%s' "$barge_ms"
+}
+
+# CTC forced align on teed clip (audio + intended text). Ground-truth cut.
+finalize_assistant_cut_ctc() {
+  local intended played_ms wav out_json mono_ns payload cut_line backend conf lat
+  intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
+  [[ -n "$intended" ]] || return 0
+  played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  if ! [[ "$played_ms" =~ ^[0-9]+$ ]]; then played_ms=0; fi
+  wav="$(latest_assistant_wav)"
+  mkdir -p "$assistant_cut_dir"
+
+  if [[ -z "$align_script" || ! -f "$align_script" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc skipped (no align script)" >>"$trigger_log"
+    return 1
+  fi
+
+  out_json="$assistant_cut_dir/ctc_align.json"
+  backend="$align_backend"
+  local t0 t1
+  t0="$(($(date +%s%N) / 1000000))"
+
+  # Prefer local align_python with torch; optional remote to core host.
+  local use_remote=0
+  if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
+    use_remote=1
+  elif [[ "$align_remote" == "auto" ]]; then
+    if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
+      use_remote=1
+    fi
+  fi
+
+  if (( use_remote == 0 )); then
+    "$align_python" "$align_script" \
+      --backend "$backend" \
+      --wav "${wav:-}" \
+      --intended "$intended" \
+      --played-ms "$played_ms" \
+      --speed "$speed" \
+      --out "$out_json" \
+      >>"$trigger_log" 2>&1 || true
+  else
+    # Remote align on speech-core host (where pyannote-cpu / torch lives).
+    local host remote_wav remote_py remote_script
+    host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+    remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+    remote_script="${SPEECH_CORE_ALIGN_SCRIPT_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/run_align.py}"
+    if [[ -n "$wav" && -f "$wav" && -n "$host" ]]; then
+      remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
+      scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
+      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+        "PYTHONPATH=/home/sf/workspace/speech-core/scripts $remote_py $remote_script --backend $backend --wav $remote_wav --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
+        >"$out_json" 2>>"$trigger_log" || true
+      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $remote_wav" >/dev/null 2>&1 || true
+    else
+      echo "[$(date --iso-8601=seconds)] assistant_cut: remote ctc skipped (no wav/host)" >>"$trigger_log"
+    fi
+  fi
+
+  t1="$(($(date +%s%N) / 1000000))"
+  if [[ ! -s "$out_json" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc produced no json wall_ms=$((t1-t0))" >>"$trigger_log"
+    return 1
+  fi
+
+  # out may be pretty or single-line; normalize
+  if [[ -n "${PYTHON3_BIN:-}" ]]; then
+    cut_line="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("spoken_prefix") or "")' "$out_json" 2>/dev/null || true)"
+    conf="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("confidence",0))' "$out_json" 2>/dev/null || echo 0)"
+    lat="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("align_latency_ms",0))' "$out_json" 2>/dev/null || echo 0)"
+    backend="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("backend_id","ctc_forced"))' "$out_json" 2>/dev/null || echo ctc_forced)"
+  else
+    cut_line=""
+  fi
+  [[ -n "$cut_line" ]] || return 1
+
+  printf '%s\n' "$cut_line" >"$assistant_cut_dir/production_cut_text"
+  printf '%s\n' "$intended" >"$assistant_cut_dir/assistant_intended.txt"
+  echo "[$(date --iso-8601=seconds)] assistant_cut: ground_truth source=$backend played_ms=$played_ms align_ms=$lat wall_ms=$((t1-t0)) cut=$cut_line" >>"$trigger_log"
+  emit_assistant_truncated_event "$cut_line" "$backend" "high"
+  return 0
+}
+
+# Provisional approx cut (immediate UI). Ground truth is CTC (or legacy B).
 finalize_assistant_cut_approx() {
   local intended played_ms cut_line
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
@@ -1001,8 +1149,10 @@ p.write_text(json.dumps(m, indent=2)+"\n")
 
 # Compatibility name used by older call sites.
 finalize_assistant_cut() {
-  # Prefer ground truth if live B watch has content; else provisional only.
-  if [[ -s "$assistant_b_watch_log" ]]; then
+  # Prefer CTC ground truth; legacy Nemotron B only if explicitly enabled + log present.
+  if [[ "$align_backend" == "ctc_forced" ]]; then
+    finalize_assistant_cut_ctc || finalize_assistant_cut_approx || true
+  elif [[ -s "$assistant_b_watch_log" ]]; then
     finalize_assistant_cut_from_live_b || true
   else
     finalize_assistant_cut_approx || true
@@ -1028,14 +1178,24 @@ cancel_speech_out() {
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
 
   if [[ "$trigger" == "transcript_token_committed" || "$trigger" == "user_speech" ]]; then
-    # 1) stop live B follow (signals residual drain of already-buffered audio)
-    stop_assistant_live_b || true
-    # 2) provisional greying immediately
+    # Freeze play duration for cut.
+    record_barge_played_ms >/dev/null || true
+    # Legacy Nemotron B only when explicitly enabled.
+    if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+      stop_assistant_live_b || true
+    fi
+    # 1) provisional greying immediately (wall-clock)
     finalize_assistant_cut_approx || true
-    # 3) ground truth from live B transcript (async — do not block next speak)
-    finalize_assistant_cut_from_live_b &
+    # 2) ground truth: CTC forced align (async) — default product path
+    if [[ "$align_backend" == "ctc_forced" ]]; then
+      finalize_assistant_cut_ctc &
+    elif [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+      finalize_assistant_cut_from_live_b &
+    fi
   elif [[ "$trigger" == "session_end" || "$trigger" == "new_response" ]]; then
-    stop_assistant_live_b || true
+    if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+      stop_assistant_live_b || true
+    fi
   fi
 }
 
@@ -1131,26 +1291,51 @@ run_speech_out() {
     current_reference="${SPEECH_OUT_REFERENCE:-$current_reference}"
     current_style="${SPEECH_OUT_STYLE:-$current_style}"
   fi
-  # Live dual-instance B: tee play WAVs + 16k follow chunks; start B feed before TTS.
+  # Tee played WAVs for cut alignment (CTC needs audio). Optional legacy Nemotron B.
   local effective_play_command="$play_command"
+  local need_tee=0
+  if [[ "$align_backend" == "ctc_forced" || "$align_backend" == "approx_wallclock" ]]; then
+    need_tee=1
+  fi
   if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+    need_tee=1
+  fi
+  if (( need_tee == 1 )); then
     if [[ -x "$tee_play_script" || -f "$tee_play_script" ]]; then
       mkdir -p "$assistant_capture_dir"
-      # Fresh capture for this utterance (do not mix prior turns).
       rm -f "$assistant_capture_dir"/chunk_*.wav
       : >"$assistant_manifest"
       : >"$assistant_b_watch_log"
-      # Start live B session first so follow-dir is ready before first chunk.
-      start_assistant_live_b || true
-      local follow_dir
+      # Legacy dual Nemotron only when explicitly enabled (default OFF).
+      if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
+        start_assistant_live_b || true
+      fi
+      local follow_dir=""
       follow_dir="$(cat "$assistant_cut_dir/current_follow_dir" 2>/dev/null || true)"
+      # Always emit 16k follow dir for CTC even without Nemotron B.
+      if [[ -z "$follow_dir" ]]; then
+        follow_dir="$assistant_cut_dir/follow"
+        mkdir -p "$follow_dir"
+        rm -f "$follow_dir"/chunk_*.wav
+        printf '%s
+' "$follow_dir" >"$assistant_cut_dir/current_follow_dir"
+      fi
       export SPEECH_OUT_TEE_REAL_PLAY="$play_command"
       export SPEECH_OUT_TEE_CAPTURE_DIR="$assistant_capture_dir"
       export SPEECH_OUT_TEE_MANIFEST="$assistant_manifest"
-      export SPEECH_OUT_TEE_FOLLOW_DIR="${follow_dir:-}"
+      export SPEECH_OUT_TEE_FOLLOW_DIR="$follow_dir"
       effective_play_command="$tee_play_script"
+      # Warm CTC weights once per session (non-blocking).
+      if [[ "$align_backend" == "ctc_forced" && -n "$align_script" && -f "$align_script" ]]; then
+        if [[ ! -f "$assistant_cut_dir/.ctc_preloaded" ]]; then
+          if "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
+            "$align_python" "$align_script" --preload >>"$trigger_log" 2>&1 &
+            touch "$assistant_cut_dir/.ctc_preloaded"
+          fi
+        fi
+      fi
     else
-      echo "[$(date --iso-8601=seconds)] assistant_self_asr: tee script missing; play without capture" >>"$trigger_log"
+      echo "[$(date --iso-8601=seconds)] assistant_cut: tee script missing; play without capture" >>"$trigger_log"
     fi
   fi
 
@@ -1291,11 +1476,8 @@ while IFS= read -r line; do
           # do not infer it from cumulative updates or revise it after this event.
           turn_text="$(printf '%s\n' "$line" | json_get_string text)"
           turn_committed_seen=1
-          # Cut was provisionally set on barge; re-assert ground truth from live B
-          # BEFORE starting the next TTS (which opens a new live B session).
-          finalize_assistant_cut_from_live_b || true
-          # CRITICAL LATENCY: next speak is not blocked on B (live B already ran
-          # during previous TTS; residual drain happened at barge).
+          # Cut should already be provisional (+ async CTC) from barge.
+          # Do not block next speak on aligner.
           dispatch_turn_response transcript_committed
           ;;
         turn_closed)
