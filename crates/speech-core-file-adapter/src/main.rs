@@ -1,5 +1,8 @@
 //! speech-in file adapter — replays WAV files to the daemon over websocket for
 //! repeatable detector and turn-detection testing.
+//!
+//! Also supports --follow-dir: long-lived live feed of teed assistant WAV chunks
+//! for dual-instance Nemotron B during TTS playback.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -8,9 +11,10 @@ use speech_core_protocol::{
     frame_duration_samples, now_mono_ns, AudioFrame, AudioFrameHeader, ClockDomain, ControlMessage,
     PcmFormat, SourceKind, TimestampProvenance, TimestampQuality,
 };
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -27,7 +31,8 @@ struct Args {
     url: String,
 
     /// Input wav file. Must be 16 kHz mono PCM16 or f32.
-    wav: PathBuf,
+    /// Optional when --follow-dir is set.
+    wav: Option<PathBuf>,
 
     /// Stable adapter id to place in frame headers.
     #[arg(long, default_value = "file-adapter", env = "SPEECH_CORE_ADAPTER_ID")]
@@ -54,13 +59,30 @@ struct Args {
     append_silence_ms: u32,
 
     /// Keep the websocket open this many milliseconds after all samples are sent.
-    ///
-    /// Useful when testing realtime detector latency: if this is zero, connection teardown can
-    /// trigger session-end silence flushes that are not representative of a still-open microphone
-    /// stream.
     #[arg(long, default_value_t = 0)]
     hold_open_ms: u32,
+
+    /// Live follow mode: watch this directory for chunk_*.wav files and stream
+    /// them as they appear (for assistant self-ASR during TTS).
+    #[arg(long)]
+    follow_dir: Option<PathBuf>,
+
+    /// When this file exists, stop following (used on barge-in).
+    #[arg(long)]
+    stop_file: Option<PathBuf>,
+
+    /// Max time to wait for the first chunk in follow mode (ms).
+    #[arg(long, default_value_t = 30_000)]
+    follow_first_chunk_timeout_ms: u64,
+
+    /// Idle poll interval while waiting for more chunks (ms).
+    #[arg(long, default_value_t = 20)]
+    follow_poll_ms: u64,
 }
+
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,8 +90,20 @@ async fn main() -> Result<()> {
     if args.frame_ms == 0 {
         bail!("--frame-ms must be greater than zero");
     }
+    if args.follow_dir.is_none() && args.wav.is_none() {
+        bail!("either a wav path or --follow-dir is required");
+    }
 
-    let (mut samples, format) = load_wav(&args.wav)?;
+    if let Some(dir) = args.follow_dir.clone() {
+        return run_follow(args, dir).await;
+    }
+
+    let wav = args.wav.clone().expect("wav path");
+    run_one_shot(args, wav).await
+}
+
+async fn run_one_shot(args: Args, wav: PathBuf) -> Result<()> {
+    let (mut samples, format) = load_wav(&wav)?;
     let silence_samples = (u64::from(args.append_silence_ms) * 16_000 / 1_000) as usize;
     samples.resize(samples.len() + silence_samples, 0.0);
 
@@ -86,10 +120,208 @@ async fn main() -> Result<()> {
     let (mut ws, _) = connect_async(&args.url)
         .await
         .with_context(|| format!("connecting to {}", args.url))?;
+    send_hello(&mut ws, &args, &stream_session_id, format, &provenance).await?;
+
+    let (seq, source_sample_start) = stream_samples(
+        &mut ws,
+        &args,
+        &stream_session_id,
+        &samples,
+        format,
+        &provenance,
+        0,
+        0,
+        None,
+    )
+    .await?;
+
+    if args.hold_open_ms > 0 {
+        sleep(Duration::from_millis(args.hold_open_ms as u64)).await;
+        drain_available_text(&mut ws).await?;
+    }
+
+    ws.close(None).await.ok();
+    eprintln!("sent {seq} frames, {source_sample_start} samples, session={stream_session_id}");
+    Ok(())
+}
+
+async fn run_follow(args: Args, dir: PathBuf) -> Result<()> {
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating follow dir {}", dir.display()))?;
+    let stop = args.stop_file.clone();
+    let stream_session_id = args
+        .stream_session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let provenance = TimestampProvenance::same_clock(
+        "file-adapter:live-follow",
+        ClockDomain::SyntheticAdapter,
+        TimestampQuality::SyntheticScheduled,
+    );
+
+    let (mut ws, _) = connect_async(&args.url)
+        .await
+        .with_context(|| format!("connecting to {}", args.url))?;
+
+    // Format fixed for live assistant feed after client-side resample to 16k mono s16.
+    let format = PcmFormat::PcmS16Le;
+    send_hello(&mut ws, &args, &stream_session_id, format, &provenance).await?;
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seq = 0_u64;
+    let mut source_sample_start = 0_u64;
+    let mut first_chunk_seen = false;
+    let started = std::time::Instant::now();
+    let mut stop_reason = "idle_timeout".to_string();
+
+    eprintln!(
+        "follow-dir active dir={} session={} realtime={}",
+        dir.display(),
+        stream_session_id,
+        args.realtime
+    );
+
+    loop {
+        if stop_requested(stop.as_ref()) {
+            stop_reason = "stop_file".to_string();
+            break;
+        }
+
+        let mut chunks = list_chunk_wavs(&dir)?;
+        chunks.sort();
+        let mut progressed = false;
+        for chunk_path in chunks {
+            if seen.contains(&chunk_path) {
+                continue;
+            }
+            // Wait until file size stabilizes briefly (tee cp finished).
+            if !file_stable(&chunk_path, 2, 15).await? {
+                continue;
+            }
+            seen.insert(chunk_path.clone());
+            first_chunk_seen = true;
+            progressed = true;
+
+            // Resample/normalize to 16k mono s16 in memory via hound if already ok;
+            // otherwise require pre-resampled chunks from the harness.
+            let (samples, chunk_format) = match load_wav(&chunk_path) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!(
+                        "follow skip unreadable chunk {}: {err:#}",
+                        chunk_path.display()
+                    );
+                    continue;
+                }
+            };
+            if chunk_format != format && chunk_format != PcmFormat::PcmF32Le {
+                eprintln!(
+                    "follow skip unsupported format {:?} in {}",
+                    chunk_format,
+                    chunk_path.display()
+                );
+                continue;
+            }
+            let samples = if chunk_format == PcmFormat::PcmF32Le {
+                // encode path uses f32 samples for both; header format stays s16 if we convert
+                samples
+            } else {
+                samples
+            };
+            let send_format = if chunk_format == PcmFormat::PcmF32Le {
+                // Convert f32 samples → treat as f32 frames (daemon accepts f32).
+                PcmFormat::PcmF32Le
+            } else {
+                format
+            };
+
+            eprintln!(
+                "follow streaming chunk={} samples={} seq_start={}",
+                chunk_path.display(),
+                samples.len(),
+                seq
+            );
+            let (new_seq, new_start) = stream_samples(
+                &mut ws,
+                &args,
+                &stream_session_id,
+                &samples,
+                send_format,
+                &provenance,
+                seq,
+                source_sample_start,
+                stop.as_ref(),
+            )
+            .await?;
+            seq = new_seq;
+            source_sample_start = new_start;
+
+            if stop_requested(stop.as_ref()) {
+                stop_reason = "stop_file_mid_chunk".to_string();
+                break;
+            }
+        }
+
+        if stop_reason.starts_with("stop_file") {
+            break;
+        }
+
+        if !first_chunk_seen
+            && started.elapsed() > Duration::from_millis(args.follow_first_chunk_timeout_ms)
+        {
+            stop_reason = "first_chunk_timeout".to_string();
+            break;
+        }
+
+        // After first chunk, if stop not set, keep waiting for more chunks until stop.
+        // Safety idle: if we have streamed something and no new chunks for a long time without stop,
+        // keep waiting — TTS may still be synthesizing. Rely on stop_file from harness.
+        if !progressed {
+            sleep(Duration::from_millis(args.follow_poll_ms)).await;
+        }
+    }
+
+    // Short silence + hold so B can flush the last frames without a hard hangup.
+    if args.append_silence_ms > 0 {
+        let silence_samples = (u64::from(args.append_silence_ms) * 16_000 / 1_000) as usize;
+        let silence = vec![0.0_f32; silence_samples];
+        let (new_seq, new_start) = stream_samples(
+            &mut ws,
+            &args,
+            &stream_session_id,
+            &silence,
+            format,
+            &provenance,
+            seq,
+            source_sample_start,
+            None, // always finish silence pad
+        )
+        .await?;
+        seq = new_seq;
+        source_sample_start = new_start;
+    }
+    if args.hold_open_ms > 0 {
+        sleep(Duration::from_millis(args.hold_open_ms as u64)).await;
+        drain_available_text(&mut ws).await?;
+    }
+
+    ws.close(None).await.ok();
+    eprintln!(
+        "follow done reason={stop_reason} frames={seq} samples={source_sample_start} session={stream_session_id}"
+    );
+    Ok(())
+}
+
+async fn send_hello(
+    ws: &mut WsStream,
+    args: &Args,
+    stream_session_id: &str,
+    format: PcmFormat,
+    provenance: &TimestampProvenance,
+) -> Result<()> {
     let hello = ControlMessage::Hello {
         adapter_id: args.adapter_id.clone(),
         stream_id: args.stream_id.clone(),
-        stream_session_id: stream_session_id.clone(),
+        stream_session_id: stream_session_id.to_owned(),
         source_kind: SourceKind::File,
         sample_rate_hz: 16_000,
         channels: 1,
@@ -99,14 +331,28 @@ async fn main() -> Result<()> {
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
+    Ok(())
+}
 
+async fn stream_samples(
+    ws: &mut WsStream,
+    args: &Args,
+    stream_session_id: &str,
+    samples: &[f32],
+    format: PcmFormat,
+    provenance: &TimestampProvenance,
+    mut seq: u64,
+    mut source_sample_start: u64,
+    stop: Option<&PathBuf>,
+) -> Result<(u64, u64)> {
     let samples_per_frame = frame_duration_samples(16_000, args.frame_ms) as usize;
-    let mut seq = 0_u64;
-    let mut source_sample_start = 0_u64;
     let mut ticker = interval(Duration::from_millis(args.frame_ms as u64));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     for chunk in samples.chunks(samples_per_frame) {
+        if stop_requested(stop) {
+            break;
+        }
         if args.realtime {
             ticker.tick().await;
         }
@@ -116,7 +362,7 @@ async fn main() -> Result<()> {
         let frame = AudioFrame::new(
             AudioFrameHeader {
                 stream_id: args.stream_id.clone(),
-                stream_session_id: stream_session_id.clone(),
+                stream_session_id: stream_session_id.to_owned(),
                 adapter_id: args.adapter_id.clone(),
                 source_kind: SourceKind::File,
                 seq,
@@ -133,19 +379,48 @@ async fn main() -> Result<()> {
             payload,
         )?;
         ws.send(Message::Binary(frame.encode()?)).await?;
-        drain_available_text(&mut ws).await?;
+        drain_available_text(ws).await?;
         seq = seq.saturating_add(1);
         source_sample_start = source_sample_start.saturating_add(u64::from(sample_count));
     }
+    Ok((seq, source_sample_start))
+}
 
-    if args.hold_open_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(args.hold_open_ms as u64)).await;
-        drain_available_text(&mut ws).await?;
+fn stop_requested(stop: Option<&PathBuf>) -> bool {
+    stop.map(|p| p.exists()).unwrap_or(false)
+}
+
+fn list_chunk_wavs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return Ok(out);
     }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.starts_with("chunk_") && name.ends_with(".wav") {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
 
-    ws.close(None).await.ok();
-    eprintln!("sent {seq} frames, {source_sample_start} samples, session={stream_session_id}");
-    Ok(())
+async fn file_stable(path: &Path, checks: u32, wait_ms: u64) -> Result<bool> {
+    let mut last = None;
+    for _ in 0..checks {
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return Ok(false),
+        };
+        let len = meta.len();
+        if last == Some(len) && len > 44 {
+            return Ok(true);
+        }
+        last = Some(len);
+        sleep(Duration::from_millis(wait_ms)).await;
+    }
+    Ok(last.unwrap_or(0) > 44)
 }
 
 fn load_wav(path: &PathBuf) -> Result<(Vec<f32>, PcmFormat)> {
@@ -188,11 +463,7 @@ fn encode_payload(samples: &[f32], format: PcmFormat) -> Vec<u8> {
     }
 }
 
-async fn drain_available_text(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> Result<()> {
+async fn drain_available_text(ws: &mut WsStream) -> Result<()> {
     loop {
         match tokio::time::timeout(Duration::from_millis(1), ws.next()).await {
             Ok(Some(Ok(Message::Text(_)))) => {}

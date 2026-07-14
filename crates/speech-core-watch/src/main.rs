@@ -1584,8 +1584,8 @@ fn render_speech_out_text(output: &SpeechOutLine) -> String {
     if spoken.is_empty() {
         return full;
     }
-    // Visible approximate-cut marker between heard (dim) and unsaid (normal).
-    format!("{ANSI_DIM}{spoken}{ANSI_RESET} <probably cut here>{rest}")
+    // Dim spoken/cut prefix; unsaid remainder stays normal white (no text marker).
+    format!("{ANSI_DIM}{spoken}{ANSI_RESET}{rest}")
 }
 
 fn split_spoken_remainder(full: &str, spoken_prefix: &str) -> (String, String) {
@@ -2816,9 +2816,9 @@ mod tests {
         let rendered = model.render(true);
         assert!(
             rendered.contains(
-                "\u{1b}[2mThis is a long assistant reply\u{1b}[0m <probably cut here> so you can barge in"
+                "\u{1b}[2mThis is a long assistant reply\u{1b}[0m so you can barge in"
             ),
-            "spoken prefix must be dim + approx-cut marker, remainder normal white; got:\n{rendered}"
+            "spoken prefix must be dim, remainder normal white; got:\n{rendered}"
         );
         assert!(
             rendered.contains("assistant cut (drain): This is a long assistant reply"),

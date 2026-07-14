@@ -286,6 +286,8 @@ assistant_cut_dir="$run_dir/assistant_self_asr"
 assistant_pad_words="${SPEECH_OUT_ASSISTANT_CUT_PAD_WORDS:-2}"
 assistant_b_feed_pid=""
 assistant_b_watch_pid=""
+assistant_cut_gen=0
+assistant_active_gen=""
 # B daemon URL: separate Nemotron process. Override with SPEECH_OUT_ASSISTANT_SELF_ASR_WS_URL.
 assistant_self_asr_ws_url="${SPEECH_OUT_ASSISTANT_SELF_ASR_WS_URL:-}"
 if [[ -z "$assistant_self_asr_ws_url" && -n "${core_ws_url:-}" ]]; then
@@ -364,7 +366,7 @@ speech-out developer live session
   steps/speed:    $steps / $speed
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
-  assistant_cut:  approx wall-clock always; dual-instance B drain=$assistant_self_asr_enabled url=${assistant_self_asr_ws_url:-n/a}
+  assistant_cut:  LIVE dual-instance B during TTS (enabled=$assistant_self_asr_enabled url=${assistant_self_asr_ws_url:-n/a}); approx provisional only
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
@@ -754,202 +756,21 @@ _speech_out_cancelled=0
 _speech_out_cancel_reason=""
 
 count_assistant_played_chunks() {
+  local dir="${1:-$assistant_capture_dir}"
   local n=0
-  if compgen -G "$assistant_capture_dir/chunk_*.wav" > /dev/null 2>&1; then
-    n="$(find "$assistant_capture_dir" -maxdepth 1 -name 'chunk_*.wav' 2>/dev/null | wc -l | tr -d ' ')"
+  if compgen -G "$dir/chunk_*.wav" > /dev/null 2>&1; then
+    n="$(find "$dir" -maxdepth 1 -name 'chunk_*.wav' 2>/dev/null | wc -l | tr -d ' ')"
   fi
   printf '%s' "${n:-0}"
 }
 
-# After barge: feed already-played assistant WAV into Nemotron B (separate stream).
-start_assistant_self_asr_drain() {
-  [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
-  local chunks merged b_session feed_py
-  chunks="$(count_assistant_played_chunks)"
-  echo "[$(date --iso-8601=seconds)] assistant_self_asr: start drain played_chunks=$chunks" >>"$trigger_log"
-  emit_ui_event "$(printf '{"event":"assistant_self_asr_drain_started","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","played_chunks":%s}' "$(diagnostic_mono_ns)" "$session_id" "$chunks")"
-
-  if (( chunks < 1 )); then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: no played chunks yet — cut will use pad fallback" >>"$trigger_log"
-    return 0
-  fi
-
-  merged="$assistant_cut_dir/assistant_played.wav"
-  if [[ -z "${PYTHON3_BIN:-}" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: no python3 found; cut will use pad fallback only" >>"$trigger_log"
-    return 0
-  fi
-  if [[ ! -f "$finalize_cut_py" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: finalize helper missing at $finalize_cut_py" >>"$trigger_log"
-    return 0
-  fi
-  # Merge tee-captured chunks (real audio that reached the player).
-  "$PYTHON3_BIN" "$finalize_cut_py" \
-    --intended-text "$(cat "$tts_expected_file" 2>/dev/null || true)" \
-    --out-dir "$assistant_cut_dir" \
-    --merge-chunks-dir "$assistant_capture_dir" \
-    --played-chunks "$chunks" \
-    --merge-only \
-    >>"$trigger_log" 2>&1 || true
-
-  if [[ ! -f "$merged" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: merge failed — no assistant_played.wav" >>"$trigger_log"
-    return 0
-  fi
-
-  # Trim to audio actually audible before barge. Teed chunks are full TTS
-  # buffers (often the whole sentence); without trim, B ASR greys everything
-  # and steals Nemotron CPU while the user is speaking.
-  local start_ms now_ms elapsed_ms feed_wav
-  start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
-  now_ms="$(($(date +%s%N) / 1000000))"
-  if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
-    elapsed_ms=$((now_ms - start_ms))
-  else
-    elapsed_ms=1500
-  fi
-  # Small pad so we don't cut the last half-word; clamp to [200ms, full].
-  if (( elapsed_ms < 200 )); then elapsed_ms=200; fi
-  feed_wav="$assistant_cut_dir/assistant_played_trimmed.wav"
-  "$PYTHON3_BIN" - <<PY >>"$trigger_log" 2>&1 || true
-import wave
-from pathlib import Path
-src = Path("$merged")
-dst = Path("$feed_wav")
-ms = int("$elapsed_ms")
-with wave.open(str(src), "rb") as w:
-    rate = w.getframerate()
-    ch = w.getnchannels()
-    sw = w.getsampwidth()
-    total = w.getnframes()
-    keep = min(total, max(1, int(rate * (ms / 1000.0))))
-    frames = w.readframes(keep)
-with wave.open(str(dst), "wb") as out:
-    out.setnchannels(ch)
-    out.setsampwidth(sw)
-    out.setframerate(rate)
-    out.writeframes(frames)
-print(f"assistant_self_asr: trim played_ms={ms} keep_frames={keep}/{total} rate={rate}")
-PY
-  if [[ -f "$feed_wav" && -s "$feed_wav" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: using trimmed feed elapsed_ms=$elapsed_ms" >>"$trigger_log"
-  else
-    feed_wav="$merged"
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: trim failed; feeding full merged wav" >>"$trigger_log"
-  fi
-
-  b_session="${session_id}-assistant-self-asr"
-  feed_py="$dual_asr_dir/feed_assistant_asr.py"
-  if [[ ! -f "$feed_py" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed helper missing at $feed_py" >>"$trigger_log"
-    return 0
-  fi
-
-  local b_url="${assistant_self_asr_ws_url:-$core_ws_url}"
-  echo "[$(date --iso-8601=seconds)] assistant_self_asr: dual-instance B url=$b_url (primary mic url=$core_ws_url)" >>"$trigger_log"
-
-  # Watch Nemotron B on the SECOND daemon (separate process + model worker).
-  : >"$assistant_b_watch_log"
-  "$bin_dir/speech-core-watch" \
-    --url "$b_url" \
-    --stream-id "assistant.self_asr" \
-    --stream-session-id "$b_session" \
-    --mode jsonl \
-    >>"$assistant_b_watch_log" 2>>"$trigger_log" &
-  assistant_b_watch_pid=$!
-
-  # Feed trimmed WAV into second speech-core-daemon as assistant.self_asr.
-  # --no-realtime: push faster than wall-clock so B finishes during user barge.
-  "$PYTHON3_BIN" "$feed_py" \
-    "$feed_wav" \
-    --url "$b_url" \
-    --stream-id "assistant.self_asr" \
-    --stream-session-id "$b_session" \
-    --out-dir "$assistant_cut_dir/feed" \
-    --no-realtime \
-    >>"$trigger_log" 2>&1 &
-  assistant_b_feed_pid=$!
-  echo "[$(date --iso-8601=seconds)] assistant_self_asr: feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid session=$b_session elapsed_ms=$elapsed_ms b_url=$b_url" >>"$trigger_log"
-}
-
-# At barge / transcript_committed: cheap wall-clock word estimate cut.
-# No Nemotron. Snap to word boundary of intended TTS text only.
-finalize_assistant_cut() {
-  local intended cut_line cut_source played_ms estimated_words mono_ns payload start_ms now_ms
+emit_assistant_truncated_event() {
+  local cut_text="$1" source="$2" confidence="${3:-low}" intended played_ms words mono_ns payload
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
-  [[ -n "$intended" ]] || return 0
-
-  # Prefer duration frozen at barge so a later transcript_committed re-finalize
-  # does not count user speech into the estimate.
-  if [[ -s "$assistant_barge_played_ms_file" ]]; then
-    played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
-  else
-    start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
-    now_ms="$(($(date +%s%N) / 1000000))"
-    if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
-      played_ms=$((now_ms - start_ms))
-    else
-      played_ms=800
-    fi
-    printf '%s\n' "$played_ms" >"$assistant_barge_played_ms_file" 2>/dev/null || true
-  fi
-  if ! [[ "$played_ms" =~ ^[0-9]+$ ]]; then played_ms=800; fi
-  if (( played_ms < 150 )); then played_ms=150; fi
-
-  # words_per_sec ≈ 2.5 * TTS speed. Emit cut via JSON so multi-word prefixes
-  # are not shredded by `read -r` (was collapsing spoken_prefix to first word).
-  cut_source="approx_wallclock"
-  mkdir -p "$assistant_cut_dir" 2>/dev/null || true
-  if [[ -z "${PYTHON3_BIN:-}" ]]; then
-    estimated_words=$(( (played_ms * 25 * ${speed%.*} ) / 10000 ))
-    if (( estimated_words < 1 )); then estimated_words=1; fi
-    cut_line="$(printf '%s\n' "$intended" | awk -v n="$estimated_words" '{for(i=1;i<=NF && i<=n;i++) printf "%s%s", (i>1?" ":""), $i}')"
-    printf '%s\n' "$intended" >"$assistant_cut_dir/assistant_intended.txt" 2>/dev/null || true
-    printf '%s\n' "$cut_line" >"$assistant_cut_dir/production_cut_text" 2>/dev/null || true
-    echo "[$(date --iso-8601=seconds)] assistant_cut: source=$cut_source played_ms=$played_ms words=$estimated_words cut=$cut_line" >>"$trigger_log"
-    echo "[$(date --iso-8601=seconds)] assistant_cut: no python3; skip ui event" >>"$trigger_log"
-    return 0
-  fi
-
-  local cut_json payload mono_ns
-  cut_json="$("$PYTHON3_BIN" -c '
-import json, sys
-from pathlib import Path
-intended = sys.argv[1]
-played_ms = int(sys.argv[2])
-speed = float(sys.argv[3])
-out_dir = Path(sys.argv[4])
-words = intended.split()
-if not words:
-    cut, n = "", 0
-else:
-    wps = max(0.8, 2.5 * max(0.5, speed))
-    n = int(round((played_ms / 1000.0) * wps))
-    n = max(1, min(len(words), n))
-    cut = " ".join(words[:n])
-out_dir.mkdir(parents=True, exist_ok=True)
-(out_dir / "assistant_intended.txt").write_text(intended.strip() + "\n", encoding="utf-8")
-(out_dir / "production_cut_text").write_text(cut + "\n", encoding="utf-8")
-metrics = {
-  "label": "live_session",
-  "primary_cut_source": "approx_wallclock",
-  "production_cut_text": cut,
-  "intended_text": intended.strip(),
-  "played_ms": played_ms,
-  "estimated_words": n,
-  "speed": speed,
-  "confidence": "low",
-  "marker": "<probably cut here>",
-}
-(out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
-print(json.dumps({"cut": cut, "estimated_words": n, "played_ms": played_ms}))
-' "$intended" "$played_ms" "$speed" "$assistant_cut_dir")" || cut_json=""
-
-  cut_line="$("$PYTHON3_BIN" -c 'import json,sys; print(json.loads(sys.argv[1]).get("cut",""))' "$cut_json" 2>/dev/null || true)"
-  estimated_words="$("$PYTHON3_BIN" -c 'import json,sys; print(json.loads(sys.argv[1]).get("estimated_words",0))' "$cut_json" 2>/dev/null || echo 0)"
-  echo "[$(date --iso-8601=seconds)] assistant_cut: source=$cut_source played_ms=$played_ms words=$estimated_words cut=${cut_line:-}" >>"$trigger_log"
-
+  played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
+  words="$(printf '%s' "$cut_text" | awk '{print NF}')"
   mono_ns="$(diagnostic_mono_ns)"
+  [[ -n "${PYTHON3_BIN:-}" && -n "$intended" ]] || return 0
   payload="$("$PYTHON3_BIN" -c '
 import json, sys
 print(json.dumps({
@@ -961,77 +782,231 @@ print(json.dumps({
   "intended_text": sys.argv[4],
   "cut_text": sys.argv[3],
   "spoken_prefix": sys.argv[3],
-  "primary_cut_source": "approx_wallclock",
-  "played_ms": int(sys.argv[5]),
-  "estimated_words": int(sys.argv[6]),
-  "confidence": "low",
-  "marker": "<probably cut here>",
+  "primary_cut_source": sys.argv[5],
+  "played_ms": int(sys.argv[6]),
+  "estimated_words": int(sys.argv[7]),
+  "confidence": sys.argv[8],
+  "cut_gen": sys.argv[9],
 }, ensure_ascii=False))
-' "$mono_ns" "$session_id" "${cut_line:-}" "$intended" "$played_ms" "${estimated_words:-0}")" || payload=""
-  if [[ -n "$payload" ]]; then
-    emit_ui_event "$payload"
+' "$mono_ns" "$session_id" "$cut_text" "$intended" "$source" "${played_ms:-0}" "${words:-0}" "$confidence" "${assistant_active_gen:-0}")" || payload=""
+  [[ -n "$payload" ]] && emit_ui_event "$payload"
+}
+
+approx_cut_words() {
+  local intended="$1" played_ms="$2"
+  [[ -n "${PYTHON3_BIN:-}" ]] || return 1
+  "$PYTHON3_BIN" -c '
+import sys
+intended = sys.argv[1]
+played_ms = int(sys.argv[2])
+speed = float(sys.argv[3])
+words = intended.split()
+if not words:
+    print("")
+    raise SystemExit
+wps = max(0.8, 2.5 * max(0.5, speed))
+n = int(round((played_ms / 1000.0) * wps))
+n = max(1, min(len(words), n))
+print(" ".join(words[:n]))
+' "$intended" "$played_ms" "$speed"
+}
+
+# Live dual-instance B: follow teed 16k chunks while TTS plays.
+start_assistant_live_b() {
+  [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
+  local b_url b_session adapter follow_dir stop_file
+  adapter="$bin_dir/speech-core-file-adapter"
+  if [[ ! -x "$adapter" ]]; then
+    adapter="$(command -v speech-core-file-adapter 2>/dev/null || true)"
+  fi
+  if [[ ! -x "$adapter" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_self_asr: file-adapter missing; live B disabled" >>"$trigger_log"
+    return 0
+  fi
+
+  assistant_cut_gen=$((assistant_cut_gen + 1))
+  assistant_active_gen="$assistant_cut_gen"
+  follow_dir="$assistant_cut_dir/live-$assistant_active_gen/follow"
+  stop_file="$assistant_cut_dir/live-$assistant_active_gen/stop"
+  mkdir -p "$follow_dir"
+  rm -f "$stop_file"
+  : >"$assistant_b_watch_log"
+  printf '%s\n' "$follow_dir" >"$assistant_cut_dir/current_follow_dir"
+  printf '%s\n' "$stop_file" >"$assistant_cut_dir/current_stop_file"
+  printf '%s\n' "$assistant_active_gen" >"$assistant_cut_dir/current_gen"
+
+  b_url="${assistant_self_asr_ws_url:-$core_ws_url}"
+  b_session="${session_id}-assistant-self-asr-live-${assistant_active_gen}"
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: LIVE start gen=$assistant_active_gen b_url=$b_url session=$b_session" >>"$trigger_log"
+  emit_ui_event "$(printf '{"event":"assistant_self_asr_live_started","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","cut_gen":%s,"b_url":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$assistant_active_gen" "$b_url")"
+
+  # Watch B daemon events (second Nemotron process).
+  "$bin_dir/speech-core-watch" \
+    --url "$b_url" \
+    --stream-id "assistant.self_asr" \
+    --stream-session-id "$b_session" \
+    --mode jsonl \
+    >>"$assistant_b_watch_log" 2>>"$trigger_log" &
+  assistant_b_watch_pid=$!
+
+  # Follow teed chunks in realtime while TTS plays.
+  "$adapter" \
+    --url "$b_url" \
+    --stream-id "assistant.self_asr" \
+    --stream-session-id "$b_session" \
+    --adapter-id "assistant.self_asr.live" \
+    --frame-ms 20 \
+    --realtime \
+    --append-silence-ms 400 \
+    --hold-open-ms 200 \
+    --follow-dir "$follow_dir" \
+    --stop-file "$stop_file" \
+    --follow-first-chunk-timeout-ms 60000 \
+    >>"$trigger_log" 2>&1 &
+  assistant_b_feed_pid=$!
+  printf '%s\n' "$assistant_b_feed_pid" >"$assistant_cut_dir/live_feed.pid"
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: live feed pid=$assistant_b_feed_pid watch pid=$assistant_b_watch_pid follow=$follow_dir" >>"$trigger_log"
+}
+
+stop_assistant_live_b() {
+  local stop_file feed_pid barge_ms start_ms now_ms
+  stop_file="$(cat "$assistant_cut_dir/current_stop_file" 2>/dev/null || true)"
+  start_ms="$(cat "$assistant_play_start_ms_file" 2>/dev/null || echo 0)"
+  now_ms="$(($(date +%s%N) / 1000000))"
+  if [[ "$start_ms" =~ ^[0-9]+$ ]] && (( start_ms > 0 && now_ms > start_ms )); then
+    barge_ms=$((now_ms - start_ms))
   else
-    echo "[$(date --iso-8601=seconds)] assistant_cut: failed to build ui payload" >>"$trigger_log"
+    barge_ms=800
   fi
+  if (( barge_ms < 150 )); then barge_ms=150; fi
+  printf '%s\n' "$barge_ms" >"$assistant_barge_played_ms_file"
+  printf '%s\n' "$now_ms" >"$assistant_cut_dir/barge_mono_ms"
 
-  # Optional dual-instance B upgrade: if a second Nemotron drained text is ready,
-  # re-emit a better cut (word-aligned prefix of intended). Never blocks dispatch
-  # when called in background after transcript_committed.
-  if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
-    if [[ -n "$assistant_b_feed_pid" ]] && kill -0 "$assistant_b_feed_pid" 2>/dev/null; then
-      local _w=0
-      while (( _w < 60 )) && kill -0 "$assistant_b_feed_pid" 2>/dev/null; do
-        sleep 0.05
-        _w=$((_w + 1))
-      done
-    fi
-    local _s=0
-    while (( _s < 20 )); do
-      if [[ -s "$assistant_b_watch_log" ]] && rg -q '"event":"transcript_update"|"event":"transcript_committed"|"event":"turn_transcript_committed"' "$assistant_b_watch_log" 2>/dev/null; then
-        break
-      fi
+  if [[ -n "$stop_file" ]]; then
+    : >"$stop_file"
+  fi
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: LIVE stop requested gen=${assistant_active_gen:-?} played_ms=$barge_ms" >>"$trigger_log"
+
+  # Let follow-mode finish silence pad + close; measure residual drain.
+  feed_pid="${assistant_b_feed_pid:-}"
+  if [[ -z "$feed_pid" ]]; then
+    feed_pid="$(cat "$assistant_cut_dir/live_feed.pid" 2>/dev/null || true)"
+  fi
+  if [[ -n "$feed_pid" ]] && kill -0 "$feed_pid" 2>/dev/null; then
+    local _w=0
+    while (( _w < 80 )) && kill -0 "$feed_pid" 2>/dev/null; do
       sleep 0.05
-      _s=$((_s + 1))
+      _w=$((_w + 1))
     done
-    if [[ -n "${PYTHON3_BIN:-}" && -f "$finalize_cut_py" ]]; then
-      local drain_cut drain_source
-      drain_cut="$("$PYTHON3_BIN" "$finalize_cut_py" \
-        --intended-text "$intended" \
-        --out-dir "$assistant_cut_dir" \
-        --watch-jsonl "$assistant_b_watch_log" \
-        --played-chunks "$(count_assistant_played_chunks)" \
-        --pad-words "$assistant_pad_words" \
-        2>>"$trigger_log" | head -n1 || true)"
-      drain_source="approx_wallclock"
-      if [[ -f "$assistant_cut_dir/metrics.json" ]]; then
-        drain_source="$("$PYTHON3_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("primary_cut_source","fallback"))' "$assistant_cut_dir/metrics.json" 2>/dev/null || echo fallback)"
-      fi
-      if [[ -n "$drain_cut" && "$drain_source" == "drain" ]]; then
-        echo "[$(date --iso-8601=seconds)] assistant_cut: upgraded from dual-instance B source=drain cut=$drain_cut" >>"$trigger_log"
-        payload="$("$PYTHON3_BIN" -c '
-import json, sys
-print(json.dumps({
-  "event": "assistant_turn_truncated",
-  "diagnostic_mono_ns": int(sys.argv[1]),
-  "diagnostic_clock_origin": "harness_local_monotonic",
-  "stream_session_id": sys.argv[2],
-  "text": sys.argv[3],
-  "intended_text": sys.argv[4],
-  "cut_text": sys.argv[3],
-  "spoken_prefix": sys.argv[3],
-  "primary_cut_source": "drain",
-  "confidence": "medium",
-  "marker": "<probably cut here>",
-}, ensure_ascii=False))
-' "$(diagnostic_mono_ns)" "$session_id" "$drain_cut" "$intended")" || payload=""
-        [[ -n "$payload" ]] && emit_ui_event "$payload"
-      fi
+    if kill -0 "$feed_pid" 2>/dev/null; then
+      kill_tree_no_wait "$feed_pid" 2>/dev/null || true
     fi
   fi
+  assistant_b_feed_pid=""
+  local residual_ms
+  residual_ms="$(( ($(date +%s%N) / 1000000) - now_ms ))"
+  printf '%s\n' "$residual_ms" >"$assistant_cut_dir/live_drain_residual_ms"
+  echo "[$(date --iso-8601=seconds)] assistant_self_asr: live residual_drain_ms=$residual_ms gen=${assistant_active_gen:-?}" >>"$trigger_log"
+}
 
-  # Stop optional B watch/feed (best-effort).
-  if [[ -n "$assistant_b_feed_pid" ]]; then kill_tree_no_wait "$assistant_b_feed_pid" 2>/dev/null || true; assistant_b_feed_pid=""; fi
-  if [[ -n "$assistant_b_watch_pid" ]]; then kill_tree_no_wait "$assistant_b_watch_pid" 2>/dev/null || true; assistant_b_watch_pid=""; fi
+# Provisional approx cut (immediate UI). Ground truth is live B drain.
+finalize_assistant_cut_approx() {
+  local intended played_ms cut_line
+  intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
+  [[ -n "$intended" ]] || return 0
+  played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 800)"
+  if ! [[ "$played_ms" =~ ^[0-9]+$ ]]; then played_ms=800; fi
+  cut_line="$(approx_cut_words "$intended" "$played_ms" 2>/dev/null || true)"
+  [[ -n "$cut_line" ]] || return 0
+  mkdir -p "$assistant_cut_dir"
+  printf '%s\n' "$intended" >"$assistant_cut_dir/assistant_intended.txt"
+  printf '%s\n' "$cut_line" >"$assistant_cut_dir/production_cut_text"
+  if [[ -n "${PYTHON3_BIN:-}" ]]; then
+    "$PYTHON3_BIN" -c '
+import json,sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+  "label":"live_session",
+  "primary_cut_source":"approx_wallclock",
+  "production_cut_text":sys.argv[2],
+  "intended_text":sys.argv[3],
+  "played_ms":int(sys.argv[4]),
+  "confidence":"low",
+  "mode":"live_b",
+}, indent=2)+"\n", encoding="utf-8")
+' "$assistant_cut_dir/metrics_approx.json" "$cut_line" "$intended" "$played_ms" 2>/dev/null || true
+  fi
+  echo "[$(date --iso-8601=seconds)] assistant_cut: provisional source=approx_wallclock played_ms=$played_ms cut=$cut_line gen=${assistant_active_gen:-?}" >>"$trigger_log"
+  emit_assistant_truncated_event "$cut_line" "approx_wallclock" "low"
+}
+
+# Ground-truth cut from live B watch log (Nemotron transcribed chunks).
+finalize_assistant_cut_from_live_b() {
+  [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]] || return 0
+  local intended drain_cut drain_source residual_ms gen
+  intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
+  [[ -n "$intended" && -n "${PYTHON3_BIN:-}" && -f "$finalize_cut_py" ]] || return 0
+  gen="${assistant_active_gen:-0}"
+  residual_ms="$(cat "$assistant_cut_dir/live_drain_residual_ms" 2>/dev/null || echo 0)"
+
+  # Brief settle for last B transcript events after stop.
+  local _s=0
+  while (( _s < 30 )); do
+    if [[ -s "$assistant_b_watch_log" ]] && rg -q '"event":"transcript_update"|"event":"transcript_committed"|"event":"turn_transcript_committed"|"event":"transcript_token_committed"' "$assistant_b_watch_log" 2>/dev/null; then
+      break
+    fi
+    sleep 0.05
+    _s=$((_s + 1))
+  done
+
+  drain_cut="$("$PYTHON3_BIN" "$finalize_cut_py" \
+    --intended-text "$intended" \
+    --out-dir "$assistant_cut_dir" \
+    --watch-jsonl "$assistant_b_watch_log" \
+    --played-chunks "$(count_assistant_played_chunks)" \
+    --pad-words "$assistant_pad_words" \
+    --drain-complete \
+    2>>"$trigger_log" | head -n1 || true)"
+  drain_source="fallback"
+  if [[ -f "$assistant_cut_dir/metrics.json" ]]; then
+    drain_source="$("$PYTHON3_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("primary_cut_source","fallback"))' "$assistant_cut_dir/metrics.json" 2>/dev/null || echo fallback)"
+    # Annotate live metrics.
+    "$PYTHON3_BIN" -c '
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+try:
+  m=json.loads(p.read_text())
+except Exception:
+  m={}
+m["mode"]="live_b"
+m["live_drain_residual_ms"]=int(sys.argv[2])
+m["cut_gen"]=sys.argv[3]
+p.write_text(json.dumps(m, indent=2)+"\n")
+' "$assistant_cut_dir/metrics.json" "${residual_ms:-0}" "$gen" 2>/dev/null || true
+  fi
+
+  if [[ -n "$drain_cut" ]]; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: ground_truth source=$drain_source residual_ms=$residual_ms cut=$drain_cut gen=$gen" >>"$trigger_log"
+    emit_assistant_truncated_event "$drain_cut" "$drain_source" "high"
+  else
+    echo "[$(date --iso-8601=seconds)] assistant_cut: live B produced no cut gen=$gen residual_ms=$residual_ms" >>"$trigger_log"
+  fi
+
+  if [[ -n "$assistant_b_watch_pid" ]]; then
+    kill_tree_no_wait "$assistant_b_watch_pid" 2>/dev/null || true
+    assistant_b_watch_pid=""
+  fi
+}
+
+# Compatibility name used by older call sites.
+finalize_assistant_cut() {
+  # Prefer ground truth if live B watch has content; else provisional only.
+  if [[ -s "$assistant_b_watch_log" ]]; then
+    finalize_assistant_cut_from_live_b || true
+  else
+    finalize_assistant_cut_approx || true
+  fi
 }
 
 cancel_speech_out() {
@@ -1048,25 +1023,19 @@ cancel_speech_out() {
   echo "[$(date --iso-8601=seconds)] barge-in ($trigger) -> cancel speech-out pid=$pid" >>"$trigger_log"
   emit_ui_event "$(printf '{"event":"speech_out_barge_in","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","trigger":"%s","tts_pid":%s}'     "$(diagnostic_mono_ns)" "$session_id" "$trigger" "${pid:-0}")"
 
-  # Attempt graceful termination via SIGTERM, then escalate after timeout.
-  # This distinguishes expected cancellation from a raw kill -9.
-  #
-  # Rationale: the script spawns `speech-out play` as a child process.
-  # `run_play` (crates/speech-out/src/main.rs) now sets up tokio signal
-  # watchers for SIGTERM/SIGINT.  On receipt it sends a protocol-level
-  # `Cancel` WebSocket message to the daemon (so the daemon stops
-  # synthesis and emits speech_out_cancelled), then exits cleanly.
-  # If the child does not exit within the timeout window, we escalate
-  # to SIGKILL.
   kill_tree "$pid"
   rm -f "$tts_pid_file"
   echo $(( $(date +%s) + echo_suppress_secs )) >"$tts_echo_deadline_file" 2>/dev/null || true
 
-  # Cheap cut immediately (wall-clock word estimate). No Nemotron.
   if [[ "$trigger" == "transcript_token_committed" || "$trigger" == "user_speech" ]]; then
-    finalize_assistant_cut || true
-    # Optional deferred dual-stream self-asr (default OFF). Never required for cut.
-    start_assistant_self_asr_drain || true
+    # 1) stop live B follow (signals residual drain of already-buffered audio)
+    stop_assistant_live_b || true
+    # 2) provisional greying immediately
+    finalize_assistant_cut_approx || true
+    # 3) ground truth from live B transcript (async — do not block next speak)
+    finalize_assistant_cut_from_live_b &
+  elif [[ "$trigger" == "session_end" || "$trigger" == "new_response" ]]; then
+    stop_assistant_live_b || true
   fi
 }
 
@@ -1162,8 +1131,7 @@ run_speech_out() {
     current_reference="${SPEECH_OUT_REFERENCE:-$current_reference}"
     current_style="${SPEECH_OUT_STYLE:-$current_style}"
   fi
-  # Real assistant self-ASR capture: tee every WAV that speech-out hands to the
-  # local player into run_dir/assistant_self_asr/played_chunks/ (actual play path).
+  # Live dual-instance B: tee play WAVs + 16k follow chunks; start B feed before TTS.
   local effective_play_command="$play_command"
   if [[ "$assistant_self_asr_enabled" == "1" || "$assistant_self_asr_enabled" == "true" || "$assistant_self_asr_enabled" == "yes" ]]; then
     if [[ -x "$tee_play_script" || -f "$tee_play_script" ]]; then
@@ -1171,9 +1139,15 @@ run_speech_out() {
       # Fresh capture for this utterance (do not mix prior turns).
       rm -f "$assistant_capture_dir"/chunk_*.wav
       : >"$assistant_manifest"
+      : >"$assistant_b_watch_log"
+      # Start live B session first so follow-dir is ready before first chunk.
+      start_assistant_live_b || true
+      local follow_dir
+      follow_dir="$(cat "$assistant_cut_dir/current_follow_dir" 2>/dev/null || true)"
       export SPEECH_OUT_TEE_REAL_PLAY="$play_command"
       export SPEECH_OUT_TEE_CAPTURE_DIR="$assistant_capture_dir"
       export SPEECH_OUT_TEE_MANIFEST="$assistant_manifest"
+      export SPEECH_OUT_TEE_FOLLOW_DIR="${follow_dir:-}"
       effective_play_command="$tee_play_script"
     else
       echo "[$(date --iso-8601=seconds)] assistant_self_asr: tee script missing; play without capture" >>"$trigger_log"
@@ -1317,11 +1291,12 @@ while IFS= read -r line; do
           # do not infer it from cumulative updates or revise it after this event.
           turn_text="$(printf '%s\n' "$line" | json_get_string text)"
           turn_committed_seen=1
-          # CRITICAL LATENCY: dispatch speech-out immediately. Never block the
-          # next assistant reply on Nemotron B cut finalization. Cut updates the
-          # TUI asynchronously (grey/white) when B drain is ready.
+          # Cut was provisionally set on barge; re-assert ground truth from live B
+          # BEFORE starting the next TTS (which opens a new live B session).
+          finalize_assistant_cut_from_live_b || true
+          # CRITICAL LATENCY: next speak is not blocked on B (live B already ran
+          # during previous TTS; residual drain happened at barge).
           dispatch_turn_response transcript_committed
-          finalize_assistant_cut &
           ;;
         turn_closed)
           # Backward compatibility for older daemons that do not emit
