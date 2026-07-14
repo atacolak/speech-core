@@ -58,6 +58,10 @@ int32_t sc_transcribe_feed(sc_transcribe_session * session,
                            sc_transcribe_update * out_update);
 int32_t sc_transcribe_finalize(sc_transcribe_session * session,
                                sc_transcribe_update * out_update);
+/* After finalize (FINISHED), reset + begin a fresh stream on the same session
+ * without reloading the model. Required for per-turn finalization while the
+ * mic session stays live. */
+int32_t sc_transcribe_rebegin(sc_transcribe_session * session);
 void sc_transcribe_free(sc_transcribe_session * session);
 int32_t sc_transcribe_get_token(sc_transcribe_session * session,
                                 int32_t token_index,

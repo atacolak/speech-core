@@ -1511,6 +1511,16 @@ struct CloseModelAlignment {
     drain_session_found: Option<bool>,
     drain_chunk_processed: Option<bool>,
     drain_until_sample: Option<u64>,
+    // Deterministic stream finalize (Nemotron) metrics
+    finalize_attempted: bool,
+    finalize_ok: bool,
+    finalize_timeout: bool,
+    close_to_input_finished_ms: u64,
+    finalize_decode_ms: u64,
+    finalize_chunks: u32,
+    tokens_added_during_finalize: u32,
+    padding_ms: u32,
+    buffered_ms_at_close: Option<i64>,
     elapsed_ms: u64,
     budget_ms: u32,
 }
@@ -1543,6 +1553,15 @@ impl CloseModelAlignment {
             drain_session_found: self.drain_session_found,
             drain_chunk_processed: self.drain_chunk_processed,
             drain_until_sample: self.drain_until_sample,
+            finalize_attempted: self.finalize_attempted,
+            finalize_ok: self.finalize_ok,
+            finalize_timeout: self.finalize_timeout,
+            close_to_input_finished_ms: self.close_to_input_finished_ms,
+            finalize_decode_ms: self.finalize_decode_ms,
+            finalize_chunks: self.finalize_chunks,
+            tokens_added_during_finalize: self.tokens_added_during_finalize,
+            padding_ms: self.padding_ms,
+            buffered_ms_at_close: self.buffered_ms_at_close,
             elapsed_ms: self.elapsed_ms,
             budget_ms: self.budget_ms,
             daemon_mono_ns: now_mono_ns(),
@@ -1686,6 +1705,15 @@ struct TurnCloseAlignmentEvent {
     drain_session_found: Option<bool>,
     drain_chunk_processed: Option<bool>,
     drain_until_sample: Option<u64>,
+    finalize_attempted: bool,
+    finalize_ok: bool,
+    finalize_timeout: bool,
+    close_to_input_finished_ms: u64,
+    finalize_decode_ms: u64,
+    finalize_chunks: u32,
+    tokens_added_during_finalize: u32,
+    padding_ms: u32,
+    buffered_ms_at_close: Option<i64>,
     elapsed_ms: u64,
     budget_ms: u32,
     daemon_mono_ns: u64,
@@ -1784,14 +1812,17 @@ fn ms_to_samples(ms: u32) -> u64 {
     u64::from(ms).saturating_mul(16_000) / 1_000
 }
 
-/// How long token end-sample must stay unchanged after audio catch-up before close freezes.
-/// Kept short for UX: session evidence showed 120ms + buffer-wait made closes feel unusable.
-/// Ghost late tokens are suppressed separately; this is not the main correctness lever.
+/// Legacy soft pad retained only as a degraded fallback when stream finalize
+/// is unavailable (no model_drain). Normal close uses deterministic finalize.
 const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 60;
-/// Snapshot-only: family buffered_ms is recorded at close but we do NOT block on it.
-/// Mid-stream buffer rarely reaches a true drained floor without silence pad, so waiting
-/// was a near-fixed ~200ms tax on almost every smart-turn close.
+/// Snapshot-only residual for diagnostics.
 const CLOSE_BUFFER_DRAINED_MS: i64 = 20;
+/// Synthetic silence fed after real audio before stream finalize (Nemotron
+/// right-context / lookahead). Maps to Sherpa-style input_finished padding.
+const CLOSE_FINALIZE_PADDING_MS: u32 = 320;
+/// Hard bound for finalize_turn drain. Timeout → degraded commit with
+/// whatever tokens we have (not the normal path).
+const CLOSE_FINALIZE_TIMEOUT_MS: u32 = 800;
 
 
 fn model_alignment_deadline(timeout_ms: u32) -> Instant {
@@ -1895,28 +1926,58 @@ fn align_model_for_close(
     timeout_ms: u32,
 ) -> CloseModelAlignment {
     let started = Instant::now();
-    let deadline = model_alignment_deadline(timeout_ms);
+    let finalize_budget = timeout_ms.max(CLOSE_FINALIZE_TIMEOUT_MS);
+    let deadline = model_alignment_deadline(finalize_budget);
     let audio_target_sample = decision_sample;
     let mut drain_attempted = false;
     let mut drain_succeeded = false;
     let mut drain_session_found = None;
     let mut drain_chunk_processed = None;
     let mut drain_until_sample = None;
+    let mut finalize_attempted = false;
+    let mut finalize_ok = false;
+    let mut finalize_timeout = false;
+    let mut close_to_input_finished_ms = 0;
+    let mut finalize_decode_ms = 0;
+    let mut finalize_chunks = 0;
+    let mut tokens_added_during_finalize = 0;
+    let mut padding_ms = 0;
+    let mut buffered_ms_at_close = None;
 
+    // Prefer deterministic stream finalize when a model drain handle exists.
+    // Nemotron mapping of Sherpa input_finished + decode-until-ready:
+    // silence pad → stream finalize → rebegin. Token quiescence is NOT the
+    // normal commit mechanism anymore.
     if let Some(model_drain) = model_drain {
         drain_attempted = true;
-        if let Ok(result) = model_drain.drain_session(ModelDrainRequest {
+        finalize_attempted = true;
+        match model_drain.drain_session(ModelDrainRequest {
             stream_id: stream_id.to_owned(),
             stream_session_id: stream_session_id.to_owned(),
             adapter_id: adapter_id.to_owned(),
             target_sample: audio_target_sample,
             reason: close_reason,
-            timeout_ms: remaining_timeout_ms(deadline),
+            timeout_ms: remaining_timeout_ms(deadline).max(CLOSE_FINALIZE_TIMEOUT_MS),
+            finalize_turn: true,
+            padding_ms: CLOSE_FINALIZE_PADDING_MS,
         }) {
-            drain_succeeded = true;
-            drain_session_found = Some(result.session_found);
-            drain_chunk_processed = Some(result.chunk_processed);
-            drain_until_sample = Some(result.drained_until_sample);
+            Ok(result) => {
+                drain_succeeded = result.session_found;
+                drain_session_found = Some(result.session_found);
+                drain_chunk_processed = Some(result.chunk_processed);
+                drain_until_sample = Some(result.drained_until_sample);
+                finalize_ok = result.finalize_ok;
+                finalize_timeout = result.finalize_timeout;
+                close_to_input_finished_ms = result.close_to_input_finished_ms;
+                finalize_decode_ms = result.finalize_decode_ms;
+                finalize_chunks = result.finalize_chunks;
+                tokens_added_during_finalize = result.tokens_added_during_finalize;
+                padding_ms = result.padding_ms;
+                buffered_ms_at_close = result.buffered_ms_at_close;
+            }
+            Err(_) => {
+                finalize_timeout = true;
+            }
         }
     }
 
@@ -1925,46 +1986,56 @@ fn align_model_for_close(
     let mut token_quiescence_elapsed_ms = 0;
     let mut audio_committed_sample = None;
     let mut last_token_end_sample = None;
-    let mut buffered_ms = None;
+    let mut buffered_ms = buffered_ms_at_close;
     let mut buffer_drained = true;
     let mut buffer_wait_elapsed_ms = 0;
     let mut effective_end_sample = end_sample;
     let mut effective_decision_sample = decision_sample;
 
     if let Some(model_progress) = model_progress {
-        audio_caught_up = wait_for_model_progress_until(
-            model_progress,
-            stream_session_id,
-            audio_target_sample,
-            deadline,
-        );
-        audio_committed_sample = model_progress.get(stream_session_id);
-
-        // Record buffer state only. Do not block on buffered_ms: in live sessions it
-        // almost never falls to the drained threshold without injecting silence, so a
-        // wait becomes a fixed latency tax (~200ms) on every close.
-        buffered_ms = model_progress.buffered_ms(stream_session_id);
-        buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
-        buffer_wait_elapsed_ms = 0;
-
-        let token_quiescence = wait_for_token_quiescence_until(
-            model_progress,
-            stream_session_id,
-            deadline,
-            Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS),
-        );
-        last_token_end_sample = token_quiescence.last_token_end_sample;
-        token_quiescent = token_quiescence.quiescent;
-        token_quiescence_elapsed_ms = token_quiescence.elapsed_ms;
-        buffered_ms = model_progress.buffered_ms(stream_session_id).or(buffered_ms);
-        buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
-        apply_trailing_token_extension(
-            model_progress,
-            stream_session_id,
-            decision_sample,
-            &mut effective_end_sample,
-            &mut effective_decision_sample,
-        );
+        if finalize_attempted && drain_succeeded && !finalize_timeout {
+            // Happy path: finalize already flushed tokens. Snapshot only.
+            audio_caught_up = true;
+            audio_committed_sample = model_progress.get(stream_session_id);
+            last_token_end_sample = model_progress.last_token_end_sample(stream_session_id);
+            buffered_ms = model_progress.buffered_ms(stream_session_id).or(buffered_ms);
+            buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
+            if let Some(token_end) = last_token_end_sample {
+                if token_end > effective_end_sample {
+                    effective_end_sample = token_end;
+                    effective_decision_sample = effective_decision_sample.max(token_end);
+                }
+            }
+            token_quiescent = true;
+            token_quiescence_elapsed_ms = 0;
+        } else {
+            // Degraded fallback: no drain handle or finalize failed/timeout.
+            audio_caught_up = wait_for_model_progress_until(
+                model_progress,
+                stream_session_id,
+                audio_target_sample,
+                deadline,
+            );
+            audio_committed_sample = model_progress.get(stream_session_id);
+            buffered_ms = model_progress.buffered_ms(stream_session_id).or(buffered_ms);
+            buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
+            let token_quiescence = wait_for_token_quiescence_until(
+                model_progress,
+                stream_session_id,
+                deadline,
+                Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS),
+            );
+            last_token_end_sample = token_quiescence.last_token_end_sample;
+            token_quiescent = token_quiescence.quiescent;
+            token_quiescence_elapsed_ms = token_quiescence.elapsed_ms;
+            apply_trailing_token_extension(
+                model_progress,
+                stream_session_id,
+                decision_sample,
+                &mut effective_end_sample,
+                &mut effective_decision_sample,
+            );
+        }
     }
 
     let _ = close_source;
@@ -1985,8 +2056,17 @@ fn align_model_for_close(
         drain_session_found,
         drain_chunk_processed,
         drain_until_sample,
+        finalize_attempted,
+        finalize_ok,
+        finalize_timeout,
+        close_to_input_finished_ms,
+        finalize_decode_ms,
+        finalize_chunks,
+        tokens_added_during_finalize,
+        padding_ms,
+        buffered_ms_at_close,
         elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        budget_ms: timeout_ms,
+        budget_ms: finalize_budget,
     }
 }
 
@@ -2477,11 +2557,7 @@ mod tests {
             drain_called_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
             drain_progress.record_token(SESSION_ID, 18_240);
             drain_progress.update(SESSION_ID, 17_920);
-            Ok(crate::model::ModelDrainResult {
-                session_found: true,
-                chunk_processed: true,
-                drained_until_sample: 17_920,
-            })
+            Ok(crate::model::ModelDrainResult { session_found: true, chunk_processed: true, drained_until_sample: 17_920, ..Default::default() })
         });
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,

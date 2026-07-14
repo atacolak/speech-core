@@ -72,6 +72,13 @@ pub struct ModelDrainRequest {
     pub target_sample: u64,
     pub reason: &'static str,
     pub timeout_ms: u32,
+    /// When true: feed remaining real audio through target_sample, feed
+    /// `padding_ms` of synthetic silence, call stream finalize (is_final),
+    /// snapshot tokens, then re-begin a fresh stream for subsequent speech.
+    /// Replaces token-quiescence as the normal close commit mechanism.
+    pub finalize_turn: bool,
+    /// Synthetic silence tail after real audio (Nemotron right-context pad).
+    pub padding_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +86,19 @@ pub struct ModelDrainResult {
     pub session_found: bool,
     pub chunk_processed: bool,
     pub drained_until_sample: u64,
+    /// True when finalize_turn path ran stream finalize + rebegin.
+    pub finalized: bool,
+    /// True when finalize completed with is_final (not timeout fallback).
+    pub finalize_ok: bool,
+    pub finalize_timeout: bool,
+    pub close_to_input_finished_ms: u64,
+    pub finalize_decode_ms: u64,
+    pub finalize_chunks: u32,
+    pub tokens_added_during_finalize: u32,
+    pub padding_ms: u32,
+    pub buffered_ms_at_close: Option<i64>,
+    pub tokens_before_finalize: u32,
+    pub tokens_after_finalize: u32,
 }
 
 #[derive(Clone)]
@@ -227,6 +247,14 @@ impl ModelProgressMap {
         })
     }
 
+    pub fn committed_token_count(&self, session_id: &str) -> u32 {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(session_id).map(|state| state.committed_token_count))
+            .unwrap_or(0)
+    }
+
     /// Set the current open turn_id for a session. Called by TurnManager on turn_started.
     pub fn set_current_turn_id(&self, session_id: &str, turn_id: Option<String>) {
         if let Ok(mut map) = self.inner.lock() {
@@ -255,8 +283,12 @@ impl ModelProgressMap {
         if let Ok(mut map) = self.inner.lock() {
             if let Some(state) = map.get_mut(session_id) {
                 state.last_committed_text = text.to_owned();
-                state.committed_token_count = committed_token_count;
                 state.revision = revision;
+                // Do not overwrite committed_token_count from native stream counts:
+                // after finalize+rebegin the native counter resets while our
+                // cumulative token snapshots (and baselines) must stay monotonic.
+                // record_token_snapshot owns the authoritative count.
+                let _ = committed_token_count;
             }
         }
     }
@@ -1029,6 +1061,10 @@ impl ModelWorker {
     }
 
     fn drain_session(&mut self, request: &ModelDrainRequest) -> Result<ModelDrainResult> {
+        if request.finalize_turn {
+            return self.finalize_turn_stream(request);
+        }
+
         let Some(session) = self.sessions.get_mut(&request.stream_session_id) else {
             return Ok(ModelDrainResult::default());
         };
@@ -1042,6 +1078,7 @@ impl ModelWorker {
                 session_found: true,
                 chunk_processed: false,
                 drained_until_sample,
+                ..Default::default()
             });
         }
 
@@ -1067,6 +1104,191 @@ impl ModelWorker {
             session_found: true,
             chunk_processed: true,
             drained_until_sample,
+            ..Default::default()
+        })
+    }
+
+    /// Deterministic turn finalization (Nemotron equivalent of Sherpa
+    /// input_finished + decode-until-ready):
+    /// 1) feed remaining real audio already buffered for this session
+    /// 2) feed `padding_ms` synthetic silence (right-context pad)
+    /// 3) call stream finalize (is_final=true) — model flushes remaining tokens
+    /// 4) re-begin a fresh stream so subsequent mic audio is a new utterance
+    ///
+    /// Late tokens emitted during this path keep the pre-close turn_id via
+    /// model progress (caller freezes ownership before invoking).
+    fn finalize_turn_stream(&mut self, request: &ModelDrainRequest) -> Result<ModelDrainResult> {
+        let started = std::time::Instant::now();
+        let session_id = request.stream_session_id.clone();
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Ok(ModelDrainResult::default());
+        };
+        let _ = session; // existence check only
+
+        let tokens_before = self
+            .model_progress
+            .as_ref()
+            .map(|p| p.committed_token_count(&session_id))
+            .unwrap_or(0);
+        let buffered_ms_at_close = self
+            .model_progress
+            .as_ref()
+            .and_then(|p| p.buffered_ms(&session_id));
+
+        let mut finalize_chunks: u32 = 0;
+        let mut drained_until_sample: u64 = 0;
+        let mut chunk_processed = false;
+
+        // 1) Flush any partial real-audio buffer (may be < chunk size).
+        let pending_real = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return Ok(ModelDrainResult::default());
+            };
+            drained_until_sample = session.next_chunk_sample_start;
+            if session.buffer.is_empty() {
+                None
+            } else {
+                let chunk = std::mem::take(&mut session.buffer);
+                let start = session.next_chunk_sample_start;
+                let len = chunk.len() as u64;
+                session.next_chunk_sample_start = start.saturating_add(len);
+                drained_until_sample = session.next_chunk_sample_start;
+                Some((chunk, start))
+            }
+        };
+        if let Some((chunk, start)) = pending_real {
+            self.feed_chunk(&session_id, chunk, start, now_mono_ns(), false)?;
+            finalize_chunks = finalize_chunks.saturating_add(1);
+            chunk_processed = true;
+        }
+
+        // 2) Synthetic silence pad (default 320ms @ 16kHz).
+        let padding_ms = if request.padding_ms == 0 {
+            320
+        } else {
+            request.padding_ms
+        };
+        let pad_samples = (u64::from(padding_ms).saturating_mul(16_000) / 1_000).max(1) as usize;
+        // Feed pad in stream_chunk-sized pieces so the family sees normal steps.
+        let chunk_samples = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.chunk_samples)
+            .unwrap_or(2560);
+        let mut pad_left = pad_samples;
+        while pad_left > 0 {
+            let take = pad_left.min(chunk_samples);
+            let silence = vec![0.0f32; take];
+            let start = self
+                .sessions
+                .get(&session_id)
+                .map(|s| s.next_chunk_sample_start)
+                .unwrap_or(drained_until_sample);
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.next_chunk_sample_start = start.saturating_add(take as u64);
+                drained_until_sample = session.next_chunk_sample_start;
+            }
+            self.feed_chunk(&session_id, silence, start, now_mono_ns(), false)?;
+            finalize_chunks = finalize_chunks.saturating_add(1);
+            chunk_processed = true;
+            pad_left = pad_left.saturating_sub(take);
+        }
+
+        let close_to_input_finished_ms = started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+
+        // 3) Stream finalize — flushes right-context / remaining decode.
+        let decode_started = std::time::Instant::now();
+        let mut finalize_ok = false;
+        let mut finalize_timeout = false;
+        if let Some(mut session) = self.sessions.remove(&session_id) {
+            let model_feed_start_mono_ns = now_mono_ns();
+            let mut update = ScTranscribeUpdate::default();
+            let status = unsafe { sc_transcribe_finalize(session.raw, &mut update) };
+            let model_feed_end_mono_ns = now_mono_ns();
+            // Emit as final so tokens/text land with is_final=true.
+            if let Err(err) = self.emit_update_events(
+                &mut session,
+                status,
+                &update,
+                model_feed_start_mono_ns,
+                model_feed_end_mono_ns,
+                now_mono_ns(),
+                None,
+                true,
+                Some(request.reason),
+            ) {
+                warn!(error = ?err, "finalize_turn emit_update_events failed");
+            }
+            finalize_ok = status == TRANSCRIBE_OK || update.is_final;
+
+            // 4) Re-begin so the live mic session can accept the next utterance.
+            let rebegin_status = unsafe { sc_transcribe_rebegin(session.raw) };
+            if rebegin_status != TRANSCRIBE_OK {
+                warn!(
+                    status = %status_string(rebegin_status),
+                    "sc_transcribe_rebegin failed after turn finalize; session will be dropped"
+                );
+                drop(session);
+            } else {
+                // Native token indices restart at 0 after rebegin; keep global
+                // snapshot indices monotonic for per-turn baseline slicing.
+                let base = self
+                    .model_progress
+                    .as_ref()
+                    .map(|p| p.committed_token_count(&session_id))
+                    .unwrap_or(0);
+                session.next_committed_token = 0;
+                session.token_index_base = base;
+                // next_chunk_sample_start stays continuous across rebegin.
+                self.sessions.insert(session_id.clone(), session);
+            }
+        } else {
+            finalize_timeout = true;
+        }
+
+        if let Some(ref progress) = self.model_progress {
+            if progress.get(&session_id).unwrap_or(0) < drained_until_sample {
+                progress.update(&session_id, drained_until_sample);
+            }
+        }
+
+        let tokens_after = self
+            .model_progress
+            .as_ref()
+            .map(|p| p.committed_token_count(&session_id))
+            .unwrap_or(tokens_before);
+        let tokens_added = tokens_after.saturating_sub(tokens_before);
+        let finalize_decode_ms = decode_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+
+        // Bound: if overall elapsed exceeds timeout, mark degraded timeout.
+        let elapsed_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        if elapsed_ms > request.timeout_ms as u64 {
+            finalize_timeout = true;
+        }
+
+        Ok(ModelDrainResult {
+            session_found: true,
+            chunk_processed,
+            drained_until_sample,
+            finalized: true,
+            finalize_ok,
+            finalize_timeout,
+            close_to_input_finished_ms,
+            finalize_decode_ms,
+            finalize_chunks,
+            tokens_added_during_finalize: tokens_added,
+            padding_ms,
+            buffered_ms_at_close,
+            tokens_before_finalize: tokens_before,
+            tokens_after_finalize: tokens_after,
         })
     }
 
@@ -1241,7 +1463,9 @@ impl ModelWorker {
                 progress.record_token_snapshot(
                     &session.hello.stream_session_id,
                     CommittedTokenSnapshot {
-                        index: token_index as u32,
+                        index: session
+                            .token_index_base
+                            .saturating_add(token_index as u32),
                         text: token_text.clone(),
                         start_sample: token_start_sample,
                         end_sample: token_end_sample,
@@ -1265,7 +1489,7 @@ impl ModelWorker {
                 stream_session_id: session.hello.stream_session_id.clone(),
                 adapter_id: session.hello.adapter_id.clone(),
                 turn_id: token_turn_id,
-                token_index: token_index as u32,
+                token_index: session.token_index_base.saturating_add(token_index as u32),
                 token_id: token.id,
                 text: token_text.clone(),
                 t0_ms: token.t0_ms,
@@ -1302,7 +1526,7 @@ impl ModelWorker {
                     stream_id: session.hello.stream_id.clone(),
                     stream_session_id: session.hello.stream_session_id.clone(),
                     adapter_id: session.hello.adapter_id.clone(),
-                    token_index: token_index as u32,
+                    token_index: session.token_index_base.saturating_add(token_index as u32),
                     text: token_text,
                     start_sample,
                     end_sample,
@@ -1348,7 +1572,11 @@ struct ModelSession {
     buffer: Vec<f32>,
     chunk_samples: usize,
     next_chunk_sample_start: u64,
+    /// Next native stream token index to read (resets on rebegin).
     next_committed_token: i32,
+    /// Added to native token indices when recording snapshots so indices stay
+    /// monotonic across per-turn finalize+rebegin boundaries.
+    token_index_base: u32,
     drain_handle: ModelDrainHandle,
 }
 
@@ -1368,6 +1596,7 @@ impl ModelSession {
             chunk_samples,
             next_chunk_sample_start: 0,
             next_committed_token: 0,
+            token_index_base: 0,
             drain_handle,
         }
     }
@@ -1654,6 +1883,7 @@ extern "C" {
         session: *mut ScTranscribeSession,
         out_update: *mut ScTranscribeUpdate,
     ) -> c_int;
+    fn sc_transcribe_rebegin(session: *mut ScTranscribeSession) -> c_int;
     fn sc_transcribe_free(session: *mut ScTranscribeSession);
     fn sc_transcribe_get_token(
         session: *mut ScTranscribeSession,

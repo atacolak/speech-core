@@ -12,6 +12,8 @@ struct sc_transcribe_session {
     std::string committed_text;
     std::string tentative_text;
     std::string token_text;
+    int32_t att_context_right = 0;
+    bool accepts_parakeet_stream = false;
 };
 
 static void fill_update(sc_transcribe_session * wrapper,
@@ -38,6 +40,24 @@ static void fill_update(sc_transcribe_session * wrapper,
     out->returned_timestamp_kind = transcribe_returned_timestamp_kind(wrapper->session);
     out->committed_text = wrapper->committed_text.c_str();
     out->tentative_text = wrapper->tentative_text.c_str();
+}
+
+static transcribe_status begin_stream(sc_transcribe_session * wrapper) {
+    struct transcribe_run_params run_params;
+    transcribe_run_params_init(&run_params);
+    run_params.timestamps = TRANSCRIBE_TIMESTAMPS_TOKEN;
+
+    struct transcribe_stream_params stream_params;
+    transcribe_stream_params_init(&stream_params);
+
+    struct transcribe_parakeet_stream_ext pkst;
+    if (wrapper->accepts_parakeet_stream) {
+        transcribe_parakeet_stream_ext_init(&pkst);
+        pkst.att_context_right = wrapper->att_context_right;
+        stream_params.family = &pkst.ext;
+    }
+
+    return transcribe_stream_begin(wrapper->session, &run_params, &stream_params);
 }
 
 const char * sc_transcribe_status_string(int32_t status) {
@@ -83,28 +103,18 @@ int32_t sc_transcribe_open_stream(const sc_transcribe_config * config,
         out_caps->accepts_parakeet_stream = accepts_pkst;
     }
 
-    struct transcribe_run_params run_params;
-    transcribe_run_params_init(&run_params);
-    run_params.timestamps = TRANSCRIBE_TIMESTAMPS_TOKEN;
+    sc_transcribe_session * wrapper = new sc_transcribe_session();
+    wrapper->session = session;
+    wrapper->att_context_right = config->att_context_right;
+    wrapper->accepts_parakeet_stream = accepts_pkst;
 
-    struct transcribe_stream_params stream_params;
-    transcribe_stream_params_init(&stream_params);
-
-    struct transcribe_parakeet_stream_ext pkst;
-    if (accepts_pkst) {
-        transcribe_parakeet_stream_ext_init(&pkst);
-        pkst.att_context_right = config->att_context_right;
-        stream_params.family = &pkst.ext;
-    }
-
-    st = transcribe_stream_begin(session, &run_params, &stream_params);
+    st = begin_stream(wrapper);
     if (st != TRANSCRIBE_OK) {
         transcribe_session_free(session);
+        delete wrapper;
         return st;
     }
 
-    sc_transcribe_session * wrapper = new sc_transcribe_session();
-    wrapper->session = session;
     *out_session = wrapper;
     return TRANSCRIBE_OK;
 }
@@ -129,6 +139,17 @@ int32_t sc_transcribe_finalize(sc_transcribe_session * wrapper,
     transcribe_status st = transcribe_stream_finalize(wrapper->session, &update);
     fill_update(wrapper, update, out_update);
     return st;
+}
+
+int32_t sc_transcribe_rebegin(sc_transcribe_session * wrapper) {
+    if (!wrapper || !wrapper->session) return TRANSCRIBE_ERR_INVALID_ARG;
+    // Clear FINISHED/FAILED → IDLE, then begin a new ACTIVE stream.
+    // Does not free the model or session; keeps weights warm.
+    transcribe_stream_reset(wrapper->session);
+    wrapper->committed_text.clear();
+    wrapper->tentative_text.clear();
+    wrapper->token_text.clear();
+    return begin_stream(wrapper);
 }
 
 void sc_transcribe_free(sc_transcribe_session * wrapper) {
