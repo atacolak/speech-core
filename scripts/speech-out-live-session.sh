@@ -1075,6 +1075,10 @@ align_worker_alive() {
 start_align_worker_local() {
   # Start long-lived worker on this host if torchaudio is available.
   [[ "$align_backend" == "ctc_forced" ]] || return 1
+  # Laptop path: never probe torch when remote TCP is the product path.
+  if [[ -f "${align_tcp_ready_file:-}" || -f "${align_prefer_remote_file:-}" ]] || (( align_prefer_remote == 1 )); then
+    return 1
+  fi
   [[ -n "$align_worker_script" && -f "$align_worker_script" ]] || return 1
   [[ -n "$align_python" && -x "$align_python" ]] || return 1
   if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
@@ -1574,6 +1578,8 @@ suppress_self_echo_if_needed() {
 }
 
 run_speech_out() {
+  local _rs0 _rs_spawn
+  _rs0="$(($(date +%s%N) / 1000000))"
   echo "[$(date --iso-8601=seconds)] turn_closed -> speech-out" >>"$trigger_log"
   local current_response_text="$response_text"
   local current_steps="$steps"
@@ -1627,10 +1633,24 @@ run_speech_out() {
       export SPEECH_OUT_TEE_MANIFEST="$assistant_manifest"
       export SPEECH_OUT_TEE_FOLLOW_DIR="$follow_dir"
       effective_play_command="$tee_play_script"
-      # Keep CTC model warm for the session (local if torch available, else remote on core host).
+      # Align worker warm-up must NOT sit on the speak hot path.
+      # Prefer remote TCP when core host is set; never import torch here.
       if [[ "$align_backend" == "ctc_forced" ]]; then
-        if ! start_align_worker_local; then
-          ensure_remote_align_worker || true
+        if [[ -f "${align_tcp_ready_file:-}" ]]; then
+          :
+        else
+          local _align_host
+          _align_host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+          if [[ -n "$_align_host" ]]; then
+            align_prefer_remote=1
+            mkdir -p "$(dirname "${align_prefer_remote_file:-/tmp}")" 2>/dev/null || true
+            : >"$align_prefer_remote_file" 2>/dev/null || true
+            # Non-blocking: ensure in background so speech-out request is not delayed.
+            # First barge may race; session-start warmup covers the common case.
+            ensure_remote_align_worker >/dev/null 2>&1 &
+          else
+            start_align_worker_local || true
+          fi
         fi
       fi
     else
@@ -1665,6 +1685,8 @@ run_speech_out() {
   # authoritative handle used by cancel_speech_out and tts_active,
   # both of which may be called from a different shell context
   # (main-script cleanup vs while-pipeline barge-in).
+  _rs_spawn="$(($(date +%s%N) / 1000000))"
+  echo "[$(date --iso-8601=seconds)] dispatch: pre_spawn_ms=$((_rs_spawn-_rs0)) (harness work before speech-out binary)" >>"$trigger_log"
   "$bin_dir/speech-out" "${play_args[@]}" "$current_response_text" \
     2> >(while IFS= read -r out_line; do
       printf '%s\n' "$out_line" >>"$trigger_log"
@@ -1729,12 +1751,23 @@ dispatch_turn_response() {
     echo "[$(date --iso-8601=seconds)] $dispatch_source self-echo -> skip speech-out" >>"$trigger_log"
     emit_ui_event "$(printf '{"event":"speech_out_skipped","diagnostic_mono_ns":%s,"diagnostic_clock_origin":"harness_local_monotonic","stream_session_id":"%s","reason":"self_echo","dispatch_source":"%s"}' "$(diagnostic_mono_ns)" "$session_id" "$dispatch_source")"
   else
+    local _d0 _d1
+    _d0="$(($(date +%s%N) / 1000000))"
     cancel_speech_out new_response
+    _d1="$(($(date +%s%N) / 1000000))"
+    echo "[$(date --iso-8601=seconds)] dispatch: cancel_ms=$((_d1-_d0)) source=$dispatch_source" >>"$trigger_log"
     # run_speech_out writes the real child PID to tts_pid_file
     # internally (the pid file is the cross-context authority).
     # The background subshell that wraps this call is reaped by
     # the owning while-pipeline subshell when the child exits.
-    run_speech_out &
+    # Launch without blocking the watch consumer.
+    (
+      local _r0 _r1
+      _r0="$(($(date +%s%N) / 1000000))"
+      run_speech_out
+      _r1="$(($(date +%s%N) / 1000000))"
+      echo "[$(date --iso-8601=seconds)] dispatch: run_speech_out_wall_ms=$((_r1-_r0)) (includes full play)" >>"$trigger_log"
+    ) &
   fi
 }
 
@@ -1750,6 +1783,20 @@ turn_committed_seen=0
 watch_fifo="$run_dir/watch.fifo"
 rm -f "$watch_fifo"
 mkfifo "$watch_fifo"
+
+# One-shot CTC worker warm-up BEFORE any turn (not inside commit→request).
+if [[ "$align_backend" == "ctc_forced" ]]; then
+  _align_host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+  if [[ -n "$_align_host" ]]; then
+    align_prefer_remote=1
+    mkdir -p "$assistant_cut_dir" 2>/dev/null || true
+    : >"$align_prefer_remote_file" 2>/dev/null || true
+    align_tcp_target="${align_tcp_target:-${_align_host}:${align_tcp_port:-8791}}"
+    ensure_remote_align_worker >>"$trigger_log" 2>&1 || true
+  else
+    start_align_worker_local >>"$trigger_log" 2>&1 || true
+  fi
+fi
 
 "$bin_dir/speech-core-watch" \
   --url "$core_ws_url" \
