@@ -293,6 +293,8 @@ align_remote="${SPEECH_OUT_ALIGN_REMOTE:-auto}"  # auto|1|0 — ssh to core host
 align_script=""
 align_worker_script=""
 align_sock="${SPEECH_OUT_ALIGN_SOCK:-/tmp/speech-core-align-worker.sock}"
+align_tcp_port="${SPEECH_OUT_ALIGN_TCP_PORT:-8791}"
+align_tcp_target="${SPEECH_OUT_ALIGN_TCP:-}"  # host:port; auto-derived from core_ws_url when empty
 align_worker_pid=""
 align_worker_started_here=0
 align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
@@ -419,7 +421,7 @@ speech-out developer live session
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
   assistant_cut:  backend=$align_backend window_ms=$align_window_ms warm_sock=$align_sock (nemotron_B=$assistant_self_asr_enabled)
-  align:          py=${align_python:-n/a} worker=${align_worker_script:-n/a}
+  align:          py=${align_python:-n/a} worker=${align_worker_script:-n/a} tcp=${align_tcp_target:-auto}:$align_tcp_port
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
@@ -1049,37 +1051,54 @@ start_align_worker_local() {
 }
 
 ensure_remote_align_worker() {
-  # Keep a warm worker on the speech-core host (sfUB). Avoids cold python+SCP model reload.
-  local host remote_py remote_worker remote_sock
+  # Keep a warm worker on the speech-core host listening on TCP (no per-barge SSH).
+  local host remote_py remote_worker remote_sock remote_port
   host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
   [[ -n "$host" ]] || return 1
   remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
   remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
   remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
-  if ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-      "test -S $(printf '%q' "$remote_sock") && $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --ping >/dev/null 2>&1"; then
-    echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker already up host=$host" >>"$trigger_log"
-    return 0
+  remote_port="${align_tcp_port:-8791}"
+  align_tcp_target="${align_tcp_target:-${host}:${remote_port}}"
+
+  # Fast path: TCP ping (no SSH).
+  if [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
+    if "$align_python" "$align_worker_script" --tcp "$align_tcp_target" --ping >/dev/null 2>&1; then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker up $align_tcp_target" >>"$trigger_log"
+      return 0
+    fi
+  else
+    # Minimal TCP check without python client
+    if (echo '{"cmd":"ping"}' | timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${remote_port}" 2>/dev/null); then
+      :
+    fi
   fi
-  echo "[$(date --iso-8601=seconds)] assistant_cut: starting remote warm worker host=$host" >>"$trigger_log"
+
+  echo "[$(date --iso-8601=seconds)] assistant_cut: starting remote TCP worker host=$host port=$remote_port" >>"$trigger_log"
+  # One-time SSH only to (re)start the daemon if TCP is down.
   ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
     "rm -f $(printf '%q' "$remote_sock"); \
+     pkill -f 'align_worker.py --sock' 2>/dev/null || true; \
      SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} \
      SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} \
+     SPEECH_OUT_ALIGN_TCP_PORT=${remote_port} \
      PYTHONPATH=/home/sf/workspace/speech-core/scripts \
-     nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --serve \
+     nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") \
+       --sock $(printf '%q' "$remote_sock") --tcp-bind 0.0.0.0 --tcp-port ${remote_port} --serve \
        >/tmp/speech-core-align-worker.log 2>&1 &" \
     >>"$trigger_log" 2>&1 || true
+
   local i
   for i in $(seq 1 40); do
-    if ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-        "$(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --ping >/dev/null 2>&1"; then
-      echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker ready host=$host" >>"$trigger_log"
-      return 0
+    if [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
+      if "$align_python" "$align_worker_script" --tcp "$align_tcp_target" --ping >/dev/null 2>&1; then
+        echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker ready $align_tcp_target" >>"$trigger_log"
+        return 0
+      fi
     fi
     sleep 0.5
   done
-  echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker start failed host=$host" >>"$trigger_log"
+  echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker start failed $align_tcp_target" >>"$trigger_log"
   return 1
 }
 
@@ -1130,7 +1149,7 @@ finalize_assistant_cut_ctc() {
       --out "$out_json" \
       >>"$trigger_log" 2>&1 || true
   else
-    # 2) Remote warm worker on core host — prefer host-retained WAV (no SCP).
+    # 2) Remote warm worker via TCP (host-retained WAV). No SSH/SCP on hot path.
     local use_remote=0 host
     host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
     if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
@@ -1141,27 +1160,48 @@ finalize_assistant_cut_ctc() {
       fi
     fi
     if (( use_remote == 1 )) && [[ -n "$host" ]]; then
-      local remote_wav remote_py remote_worker remote_sock remote_line utt retained_hint
-      remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-      remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
-      remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
+      local remote_wav utt retained_hint
+      if [[ -z "$align_tcp_target" ]]; then
+        align_tcp_target="${host}:${align_tcp_port:-8791}"
+      fi
+      # Ensure worker up (SSH only if TCP ping fails).
       ensure_remote_align_worker || true
       utt="$(cat "$assistant_utterance_id_file" 2>/dev/null || true)"
       retained_hint="$(cat "$assistant_retained_path_file" 2>/dev/null || true)"
-      # Prefer deterministic host path (no preflight SSH probes — each costs RTT).
-      remote_wav=""
       if [[ -n "$retained_hint" ]]; then
         remote_wav="$retained_hint"
-        path_used="warm_remote_host"
+        path_used="warm_tcp_host"
       elif [[ -n "$utt" ]]; then
         remote_wav="${retain_dir_remote}/${utt}_chunk_0000.wav"
-        path_used="warm_remote_host"
+        path_used="warm_tcp_host"
       else
         remote_wav="$retain_dir_remote/latest.wav"
-        path_used="warm_remote_host_latest"
+        path_used="warm_tcp_host_latest"
       fi
-      if [[ -n "$remote_wav" ]]; then
-        echo "[$(date --iso-8601=seconds)] assistant_cut: host-retained wav=$remote_wav (no scp)" >>"$trigger_log"
+      echo "[$(date --iso-8601=seconds)] assistant_cut: TCP align $align_tcp_target wav=$remote_wav" >>"$trigger_log"
+      if [[ -n "$align_worker_script" && -f "$align_worker_script" ]]; then
+        SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
+        "$align_python" "$align_worker_script" \
+          --tcp "$align_tcp_target" \
+          --align \
+          --backend "$backend" \
+          --wav "$remote_wav" \
+          --intended "$intended" \
+          --played-ms "$played_ms" \
+          --speed "$speed" \
+          --out "$out_json" \
+          >>"$trigger_log" 2>&1 || true
+      fi
+      # Last-ditch: SCP+SSH only if TCP path produced nothing.
+      if [[ ! -s "$out_json" ]] && [[ -n "$wav" && -f "$wav" ]]; then
+        local remote_py remote_worker remote_sock remote_line
+        remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+        remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
+        remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
+        remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
+        path_used="warm_remote_scp"
+        echo "[$(date --iso-8601=seconds)] assistant_cut: TCP miss; scp+ssh fallback" >>"$trigger_log"
+        scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
         remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
           "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
            $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
@@ -1171,27 +1211,7 @@ finalize_assistant_cut_ctc() {
         if [[ -n "$remote_line" ]]; then
           printf '%s\n' "$remote_line" >"$out_json"
         fi
-      fi
-      # If host path failed (empty/missing), legacy SCP client tee.
-      if [[ ! -s "$out_json" ]]; then
-        if [[ -n "$wav" && -f "$wav" ]]; then
-          remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
-          path_used="warm_remote_scp"
-          echo "[$(date --iso-8601=seconds)] assistant_cut: host retain miss; scp fallback" >>"$trigger_log"
-          scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
-          remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-            "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
-             $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
-             --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
-             --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
-            2>>"$trigger_log" || true)"
-          if [[ -n "$remote_line" ]]; then
-            printf '%s\n' "$remote_line" >"$out_json"
-          fi
-          ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
-        else
-          echo "[$(date --iso-8601=seconds)] assistant_cut: remote ctc skipped (no host wav / tee)" >>"$trigger_log"
-        fi
+        ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
       fi
     elif [[ -n "$align_script" && -f "$align_script" ]]; then
       # 3) Last resort: cold one-shot local python.
