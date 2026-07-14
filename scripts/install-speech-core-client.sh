@@ -37,6 +37,15 @@ install -m 0755 scripts/speech-core-live-session.sh "$bin_dir/speech-core-live-s
 install -m 0755 scripts/speech-out-live-session.sh "$bin_dir/speech-out-live-session"
 install -m 0755 scripts/speech-core-dictation-run.sh "$bin_dir/speech-core-dictation-run"
 install -m 0755 scripts/speech-core-dictation-toggle.sh "$bin_dir/speech-core-dictation-toggle"
+# Barge-in cut helpers (tee + warm CTC align worker client).
+if [[ -f scripts/speech-out-tee-play.sh ]]; then
+  install -m 0755 scripts/speech-out-tee-play.sh "$libexec_dir/speech-out-tee-play.sh"
+fi
+if [[ -d scripts/barge_in_align ]]; then
+  mkdir -p "$libexec_dir/barge_in_align"
+  install -m 0644 scripts/barge_in_align/*.py "$libexec_dir/barge_in_align/" 2>/dev/null || true
+  chmod 0755 "$libexec_dir/barge_in_align/run_align.py" "$libexec_dir/barge_in_align/align_worker.py" 2>/dev/null || true
+fi
 
 cat >"$config_dir/client.env" <<EOF_ENV
 SPEECH_CORE_WS_URL=$ws_url

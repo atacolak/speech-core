@@ -7,9 +7,9 @@ Uses *both* waveform and intended text (not text-only):
 Default model: torchaudio WAV2VEC2_ASR_BASE_960H (~94M, English chars).
 Override with SPEECH_OUT_CTC_MODEL=mms_fa|wav2vec2_base (default wav2vec2_base).
 
-Important: align on the *full* teed clip, then gate by played_ms. Trimming the
-waveform before forced-align would squash the whole transcript into the short
-prefix and always look fully spoken.
+Windowing: by default only the last ALIGN_WINDOW_MS of audio up to played_ms is
+encoded (env SPEECH_OUT_ALIGN_WINDOW_MS, default 2000). Words before the window
+are assumed fully spoken so we do not re-encode the whole reply on every barge.
 """
 
 from __future__ import annotations
@@ -25,6 +25,10 @@ from typing import Any
 from .backend import AlignCursor, approx_wallclock
 
 _NON_LETTER_RE = re.compile(r"[^a-z']+")
+
+# Only re-align the recent prefix of played audio (ms). Prior words assumed spoken.
+_DEFAULT_ALIGN_WINDOW_MS = 2000
+_WINDOW_PAD_MS = 80  # small right pad past played_ms for frame edge
 
 
 def _normalize_word_en(w: str) -> str:
@@ -94,6 +98,70 @@ def _load_pack(model_id: str):
 
 def preload() -> dict[str, Any]:
     return _load_pack(_model_choice())
+
+
+def _align_window_ms() -> int:
+    raw = (os.environ.get("SPEECH_OUT_ALIGN_WINDOW_MS") or str(_DEFAULT_ALIGN_WINDOW_MS)).strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = _DEFAULT_ALIGN_WINDOW_MS
+    return max(0, v)  # 0 = full clip (legacy)
+
+
+def _window_waveform(waveform, sample_rate: int, played_ms: int) -> tuple[Any, int, dict[str, Any]]:
+    """Trim to last window ending at played_ms. Returns (wave[1,T], offset_ms, meta)."""
+    import torch
+
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    total_samples = int(waveform.size(-1))
+    audio_ms = int(1000.0 * total_samples / float(sample_rate))
+    use_played = min(max(0, int(played_ms)), audio_ms + _WINDOW_PAD_MS)
+    window_ms = _align_window_ms()
+    meta: dict[str, Any] = {
+        "window_ms_cfg": window_ms,
+        "audio_ms_full": audio_ms,
+        "played_ms_used": use_played,
+    }
+    if window_ms <= 0 or use_played <= window_ms:
+        # Full prefix up to played (+pad) — short clips or window disabled.
+        end_s = min(total_samples, int((use_played + _WINDOW_PAD_MS) * sample_rate / 1000.0))
+        end_s = max(end_s, min(total_samples, int(0.05 * sample_rate)))
+        clipped = waveform[..., :end_s]
+        meta.update({"window_mode": "prefix", "offset_ms": 0, "window_audio_ms": int(1000.0 * end_s / sample_rate)})
+        return clipped, 0, meta
+
+    end_ms = min(audio_ms, use_played + _WINDOW_PAD_MS)
+    start_ms = max(0, end_ms - window_ms)
+    start_s = int(start_ms * sample_rate / 1000.0)
+    end_s = min(total_samples, int(end_ms * sample_rate / 1000.0))
+    if end_s <= start_s:
+        end_s = min(total_samples, start_s + int(0.05 * sample_rate))
+    clipped = waveform[..., start_s:end_s]
+    meta.update(
+        {
+            "window_mode": "tail",
+            "offset_ms": start_ms,
+            "window_audio_ms": int(1000.0 * max(0, end_s - start_s) / sample_rate),
+            "window_start_ms": start_ms,
+            "window_end_ms": int(1000.0 * end_s / sample_rate),
+        }
+    )
+    return clipped, start_ms, meta
+
+
+def _assumed_spoken_words(words: list[str], offset_ms: int, played_ms: int, speed: float) -> int:
+    """How many leading words are assumed spoken before the alignment window."""
+    if offset_ms <= 0 or not words:
+        return 0
+    # Same ~2.5 wps prior used by approx_wallclock; only for pre-window assumption.
+    wps = max(0.8, 2.5 * max(0.5, float(speed)))
+    n = int(round((max(0, offset_ms) / 1000.0) * wps))
+    # Never assume past what wall-clock would claim for full played_ms.
+    n_cap = int(round((max(0, played_ms) / 1000.0) * wps))
+    n = max(0, min(len(words) - 1, n, n_cap))  # leave ≥1 word for window align
+    return n
 
 
 def _align_wav2vec2_base(pack, waveform, words: list[str], played_ms: int, path: Path, t0: float, speed: float) -> AlignCursor:
@@ -357,15 +425,63 @@ def align_ctc_forced(
         use_played = played_ms if played_ms > 0 else audio_ms
         use_played = min(use_played, audio_ms + 40)
 
-        waveform = wav.unsqueeze(0)
+        full = wav.unsqueeze(0)
+        windowed, offset_ms, win_meta = _window_waveform(full, sr, use_played)
+        assumed = _assumed_spoken_words(words, offset_ms, use_played, speed)
+        window_words = words[assumed:]
+        # played_ms relative to window start for the sub-aligner
+        local_played = max(0, use_played - offset_ms)
+
+        waveform = windowed
         if pack.get("normalize_waveform") or (
             pack["kind"] == "mms_fa" and getattr(pack["bundle"], "_normalize_waveform", False)
         ):
             waveform = torch.nn.functional.layer_norm(waveform, waveform.shape)
 
+        if not window_words:
+            # everything assumed spoken
+            ms = (time.perf_counter() - t0) * 1000.0
+            prefix = " ".join(words)
+            return AlignCursor(
+                spoken_prefix=prefix,
+                word_index=len(words),
+                intended_text=intended_text,
+                backend_id="ctc_forced",
+                confidence=0.55,
+                align_latency_ms=ms,
+                played_ms=played_ms,
+                audio_path=str(path),
+                detail={**win_meta, "assumed_words": assumed, "model": pack["id"]},
+            )
+
         if pack["kind"] == "mms_fa":
-            return _align_mms_fa(pack, waveform, words, use_played, path, t0, speed)
-        return _align_wav2vec2_base(pack, waveform, words, use_played, path, t0, speed)
+            cur = _align_mms_fa(pack, waveform, window_words, local_played, path, t0, speed)
+        else:
+            cur = _align_wav2vec2_base(pack, waveform, window_words, local_played, path, t0, speed)
+
+        # Stitch: assumed prefix + window-aligned suffix.
+        local_idx = int(cur.word_index or 0)
+        total_idx = min(len(words), assumed + local_idx)
+        if total_idx <= 0:
+            prefix = ""
+        else:
+            prefix = " ".join(words[:total_idx])
+        detail = dict(cur.detail or {})
+        detail.update(win_meta)
+        detail["assumed_words"] = assumed
+        detail["window_word_index"] = local_idx
+        detail["stitched_word_index"] = total_idx
+        return AlignCursor(
+            spoken_prefix=prefix,
+            word_index=total_idx,
+            intended_text=intended_text,
+            backend_id=cur.backend_id or "ctc_forced",
+            confidence=cur.confidence,
+            align_latency_ms=(time.perf_counter() - t0) * 1000.0,
+            played_ms=played_ms,
+            audio_path=str(path),
+            detail=detail,
+        )
     except Exception as exc:
         fb = approx_wallclock(intended_text, played_ms, speed=speed)
         fb.detail = {

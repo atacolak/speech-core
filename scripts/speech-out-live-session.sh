@@ -291,6 +291,11 @@ align_backend="${SPEECH_OUT_ALIGN_BACKEND:-ctc_forced}"
 align_python="${SPEECH_CORE_ALIGN_PYTHON:-}"
 align_remote="${SPEECH_OUT_ALIGN_REMOTE:-auto}"  # auto|1|0 — ssh to core host if no local torch
 align_script=""
+align_worker_script=""
+align_sock="${SPEECH_OUT_ALIGN_SOCK:-/tmp/speech-core-align-worker.sock}"
+align_worker_pid=""
+align_worker_started_here=0
+align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
 assistant_b_feed_pid=""
 assistant_b_watch_pid=""
 assistant_cut_gen=0
@@ -322,6 +327,15 @@ for cand in \
   "$script_dir/barge_in_align/run_align.py" \
   "$repo_root/scripts/barge_in_align/run_align.py"; do
   if [[ -f "$cand" ]]; then align_script="$cand"; break; fi
+done
+align_worker_script=""
+for cand in \
+  "$helper_dir/barge_in_align/align_worker.py" \
+  "$libexec_dir/barge_in_align/align_worker.py" \
+  "$script_dir/barge_in_align/align_worker.py" \
+  "$repo_root/scripts/barge_in_align/align_worker.py" \
+  /home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py; do
+  if [[ -f "$cand" ]]; then align_worker_script="$cand"; break; fi
 done
 if [[ -z "${align_python:-}" ]]; then
   for cand in \
@@ -400,7 +414,8 @@ speech-out developer live session
   steps/speed:    $steps / $speed
   watch_mode:     $watch_mode
   vad_energy:     enabled=$vad_energy_enabled threshold=$vad_energy_threshold (server daemon must be restarted with these env vars to take effect)
-  assistant_cut:  backend=$align_backend (nemotron_B=$assistant_self_asr_enabled) align_py=${align_python:-n/a} script=${align_script:-n/a}
+  assistant_cut:  backend=$align_backend window_ms=$align_window_ms warm_sock=$align_sock (nemotron_B=$assistant_self_asr_enabled)
+  align:          py=${align_python:-n/a} worker=${align_worker_script:-n/a}
   run_dir:        $run_dir
   watch_log:      $watch_log
   trigger_log:    $trigger_log
@@ -978,9 +993,111 @@ record_barge_played_ms() {
   printf '%s' "$barge_ms"
 }
 
+# --- Warm CTC align worker (model stays loaded; no cold python per barge) ---
+align_worker_alive() {
+  [[ -S "$align_sock" ]] || return 1
+  [[ -n "$align_worker_script" && -f "$align_worker_script" ]] || return 1
+  [[ -n "$align_python" && -x "$align_python" ]] || return 1
+  "$align_python" "$align_worker_script" --sock "$align_sock" --ping >/dev/null 2>&1
+}
+
+start_align_worker_local() {
+  # Start long-lived worker on this host if torchaudio is available.
+  [[ "$align_backend" == "ctc_forced" ]] || return 1
+  [[ -n "$align_worker_script" && -f "$align_worker_script" ]] || return 1
+  [[ -n "$align_python" && -x "$align_python" ]] || return 1
+  if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
+    return 1
+  fi
+  if align_worker_alive; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker already up sock=$align_sock" >>"$trigger_log"
+    return 0
+  fi
+  mkdir -p "$(dirname "$align_sock")" "$assistant_cut_dir" 2>/dev/null || true
+  rm -f "$align_sock" 2>/dev/null || true
+  echo "[$(date --iso-8601=seconds)] assistant_cut: starting warm worker sock=$align_sock window_ms=$align_window_ms" >>"$trigger_log"
+  SPEECH_OUT_CTC_MODEL="${SPEECH_OUT_CTC_MODEL:-wav2vec2_base}" \
+  SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
+  PYTHONPATH="$(dirname "$align_worker_script")/..${PYTHONPATH:+:$PYTHONPATH}" \
+    "$align_python" "$align_worker_script" --sock "$align_sock" --serve \
+    >>"$assistant_cut_dir/align_worker.log" 2>&1 &
+  align_worker_pid=$!
+  align_worker_started_here=1
+  printf '%s\n' "$align_worker_pid" >"$assistant_cut_dir/align_worker.pid"
+  # Wait for socket + ping (model load can take a few seconds first time).
+  local i
+  for i in $(seq 1 60); do
+    if align_worker_alive; then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker ready pid=$align_worker_pid" >>"$trigger_log"
+      return 0
+    fi
+    # died?
+    if ! kill -0 "$align_worker_pid" 2>/dev/null; then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker died during start" >>"$trigger_log"
+      align_worker_pid=""
+      align_worker_started_here=0
+      return 1
+    fi
+    sleep 0.25
+  done
+  echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker start timeout" >>"$trigger_log"
+  return 1
+}
+
+ensure_remote_align_worker() {
+  # Keep a warm worker on the speech-core host (sfUB). Avoids cold python+SCP model reload.
+  local host remote_py remote_worker remote_sock
+  host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+  [[ -n "$host" ]] || return 1
+  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+  remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
+  remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
+  if ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+      "test -S $(printf '%q' "$remote_sock") && $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --ping >/dev/null 2>&1"; then
+    echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker already up host=$host" >>"$trigger_log"
+    return 0
+  fi
+  echo "[$(date --iso-8601=seconds)] assistant_cut: starting remote warm worker host=$host" >>"$trigger_log"
+  ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+    "rm -f $(printf '%q' "$remote_sock"); \
+     SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} \
+     SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} \
+     PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+     nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --serve \
+       >/tmp/speech-core-align-worker.log 2>&1 &" \
+    >>"$trigger_log" 2>&1 || true
+  local i
+  for i in $(seq 1 40); do
+    if ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+        "$(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --ping >/dev/null 2>&1"; then
+      echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker ready host=$host" >>"$trigger_log"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "[$(date --iso-8601=seconds)] assistant_cut: remote warm worker start failed host=$host" >>"$trigger_log"
+  return 1
+}
+
+stop_align_worker_if_ours() {
+  # Only stop a worker this session started (shared host worker stays up for Discord/later).
+  if (( align_worker_started_here == 1 )) && [[ -n "${align_worker_pid:-}" ]]; then
+    if kill -0 "$align_worker_pid" 2>/dev/null; then
+      if [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
+        "$align_python" "$align_worker_script" --sock "$align_sock" --shutdown >/dev/null 2>&1 || true
+      fi
+      kill "$align_worker_pid" 2>/dev/null || true
+      wait "$align_worker_pid" 2>/dev/null || true
+    fi
+  fi
+  align_worker_pid=""
+  align_worker_started_here=0
+}
+
 # CTC forced align on teed clip (audio + intended text). Ground-truth cut.
+# Prefers warm worker (local or remote). Falls back to one-shot python only if needed.
 finalize_assistant_cut_ctc() {
-  local intended played_ms wav out_json mono_ns payload cut_line backend conf lat
+  local intended played_ms wav out_json cut_line backend conf lat path_used
   intended="$(cat "$tts_expected_file" 2>/dev/null || true)"
   [[ -n "$intended" ]] || return 0
   played_ms="$(cat "$assistant_barge_played_ms_file" 2>/dev/null || echo 0)"
@@ -988,28 +1105,19 @@ finalize_assistant_cut_ctc() {
   wav="$(latest_assistant_wav)"
   mkdir -p "$assistant_cut_dir"
 
-  if [[ -z "$align_script" || ! -f "$align_script" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc skipped (no align script)" >>"$trigger_log"
-    return 1
-  fi
-
   out_json="$assistant_cut_dir/ctc_align.json"
   backend="$align_backend"
   local t0 t1
   t0="$(($(date +%s%N) / 1000000))"
+  path_used="cold"
 
-  # Prefer local align_python with torch; optional remote to core host.
-  local use_remote=0
-  if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
-    use_remote=1
-  elif [[ "$align_remote" == "auto" ]]; then
-    if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
-      use_remote=1
-    fi
-  fi
-
-  if (( use_remote == 0 )); then
-    "$align_python" "$align_script" \
+  # 1) Local warm worker (sfUB dogfood when torch is local).
+  if align_worker_alive || start_align_worker_local; then
+    path_used="warm_local"
+    SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
+    "$align_python" "$align_worker_script" \
+      --sock "$align_sock" \
+      --align \
       --backend "$backend" \
       --wav "${wav:-}" \
       --intended "$intended" \
@@ -1018,26 +1126,57 @@ finalize_assistant_cut_ctc() {
       --out "$out_json" \
       >>"$trigger_log" 2>&1 || true
   else
-    # Remote align on speech-core host (where pyannote-cpu / torch lives).
-    local host remote_wav remote_py remote_script
+    # 2) Remote warm worker on core host — still SCP wav (harness constraint),
+    #    but model stays loaded so we drop ~1–2s cold load.
+    local use_remote=0 host
     host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
-    remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-    remote_script="${SPEECH_CORE_ALIGN_SCRIPT_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/run_align.py}"
-    if [[ -n "$wav" && -f "$wav" && -n "$host" ]]; then
+    if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
+      use_remote=1
+    elif [[ "$align_remote" == "auto" ]]; then
+      if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
+        use_remote=1
+      fi
+    fi
+    if (( use_remote == 1 )) && [[ -n "$wav" && -f "$wav" && -n "$host" ]]; then
+      local remote_wav remote_py remote_worker remote_sock remote_line
+      remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
+      remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
+      remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
+      ensure_remote_align_worker || true
       remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
+      path_used="warm_remote"
       scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
-      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-        "PYTHONPATH=/home/sf/workspace/speech-core/scripts $remote_py $remote_script --backend $backend --wav $remote_wav --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
-        >"$out_json" 2>>"$trigger_log" || true
-      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $remote_wav" >/dev/null 2>&1 || true
+      remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+        "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+         $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
+         --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
+         --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
+        2>>"$trigger_log" || true)"
+      if [[ -n "$remote_line" ]]; then
+        printf '%s\n' "$remote_line" >"$out_json"
+      fi
+      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
+    elif [[ -n "$align_script" && -f "$align_script" ]]; then
+      # 3) Last resort: cold one-shot local python.
+      path_used="cold_local"
+      SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
+      "$align_python" "$align_script" \
+        --backend "$backend" \
+        --wav "${wav:-}" \
+        --intended "$intended" \
+        --played-ms "$played_ms" \
+        --speed "$speed" \
+        --out "$out_json" \
+        >>"$trigger_log" 2>&1 || true
     else
-      echo "[$(date --iso-8601=seconds)] assistant_cut: remote ctc skipped (no wav/host)" >>"$trigger_log"
+      echo "[$(date --iso-8601=seconds)] assistant_cut: ctc skipped (no worker/script)" >>"$trigger_log"
+      return 1
     fi
   fi
 
   t1="$(($(date +%s%N) / 1000000))"
   if [[ ! -s "$out_json" ]]; then
-    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc produced no json wall_ms=$((t1-t0))" >>"$trigger_log"
+    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc produced no json path=$path_used wall_ms=$((t1-t0))" >>"$trigger_log"
     return 1
   fi
 
@@ -1054,7 +1193,7 @@ finalize_assistant_cut_ctc() {
 
   printf '%s\n' "$cut_line" >"$assistant_cut_dir/production_cut_text"
   printf '%s\n' "$intended" >"$assistant_cut_dir/assistant_intended.txt"
-  echo "[$(date --iso-8601=seconds)] assistant_cut: ground_truth source=$backend played_ms=$played_ms align_ms=$lat wall_ms=$((t1-t0)) cut=$cut_line" >>"$trigger_log"
+  echo "[$(date --iso-8601=seconds)] assistant_cut: ground_truth source=$backend path=$path_used played_ms=$played_ms align_ms=$lat wall_ms=$((t1-t0)) window_ms=$align_window_ms cut=$cut_line" >>"$trigger_log"
   emit_assistant_truncated_event "$cut_line" "$backend" "high"
   return 0
 }
@@ -1327,13 +1466,10 @@ run_speech_out() {
       export SPEECH_OUT_TEE_MANIFEST="$assistant_manifest"
       export SPEECH_OUT_TEE_FOLLOW_DIR="$follow_dir"
       effective_play_command="$tee_play_script"
-      # Warm CTC weights once per session (non-blocking).
-      if [[ "$align_backend" == "ctc_forced" && -n "$align_script" && -f "$align_script" ]]; then
-        if [[ ! -f "$assistant_cut_dir/.ctc_preloaded" ]]; then
-          if "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
-            "$align_python" "$align_script" --preload >>"$trigger_log" 2>&1 &
-            touch "$assistant_cut_dir/.ctc_preloaded"
-          fi
+      # Keep CTC model warm for the session (local if torch available, else remote on core host).
+      if [[ "$align_backend" == "ctc_forced" ]]; then
+        if ! start_align_worker_local; then
+          ensure_remote_align_worker || true
         fi
       fi
     else
@@ -1540,6 +1676,9 @@ cleanup() {
 
   # Cancel any active speech-out before tearing down processes.
   cancel_speech_out session_end || true
+
+  # Stop align worker only if this session started it (shared host worker stays).
+  stop_align_worker_if_ours || true
 
   # Terminate adapter with a brief wait (not indefinite).
   if [[ -n "${adapter_pid:-}" ]]; then
