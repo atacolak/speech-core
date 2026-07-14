@@ -215,6 +215,9 @@ struct TuiModel {
     last_closed: Option<usize>,
     next_turn_number: u64,
     notes: VecDeque<String>,
+    /// Sticky operator alerts (errors/warnings) that survive high-frequency
+    /// seam note churn so a one-frame flash is still readable.
+    sticky_alerts: VecDeque<String>,
     live_vad_bar: String,
     live_fallback_bar: String,
     live_hold_bar: String,
@@ -925,10 +928,9 @@ impl TuiModel {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                self.note_event(
-                    value,
-                    format!("speech-out playback failed: chunk {seq}: {message}"),
-                );
+                let note = format!("speech-out playback failed: chunk {seq}: {message}");
+                self.sticky_alert(note.clone());
+                self.note_event(value, note);
             }
             "speech_out_failed" if self.speech_out_ui => {
                 let idx = self.last_turn_for_output();
@@ -937,7 +939,18 @@ impl TuiModel {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                self.note_event(value, format!("speech-out failed: {message}"));
+                let note = format!("speech-out failed: {message}");
+                self.sticky_alert(note.clone());
+                self.note_event(value, note);
+            }
+            "operator_alert" if self.speech_out_ui => {
+                let message = value
+                    .get("message")
+                    .or_else(|| value.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("alert");
+                self.sticky_alert(message.to_owned());
+                self.note_event(value, format!("alert: {message}"));
             }
             "speech_out_params_updated" if self.speech_out_ui => {
                 let selected = value
@@ -1101,6 +1114,14 @@ impl TuiModel {
             out.push_str("waiting for speech…\n");
         }
 
+        if !self.sticky_alerts.is_empty() {
+            out.push_str("\nalerts\n");
+            for alert in &self.sticky_alerts {
+                out.push_str("  ⚠ ");
+                out.push_str(alert);
+                out.push('\n');
+            }
+        }
         if debug {
             out.push_str("\nlast seam transitions\n");
             for note in &self.notes {
@@ -1427,6 +1448,16 @@ impl TuiModel {
         self.notes.push_back(note);
         while self.notes.len() > MAX_TUI_NOTES {
             self.notes.pop_front();
+        }
+    }
+
+    fn sticky_alert(&mut self, alert: String) {
+        if self.sticky_alerts.iter().any(|a| a == &alert) {
+            return;
+        }
+        self.sticky_alerts.push_back(alert);
+        while self.sticky_alerts.len() > 6 {
+            self.sticky_alerts.pop_front();
         }
     }
 
