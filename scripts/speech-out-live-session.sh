@@ -387,6 +387,7 @@ resolve_python3() {
   local cand
   for cand in \
     "${SPEECH_CORE_PYTHON3:-}" \
+    "$HOME/.local/bin/python3" \
     "$HOME/.nix-profile/bin/python3" \
     /etc/profiles/per-user/"$USER"/bin/python3 \
     /run/current-system/sw/bin/python3; do
