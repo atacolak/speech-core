@@ -1862,7 +1862,12 @@ cancel_speech_out() {
     # Freeze play duration + gen ownership for cut BEFORE any slow stop work.
     record_barge_played_ms >/dev/null || true
     mkdir -p "$assistant_cut_dir"
-    printf '%s\n' "${assistant_active_gen:-0}" >"$assistant_cut_dir/barge_cut_gen"
+    # Pipeline subshell may not see in-memory gen — prefer files written at speak.
+    _barge_gen="${assistant_active_gen:-}"
+    if [[ -z "$_barge_gen" || "$_barge_gen" == "0" ]]; then
+      _barge_gen="$(cat "$assistant_cut_dir/current_gen" 2>/dev/null || true)"
+    fi
+    printf '%s\n' "${_barge_gen:-0}" >"$assistant_cut_dir/barge_cut_gen"
     # Snapshot played_ms for async CTC (files may be cleared by next speak).
     cp -f "$assistant_barge_played_ms_file" "$assistant_cut_dir/barge_played_ms_snapshot" 2>/dev/null || true
     # 1) provisional greying IMMEDIATELY (wall-clock) — do not wait on CUPE stop.

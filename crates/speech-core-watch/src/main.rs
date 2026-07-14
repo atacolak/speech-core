@@ -833,10 +833,10 @@ impl TuiModel {
                 self.note_event(value, format!("speech-out self-echo suppressed: {context}"));
             }
             "speech_out_barge_in" | "speech_out_cancel_requested" if self.speech_out_ui => {
-                if let Some(idx) = self.turns.len().checked_sub(1) {
-                    if !self.turns[idx].outputs.is_empty() {
-                        self.push_output_glyph(idx, "⏹");
-                    }
+                // Cancel belongs to the speaking assistant line, not the new user turn.
+                let idx = self.turn_for_active_output(value);
+                if !self.turns[idx].outputs.is_empty() {
+                    self.push_output_glyph(idx, "⏹");
                 }
                 let trigger = value
                     .get("trigger")
@@ -848,6 +848,8 @@ impl TuiModel {
             // Dual-Nemotron cut: spoken prefix (assistant self-ASR / pad fallback)
             // is dim grey; unsaid remainder of intended text stays normal white.
             "assistant_turn_truncated" if self.speech_out_ui => {
+                // Grey the spoken prefix on the EXISTING assistant output line.
+                // Never invent a second line under the barge-in user turn.
                 let intended = value
                     .get("intended_text")
                     .or_else(|| value.get("text"))
@@ -895,47 +897,57 @@ impl TuiModel {
                         format!("ignored stale truncate ({source}) played_ms=0"),
                     );
                 } else {
-                    let idx = self.last_turn_for_output();
                     let full_text = if intended.is_empty() {
                         spoken.clone()
                     } else {
                         intended
                     };
-                    let mut target: Option<usize> = None;
+
+                    let mut placed: Option<(usize, usize)> = None;
                     if let Some(ref u) = event_utt {
-                        target = self.turns[idx]
-                            .outputs
-                            .iter()
-                            .rposition(|o| o.utterance_id.as_deref() == Some(u.as_str()));
+                        placed = self.find_output_by_utterance(u);
                     }
-                    if target.is_none() {
+                    if placed.is_none() {
                         if let Some(ref g) = event_gen {
                             if g != "0" {
-                                target = self.turns[idx].outputs.iter().rposition(|o| {
-                                    o.cut_gen.as_deref() == Some(g.as_str())
-                                });
+                                for (ti, turn) in self.turns.iter().enumerate().rev() {
+                                    if let Some(oi) = turn
+                                        .outputs
+                                        .iter()
+                                        .rposition(|o| o.cut_gen.as_deref() == Some(g.as_str()))
+                                    {
+                                        placed = Some((ti, oi));
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                    if target.is_none() {
-                        if let Some(output) = self.turns[idx].outputs.last() {
-                            let free = output.utterance_id.is_none()
-                                && (output.cut_gen.is_none()
-                                    || output.cut_gen.as_deref() == Some("0"));
-                            let same_utt = match (&event_utt, &output.utterance_id) {
-                                (Some(a), Some(b)) => a == b,
-                                _ => false,
-                            };
-                            if free || same_utt {
-                                target =
-                                    Some(self.turns[idx].outputs.len().saturating_sub(1));
+                    if placed.is_none() {
+                        for (ti, turn) in self.turns.iter().enumerate().rev() {
+                            if let Some(oi) = turn.outputs.iter().rposition(|o| {
+                                o.cut_prefix.is_none()
+                                    && (o.text == full_text
+                                        || o.utterance_id.is_none()
+                                        || event_utt.is_none())
+                            }) {
+                                let o = &turn.outputs[oi];
+                                let conflict = match (&event_utt, &o.utterance_id) {
+                                    (Some(a), Some(b)) => a != b,
+                                    _ => false,
+                                };
+                                if !conflict {
+                                    placed = Some((ti, oi));
+                                    break;
+                                }
                             }
                         }
                     }
-                    if let Some(oi) = target {
-                        let output = &mut self.turns[idx].outputs[oi];
+
+                    if let Some((ti, oi)) = placed {
+                        let output = &mut self.turns[ti].outputs[oi];
                         if !full_text.is_empty() {
-                            output.text = full_text.clone();
+                            output.text = full_text;
                         }
                         output.cut_prefix = if spoken.is_empty() {
                             None
@@ -949,50 +961,26 @@ impl TuiModel {
                         if event_gen.is_some() {
                             output.cut_gen = event_gen.clone();
                         }
-                        if output
-                            .glyphs
-                            .last()
-                            .is_none_or(|g| g != "✂" && g != "⏹")
-                        {
-                            output.glyphs.push("✂".to_owned());
+                        // Barge stop on SAME line; greying is the cut signal.
+                        // Do not use scissors here — that glyph means text-split.
+                        if output.glyphs.last().is_none_or(|g| g != "⏹") {
+                            output.glyphs.push("⏹".to_owned());
                         }
-                    } else if !full_text.is_empty() {
-                        let last_owned = self.turns[idx].outputs.last().is_some_and(|o| {
-                            o.utterance_id.is_some()
-                                && event_utt
-                                    .as_ref()
-                                    .is_some_and(|u| o.utterance_id.as_ref() != Some(u))
-                        });
-                        if last_owned {
-                            self.note_event(
-                                value,
-                                format!(
-                                    "ignored truncate for other utterance ({source}): {}",
-                                    event_utt.as_deref().unwrap_or("?")
-                                ),
-                            );
+                        let note = if spoken.is_empty() {
+                            format!("assistant cut ({source}): empty")
                         } else {
-                            self.turns[idx].outputs.push(SpeechOutLine {
-                                text: full_text,
-                                chunks: Vec::new(),
-                                glyphs: vec!["✂".to_owned()],
-                                cut_prefix: if spoken.is_empty() {
-                                    None
-                                } else {
-                                    Some(spoken.clone())
-                                },
-                                cut_source: Some(source.clone()),
-                                utterance_id: event_utt.clone(),
-                                cut_gen: event_gen.clone(),
-                            });
-                        }
-                    }
-                    let note = if spoken.is_empty() {
-                        format!("assistant cut ({source}): empty")
+                            format!("assistant cut ({source}): {spoken}")
+                        };
+                        self.note_event(value, note);
                     } else {
-                        format!("assistant cut ({source}): {spoken}")
-                    };
-                    self.note_event(value, note);
+                        self.note_event(
+                            value,
+                            format!(
+                                "ignored truncate with no matching output ({source}): {}",
+                                event_utt.as_deref().unwrap_or("?")
+                            ),
+                        );
+                    }
                 }
             }
             "speech_out_cancel_ack" | "speech_out_cancel_acknowledged" if self.speech_out_ui => {
@@ -1211,7 +1199,7 @@ impl TuiModel {
         out.push_str("glyphs  ◖ speech  ◗ pause  ①②③④ semantic checks  ◆ close  ↺ resume  · wait  ◇ unresolved/fallback\n");
         if self.speech_out_ui {
             out.push_str(
-                "output  ⏳ queued  ⇢ request  ✂ chunked  ⌁ synth  … text-chunk  ▣ first-audio  ⏹ cancel  ✓ done  ✗ failed\n",
+                "output  ⏳ queued  ⇢ request  ✂ text-split  ⌁ synth  … chunk  ▣ audio  ⏹ barge/cancel  ✓ done  ✗ fail  (dim=spoken)\n",
             );
             if let Some(params) = &self.speech_out_params {
                 out.push_str(params);
@@ -1373,6 +1361,45 @@ impl TuiModel {
                 .position(|turn| turn.turn_id.as_deref() == Some(turn_id));
         }
         self.current_open_turn()
+    }
+
+    /// Find (turn_idx, output_idx) for an assistant utterance across all turns.
+    /// Truncate / cancel must attach to the speaking line, not the new user turn.
+    fn find_output_by_utterance(&self, utterance_id: &str) -> Option<(usize, usize)> {
+        for (ti, turn) in self.turns.iter().enumerate().rev() {
+            if let Some(oi) = turn
+                .outputs
+                .iter()
+                .rposition(|o| o.utterance_id.as_deref() == Some(utterance_id))
+            {
+                return Some((ti, oi));
+            }
+        }
+        None
+    }
+
+    /// Prefer the turn that owns a speech-out line (for barge cancel glyphs).
+    fn turn_for_active_output(&mut self, value: &Value) -> usize {
+        if let Some(utt) = value
+            .get("utterance_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some((ti, _)) = self.find_output_by_utterance(utt) {
+                return ti;
+            }
+        }
+        if let Some((ti, _)) = self
+            .turns
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, t)| !t.outputs.is_empty())
+        {
+            return ti;
+        }
+        self.last_turn_for_output()
     }
 
     fn last_turn_for_output(&mut self) -> usize {
@@ -2941,6 +2968,133 @@ mod tests {
             rendered.contains("assistant cut (drain): This is a long assistant reply"),
             "seam note must include cut text; got:\n{rendered}"
         );
+    }
+
+
+
+    #[test]
+    fn assistant_turn_truncated_greys_same_line_not_new_user_turn() {
+        // Regression (session 612e1245): barge opens a new user turn before
+        // assistant_turn_truncated arrives. Cut must grey the ORIGINAL assistant
+        // line — not create a second line under the user turn.
+        let mut model = TuiModel::new(true);
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "transcript_committed",
+                "stream_session_id": "s",
+                "turn_id": "s:turn:0",
+                "text": "barge please",
+                "diagnostic_mono_ns": 1_000_000_000_u64
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "turn_closed",
+                "stream_session_id": "s",
+                "turn_id": "s:turn:0",
+                "source": "smart_turn",
+                "diagnostic_mono_ns": 1_100_000_000_u64
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "speech_out_request_received",
+                "utterance_id": "utt-1",
+                "diagnostic_mono_ns": 1_200_000_000_u64,
+                "text": "This is a long assistant reply so you can barge in mid sentence and hear the stop.",
+                "num_chunks": 1
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "speech_out_text_chunks",
+                "utterance_id": "utt-1",
+                "diagnostic_mono_ns": 1_250_000_000_u64,
+                "chunks": ["This is a long assistant reply so you can barge in mid sentence and hear the stop."]
+            }),
+        );
+        apply(
+            &mut model,
+            json!({"event":"vad_speech_start","stream_session_id":"s"}),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "transcript_committed",
+                "stream_session_id": "s",
+                "turn_id": "s:turn:1",
+                "text": "That's good.",
+                "diagnostic_mono_ns": 2_000_000_000_u64
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "turn_closed",
+                "stream_session_id": "s",
+                "turn_id": "s:turn:1",
+                "source": "smart_turn",
+                "diagnostic_mono_ns": 2_100_000_000_u64
+            }),
+        );
+        apply(
+            &mut model,
+            json!({
+                "event": "assistant_turn_truncated",
+                "utterance_id": "utt-1",
+                "cut_gen": "1",
+                "diagnostic_mono_ns": 2_200_000_000_u64,
+                "intended_text": "This is a long assistant reply so you can barge in mid sentence and hear the stop.",
+                "spoken_prefix": "This is a long assistant reply so you",
+                "primary_cut_source": "approx_wallclock",
+                "played_ms": 2546
+            }),
+        );
+
+        let t0 = &model.turns[0];
+        assert_eq!(
+            t0.outputs.len(),
+            1,
+            "must not invent a second assistant line; got {:?}",
+            t0.outputs
+        );
+        assert_eq!(
+            t0.outputs[0].cut_prefix.as_deref(),
+            Some("This is a long assistant reply so you")
+        );
+        let t1 = &model.turns[1];
+        assert!(
+            t1.outputs.is_empty(),
+            "user barge turn must not get orphan cut line; got {:?}",
+            t1.outputs
+        );
+
+        let rendered = model.render(true);
+        assert!(
+            rendered.contains(
+                "\u{1b}[2mThis is a long assistant reply so you\u{1b}[0m can barge in mid sentence and hear the stop."
+            ),
+            "single line must show dim spoken + white remainder; got:\n{rendered}"
+        );
+                // Count only quoted assistant lines (notes also mention the cut prefix).
+        let quoted_assistant_lines = rendered
+            .lines()
+            .filter(|l| l.contains('"') && l.contains("This is a long assistant reply"))
+            .count();
+        assert_eq!(
+            quoted_assistant_lines,
+            1,
+            "expected one quoted assistant line, got {quoted_assistant_lines}:\n{rendered}"
+        );
+
     }
 
 
