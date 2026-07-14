@@ -1243,7 +1243,9 @@ impl ModelWorker {
                     .unwrap_or(0);
                 session.next_committed_token = 0;
                 session.token_index_base = base;
-                // next_chunk_sample_start stays continuous across rebegin.
+                // Token timestamps restart at 0 on the new stream; map them
+                // into the continuous session sample clock.
+                session.stream_sample_origin = session.next_chunk_sample_start;
                 self.sessions.insert(session_id.clone(), session);
             }
         } else {
@@ -1448,13 +1450,21 @@ impl ModelWorker {
                 && token.t1_ms >= token.t0_ms
                 && token.t0_ms >= 0;
             if let Some(ref progress) = self.model_progress {
+                // Nemotron t0/t1 are relative to the current native stream begin.
+                // After finalize+rebegin that origin is stream_sample_origin.
                 let token_end_sample = if timestamps_valid {
-                    ms_to_sample(token.t1_ms)
+                    session
+                        .stream_sample_origin
+                        .saturating_add(ms_to_sample(token.t1_ms))
                 } else {
-                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                    session.stream_sample_origin.saturating_add(
+                        (update.audio_committed_ms.max(0) as u64).saturating_mul(16),
+                    )
                 };
                 let token_start_sample = if timestamps_valid {
-                    ms_to_sample(token.t0_ms)
+                    session
+                        .stream_sample_origin
+                        .saturating_add(ms_to_sample(token.t0_ms))
                 } else {
                     token_end_sample.saturating_sub(160) // ~10ms estimate
                 };
@@ -1477,8 +1487,16 @@ impl ModelWorker {
             } else {
                 Some(token.probability)
             };
-            let source_sample_start_estimate = timestamps_valid.then(|| ms_to_sample(token.t0_ms));
-            let source_sample_end_estimate = timestamps_valid.then(|| ms_to_sample(token.t1_ms));
+            let source_sample_start_estimate = timestamps_valid.then(|| {
+                session
+                    .stream_sample_origin
+                    .saturating_add(ms_to_sample(token.t0_ms))
+            });
+            let source_sample_end_estimate = timestamps_valid.then(|| {
+                session
+                    .stream_sample_origin
+                    .saturating_add(ms_to_sample(token.t1_ms))
+            });
             let token_turn_id = self
                 .model_progress
                 .as_ref()
@@ -1517,10 +1535,14 @@ impl ModelWorker {
                     continue;
                 }
                 let start_sample = source_sample_start_estimate.unwrap_or_else(|| {
-                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                    session.stream_sample_origin.saturating_add(
+                        (update.audio_committed_ms.max(0) as u64).saturating_mul(16),
+                    )
                 });
                 let end_sample = source_sample_end_estimate.unwrap_or_else(|| {
-                    (update.audio_committed_ms.max(0) as u64).saturating_mul(16)
+                    session.stream_sample_origin.saturating_add(
+                        (update.audio_committed_ms.max(0) as u64).saturating_mul(16),
+                    )
                 });
                 if let Err(err) = sink.transcript_token_committed(TranscriptTokenSignal {
                     stream_id: session.hello.stream_id.clone(),
@@ -1577,6 +1599,10 @@ struct ModelSession {
     /// Added to native token indices when recording snapshots so indices stay
     /// monotonic across per-turn finalize+rebegin boundaries.
     token_index_base: u32,
+    /// Session sample clock at the start of the current native stream.
+    /// Token t0/t1 from Nemotron are stream-relative and reset on rebegin;
+    /// absolute sample = stream_sample_origin + ms_to_sample(t*).
+    stream_sample_origin: u64,
     drain_handle: ModelDrainHandle,
 }
 
@@ -1597,6 +1623,7 @@ impl ModelSession {
             next_chunk_sample_start: 0,
             next_committed_token: 0,
             token_index_base: 0,
+            stream_sample_origin: 0,
             drain_handle,
         }
     }
