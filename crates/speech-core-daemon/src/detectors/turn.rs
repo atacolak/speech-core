@@ -1785,12 +1785,13 @@ fn ms_to_samples(ms: u32) -> u64 {
 }
 
 /// How long token end-sample must stay unchanged after audio catch-up before close freezes.
-/// Sized against att_context_right≈80ms + a little decode slack (not a human pause).
-const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 120;
-/// Family-reported internal buffer at/below this is treated as "drained enough" at close.
+/// Kept short for UX: session evidence showed 120ms + buffer-wait made closes feel unusable.
+/// Ghost late tokens are suppressed separately; this is not the main correctness lever.
+const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 60;
+/// Snapshot-only: family buffered_ms is recorded at close but we do NOT block on it.
+/// Mid-stream buffer rarely reaches a true drained floor without silence pad, so waiting
+/// was a near-fixed ~200ms tax on almost every smart-turn close.
 const CLOSE_BUFFER_DRAINED_MS: i64 = 20;
-/// Bound how long close will wait for buffered_ms to fall after audio catch-up.
-const CLOSE_BUFFER_WAIT_MS: u64 = 200;
 
 
 fn model_alignment_deadline(timeout_ms: u32) -> Instant {
@@ -1880,44 +1881,6 @@ fn wait_for_token_quiescence_until(
     }
 }
 
-struct BufferDrainWait {
-    buffered_ms: Option<i64>,
-    drained: bool,
-    elapsed_ms: u64,
-}
-
-/// Wait until the family reports little/no internal buffered audio, or the wait budget ends.
-/// This is a drain *hint*: zero buffer is not a certificate that all tokens for ≤X are out,
-/// but combined with token quiescence it catches right-context still held at close.
-fn wait_for_buffer_drained_until(
-    model_progress: &ModelProgressMap,
-    stream_session_id: &str,
-    deadline: Instant,
-    max_wait: Duration,
-    drained_threshold_ms: i64,
-) -> BufferDrainWait {
-    let started = Instant::now();
-    let wait_deadline = started + max_wait;
-    loop {
-        let now = Instant::now();
-        let buffered_ms = model_progress.buffered_ms(stream_session_id);
-        let drained = buffered_ms.is_some_and(|ms| ms <= drained_threshold_ms);
-        // Unknown buffer (None) means we never observed a model update — do not block forever.
-        if drained || buffered_ms.is_none() || now >= deadline || now >= wait_deadline {
-            return BufferDrainWait {
-                buffered_ms,
-                drained: buffered_ms.is_some_and(|ms| ms <= drained_threshold_ms),
-                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            };
-        }
-        let remaining = deadline
-            .min(wait_deadline)
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(5));
-        std::thread::sleep(remaining);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn align_model_for_close(
     model_progress: Option<&ModelProgressMap>,
@@ -1977,19 +1940,12 @@ fn align_model_for_close(
         );
         audio_committed_sample = model_progress.get(stream_session_id);
 
-        // After audio has been fed through the decision sample, wait briefly for the
-        // family's internal right-context/lookahead buffer to drain. This is bounded
-        // so a stuck buffer cannot hang close; token quiescence still follows.
-        let buffer_wait = wait_for_buffer_drained_until(
-            model_progress,
-            stream_session_id,
-            deadline,
-            Duration::from_millis(CLOSE_BUFFER_WAIT_MS),
-            CLOSE_BUFFER_DRAINED_MS,
-        );
-        buffered_ms = buffer_wait.buffered_ms;
-        buffer_drained = buffer_wait.drained;
-        buffer_wait_elapsed_ms = buffer_wait.elapsed_ms;
+        // Record buffer state only. Do not block on buffered_ms: in live sessions it
+        // almost never falls to the drained threshold without injecting silence, so a
+        // wait becomes a fixed latency tax (~200ms) on every close.
+        buffered_ms = model_progress.buffered_ms(stream_session_id);
+        buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
+        buffer_wait_elapsed_ms = 0;
 
         let token_quiescence = wait_for_token_quiescence_until(
             model_progress,
@@ -2001,6 +1957,7 @@ fn align_model_for_close(
         token_quiescent = token_quiescence.quiescent;
         token_quiescence_elapsed_ms = token_quiescence.elapsed_ms;
         buffered_ms = model_progress.buffered_ms(stream_session_id).or(buffered_ms);
+        buffer_drained = buffered_ms.is_some_and(|ms| ms <= CLOSE_BUFFER_DRAINED_MS);
         apply_trailing_token_extension(
             model_progress,
             stream_session_id,
@@ -2480,7 +2437,7 @@ mod tests {
         // Close still waits CLOSE_TOKEN_QUIESCENCE_MS for token stability after audio
         // catch-up, but must NOT keep waiting until last_token_end reaches decision_sample.
         assert!(
-            elapsed < Duration::from_millis(250),
+            elapsed < Duration::from_millis(150),
             "close should not wait for last_token_end_sample to reach the VAD silence decision sample; elapsed={elapsed:?}"
         );
         assert!(
@@ -2561,8 +2518,8 @@ mod tests {
         let progress = ModelProgressMap::new();
         progress.start_session_for_test("test.session");
         progress.update(SESSION_ID, 17_920);
-        // Already drained buffer: close should not stall on buffer wait.
-        progress.update_buffered_ms(SESSION_ID, 0);
+        // High residual buffer must not add close latency (snapshot-only).
+        progress.update_buffered_ms(SESSION_ID, 110);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             model_progress: Some(progress),
@@ -2596,8 +2553,16 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            alignment.get("buffer_wait_elapsed_ms").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            alignment.get("buffered_ms").and_then(Value::as_i64),
+            Some(110)
+        );
+        assert_eq!(
             alignment.get("buffer_drained").and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
     }
 
