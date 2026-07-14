@@ -32,6 +32,9 @@ pub struct ModelProgressState {
     pub generation: u64,
     pub audio_committed_samples: u64,
     pub last_token_end_sample: Option<u64>,
+    /// Family-reported internal audio still buffered (lookahead / right-context).
+    /// Updated on every model feed/finalize update. Used by turn close as a drain hint.
+    pub buffered_ms: i64,
     /// Cumulative committed tokens since session start. Written by the model worker
     /// every time a token commits. Turn manager slices this at close time.
     pub committed_tokens: Vec<CommittedTokenSnapshot>,
@@ -164,6 +167,7 @@ impl ModelProgressMap {
                     generation,
                     audio_committed_samples: 0,
                     last_token_end_sample: None,
+                    buffered_ms: 0,
                     committed_tokens: Vec::new(),
                     last_committed_text: String::new(),
                     committed_token_count: 0,
@@ -187,6 +191,14 @@ impl ModelProgressMap {
         }
     }
 
+    pub fn update_buffered_ms(&self, session_id: &str, buffered_ms: i64) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                state.buffered_ms = buffered_ms.max(0);
+            }
+        }
+    }
+
     pub fn record_token(&self, session_id: &str, token_end_sample: u64) {
         if let Ok(mut map) = self.inner.lock() {
             if let Some(state) = map.get_mut(session_id) {
@@ -206,6 +218,12 @@ impl ModelProgressMap {
         self.inner.lock().ok().and_then(|map| {
             map.get(session_id)
                 .and_then(|state| state.last_token_end_sample)
+        })
+    }
+
+    pub fn buffered_ms(&self, session_id: &str) -> Option<i64> {
+        self.inner.lock().ok().and_then(|map| {
+            map.get(session_id).map(|state| state.buffered_ms)
         })
     }
 
@@ -1309,6 +1327,10 @@ impl ModelWorker {
         if let Some(ref progress) = self.model_progress {
             let committed_samples = (update.audio_committed_ms.max(0) as u64).saturating_mul(16);
             progress.update(&session.hello.stream_session_id, committed_samples);
+            progress.update_buffered_ms(
+                &session.hello.stream_session_id,
+                update.buffered_ms,
+            );
         }
         session.next_committed_token = session.next_committed_token.max(upper);
         Ok(())

@@ -569,17 +569,35 @@ impl TurnManager {
                 if !is_speech_evidence_text(&text) {
                     return Ok(Vec::new());
                 }
+                // Token fully inside the already-closed decision boundary.
                 let late_for_closed_turn = session
                     .last_closed_decision_sample
                     .is_some_and(|closed| end_sample <= closed);
+                // Ghost-turn guard (Test/One split): after a turn closed, ASR can still
+                // emit tokens whose timestamps sit past the close decision. Without a
+                // new VAD speech start, those must not invent a second turn — they are
+                // late decode for the same utterance, not a new one. Transcript-only
+                // open remains allowed when VAD never fired (saw_vad_signal == false).
+                let ghost_late_token = session.open_turn.is_none()
+                    && session.saw_vad_signal
+                    && session.last_closed_decision_sample.is_some_and(|closed| {
+                        !session
+                            .last_vad_start_sample
+                            .is_some_and(|start| start > closed)
+                    });
+                let suppress_token = late_for_closed_turn || ghost_late_token;
                 writer.write(&TurnSignalObservedEvent {
                     event: "turn_signal_observed",
                     stream_id: stream_id.clone(),
                     stream_session_id: stream_session_id.clone(),
                     adapter_id: adapter_id.clone(),
                     detector,
-                    signal: if late_for_closed_turn {
-                        "transcript_token_late"
+                    signal: if suppress_token {
+                        if ghost_late_token && !late_for_closed_turn {
+                            "transcript_token_late_orphan"
+                        } else {
+                            "transcript_token_late"
+                        }
                     } else {
                         "transcript_token_committed"
                     },
@@ -588,7 +606,7 @@ impl TurnManager {
                     confidence,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
-                if late_for_closed_turn {
+                if suppress_token {
                     return Ok(Vec::new());
                 }
                 if session.open_turn.is_none() {
@@ -1482,6 +1500,9 @@ struct CloseModelAlignment {
     audio_target_sample: u64,
     audio_committed_sample: Option<u64>,
     last_token_end_sample: Option<u64>,
+    buffered_ms: Option<i64>,
+    buffer_drained: bool,
+    buffer_wait_elapsed_ms: u64,
     audio_caught_up: bool,
     token_quiescent: bool,
     token_quiescence_elapsed_ms: u64,
@@ -1509,6 +1530,9 @@ impl CloseModelAlignment {
             audio_target_sample: self.audio_target_sample,
             audio_committed_sample: self.audio_committed_sample,
             last_token_end_sample: self.last_token_end_sample,
+            buffered_ms: self.buffered_ms,
+            buffer_drained: self.buffer_drained,
+            buffer_wait_elapsed_ms: self.buffer_wait_elapsed_ms,
             effective_end_sample: self.effective_end_sample,
             effective_decision_sample: self.effective_decision_sample,
             audio_caught_up: self.audio_caught_up,
@@ -1649,6 +1673,9 @@ struct TurnCloseAlignmentEvent {
     audio_target_sample: u64,
     audio_committed_sample: Option<u64>,
     last_token_end_sample: Option<u64>,
+    buffered_ms: Option<i64>,
+    buffer_drained: bool,
+    buffer_wait_elapsed_ms: u64,
     effective_end_sample: u64,
     effective_decision_sample: u64,
     audio_caught_up: bool,
@@ -1757,7 +1784,14 @@ fn ms_to_samples(ms: u32) -> u64 {
     u64::from(ms).saturating_mul(16_000) / 1_000
 }
 
-const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 25;
+/// How long token end-sample must stay unchanged after audio catch-up before close freezes.
+/// Sized against att_context_right≈80ms + a little decode slack (not a human pause).
+const CLOSE_TOKEN_QUIESCENCE_MS: u64 = 120;
+/// Family-reported internal buffer at/below this is treated as "drained enough" at close.
+const CLOSE_BUFFER_DRAINED_MS: i64 = 20;
+/// Bound how long close will wait for buffered_ms to fall after audio catch-up.
+const CLOSE_BUFFER_WAIT_MS: u64 = 200;
+
 
 fn model_alignment_deadline(timeout_ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(timeout_ms as u64)
@@ -1846,6 +1880,44 @@ fn wait_for_token_quiescence_until(
     }
 }
 
+struct BufferDrainWait {
+    buffered_ms: Option<i64>,
+    drained: bool,
+    elapsed_ms: u64,
+}
+
+/// Wait until the family reports little/no internal buffered audio, or the wait budget ends.
+/// This is a drain *hint*: zero buffer is not a certificate that all tokens for ≤X are out,
+/// but combined with token quiescence it catches right-context still held at close.
+fn wait_for_buffer_drained_until(
+    model_progress: &ModelProgressMap,
+    stream_session_id: &str,
+    deadline: Instant,
+    max_wait: Duration,
+    drained_threshold_ms: i64,
+) -> BufferDrainWait {
+    let started = Instant::now();
+    let wait_deadline = started + max_wait;
+    loop {
+        let now = Instant::now();
+        let buffered_ms = model_progress.buffered_ms(stream_session_id);
+        let drained = buffered_ms.is_some_and(|ms| ms <= drained_threshold_ms);
+        // Unknown buffer (None) means we never observed a model update — do not block forever.
+        if drained || buffered_ms.is_none() || now >= deadline || now >= wait_deadline {
+            return BufferDrainWait {
+                buffered_ms,
+                drained: buffered_ms.is_some_and(|ms| ms <= drained_threshold_ms),
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            };
+        }
+        let remaining = deadline
+            .min(wait_deadline)
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(5));
+        std::thread::sleep(remaining);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn align_model_for_close(
     model_progress: Option<&ModelProgressMap>,
@@ -1890,6 +1962,9 @@ fn align_model_for_close(
     let mut token_quiescence_elapsed_ms = 0;
     let mut audio_committed_sample = None;
     let mut last_token_end_sample = None;
+    let mut buffered_ms = None;
+    let mut buffer_drained = true;
+    let mut buffer_wait_elapsed_ms = 0;
     let mut effective_end_sample = end_sample;
     let mut effective_decision_sample = decision_sample;
 
@@ -1901,6 +1976,21 @@ fn align_model_for_close(
             deadline,
         );
         audio_committed_sample = model_progress.get(stream_session_id);
+
+        // After audio has been fed through the decision sample, wait briefly for the
+        // family's internal right-context/lookahead buffer to drain. This is bounded
+        // so a stuck buffer cannot hang close; token quiescence still follows.
+        let buffer_wait = wait_for_buffer_drained_until(
+            model_progress,
+            stream_session_id,
+            deadline,
+            Duration::from_millis(CLOSE_BUFFER_WAIT_MS),
+            CLOSE_BUFFER_DRAINED_MS,
+        );
+        buffered_ms = buffer_wait.buffered_ms;
+        buffer_drained = buffer_wait.drained;
+        buffer_wait_elapsed_ms = buffer_wait.elapsed_ms;
+
         let token_quiescence = wait_for_token_quiescence_until(
             model_progress,
             stream_session_id,
@@ -1910,6 +2000,7 @@ fn align_model_for_close(
         last_token_end_sample = token_quiescence.last_token_end_sample;
         token_quiescent = token_quiescence.quiescent;
         token_quiescence_elapsed_ms = token_quiescence.elapsed_ms;
+        buffered_ms = model_progress.buffered_ms(stream_session_id).or(buffered_ms);
         apply_trailing_token_extension(
             model_progress,
             stream_session_id,
@@ -1926,6 +2017,9 @@ fn align_model_for_close(
         audio_target_sample,
         audio_committed_sample,
         last_token_end_sample,
+        buffered_ms,
+        buffer_drained,
+        buffer_wait_elapsed_ms,
         audio_caught_up,
         token_quiescent,
         token_quiescence_elapsed_ms,
@@ -2383,9 +2477,15 @@ mod tests {
         let elapsed = started.elapsed();
         let events = harness.drain_events();
 
+        // Close still waits CLOSE_TOKEN_QUIESCENCE_MS for token stability after audio
+        // catch-up, but must NOT keep waiting until last_token_end reaches decision_sample.
         assert!(
-            elapsed < Duration::from_millis(100),
+            elapsed < Duration::from_millis(250),
             "close should not wait for last_token_end_sample to reach the VAD silence decision sample; elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS.saturating_sub(20)),
+            "expected token-quiescence wait (~{CLOSE_TOKEN_QUIESCENCE_MS}ms); elapsed={elapsed:?}"
         );
         assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
         assert_turn_closed(&events, "vad", true, "vad_speech_end");
@@ -2457,14 +2557,16 @@ mod tests {
     }
 
     #[test]
-    fn vad_close_with_model_caught_up_closes_immediately() {
+    fn vad_close_with_model_caught_up_only_waits_token_quiescence() {
         let progress = ModelProgressMap::new();
         progress.start_session_for_test("test.session");
         progress.update(SESSION_ID, 17_920);
+        // Already drained buffer: close should not stall on buffer wait.
+        progress.update_buffered_ms(SESSION_ID, 0);
         let mut harness = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             model_progress: Some(progress),
-            model_alignment_timeout_ms: 100,
+            model_alignment_timeout_ms: 500,
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
@@ -2475,12 +2577,28 @@ mod tests {
         let elapsed = started.elapsed();
         let events = harness.drain_events();
 
+        // Audio already caught up ⇒ no multi-second alignment wait; only the intentional
+        // token-quiescence pad (~CLOSE_TOKEN_QUIESCENCE_MS) remains.
         assert!(
-            elapsed < Duration::from_millis(50),
-            "when model_progress has already reached decision_sample, VAD close should not wait; elapsed={elapsed:?}"
+            elapsed < Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS + 80),
+            "when model_progress has already reached decision_sample, close should only wait token quiescence; elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(CLOSE_TOKEN_QUIESCENCE_MS.saturating_sub(20)),
+            "expected ~{CLOSE_TOKEN_QUIESCENCE_MS}ms token quiescence; elapsed={elapsed:?}"
         );
         assert_reset_action(&actions, "vad", "vad_speech_end", 17_920);
         assert_turn_closed(&events, "vad", true, "vad_speech_end");
+        let alignment = find_event(&events, "turn_close_alignment")
+            .expect("close should emit model alignment instrumentation");
+        assert_eq!(
+            alignment.get("audio_caught_up").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            alignment.get("buffer_drained").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2854,6 +2972,64 @@ mod tests {
         assert_no_event(&late_events, "turn_started");
         assert_no_event(&late_events, "turn_closed");
         assert_no_event(&late_events, "transcript_committed");
+    }
+
+    #[test]
+    fn late_asr_token_without_new_vad_does_not_open_ghost_turn() {
+        // Regression for continuous "Test One" split into two turns:
+        // Smart Turn / VAD closes turn 1, then a late ASR token ("1") arrives
+        // with start_sample past the close decision and no new vad_speech_start.
+        // That token must not invent turn 2.
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: false,
+            semantic_gate_close_enabled: false,
+            model_alignment_timeout_ms: 50,
+            ..Default::default()
+        });
+        harness.send(vad_start(512, 512));
+        // Token for the first word while the turn is open.
+        harness.send(transcript_token(21_760, 23_040, 23_040));
+        harness.drain_events();
+
+        let close_actions = harness.send(vad_end(512, 26_624, 28_160));
+        let close_events = harness.drain_events();
+        assert!(
+            !close_actions.is_empty(),
+            "vad_end should close the first turn; actions={close_actions:#?}"
+        );
+        assert!(
+            find_event(&close_events, "turn_closed").is_some(),
+            "expected turn_closed for first utterance: {close_events:#?}"
+        );
+
+        // Late token after close: timestamps past the closed decision, no new VAD start.
+        let late_actions = harness.send(transcript_token(30_720, 32_000, 32_000));
+        let late_events = harness.drain_events();
+        assert!(
+            late_actions.is_empty(),
+            "late orphan token must not emit detector actions: {late_actions:#?}"
+        );
+        assert_no_event(&late_events, "turn_started");
+        assert_no_event(&late_events, "turn_closed");
+        assert_no_event(&late_events, "transcript_committed");
+        let observed = late_events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str) == Some("turn_signal_observed")
+                && event.get("signal").and_then(Value::as_str)
+                    == Some("transcript_token_late_orphan")
+        });
+        assert!(
+            observed.is_some(),
+            "expected transcript_token_late_orphan observation; events={late_events:#?}"
+        );
+
+        // A real new utterance (new VAD start after close) must still be allowed.
+        harness.send(vad_start(40_000, 40_000));
+        let reopened = harness.drain_events();
+        assert!(
+            find_event(&reopened, "turn_started").is_some(),
+            "new vad_speech_start after close must open a turn: {reopened:#?}"
+        );
     }
 
     #[test]
