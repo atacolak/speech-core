@@ -47,6 +47,8 @@ const MAX_STEPS: u32 = 50;
 const MIN_SPEED: f32 = 0.25;
 const MAX_SPEED: f32 = 4.0;
 const CHILD_KILL_WAIT_SECS: u64 = 2;
+/// Max retained WAV bytes per text chunk (16 MiB) for host-local barge-in align.
+const MAX_RETAIN_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 
 /// WAV constants.
 const WAV_HEADER_MIN_LEN: usize = 44;
@@ -209,6 +211,24 @@ struct DaemonArgs {
     /// Maximum chunk size in characters for pragmatic text chunking.
     #[arg(long, default_value_t = DEFAULT_CHUNK_MAX_CHARS, env = "SPEECH_OUT_CHUNK_MAX_CHARS")]
     chunk_max_chars: usize,
+
+    /// Directory where the daemon retains synthesized WAV bytes for host-local
+    /// barge-in forced alignment (no client SCP). Empty path disables retain.
+    #[arg(
+        long,
+        default_value = "/tmp/speech-out-retain",
+        env = "SPEECH_OUT_RETAIN_DIR"
+    )]
+    retain_dir: PathBuf,
+
+    /// When false, do not write retained WAVs.
+    #[arg(
+        long,
+        default_value_t = true,
+        env = "SPEECH_OUT_RETAIN_WAV",
+        action = clap::ArgAction::Set
+    )]
+    retain_wav: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1626,6 +1646,7 @@ async fn stream_one_supertonic_text_chunk(
     let mut chunk = vec![0u8; 16 * 1024];
     let mut text_chunk_bytes = 0usize;
     let mut text_chunk_seq = 0u64;
+    let mut retain_chunk_audio: Vec<u8> = Vec::new();
     let timeout = Duration::from_secs(args.timeout_secs);
     let mut timed_out = false;
     let mut read_error: Option<anyhow::Error> = None;
@@ -1656,8 +1677,13 @@ async fn stream_one_supertonic_text_chunk(
                 if *global_seq == 0 {
                     metrics.first_audio_mono_ns = Some(now);
                 }
-                if metrics.accumulated_audio.len() < 1024 * 1024 {
+                            if metrics.accumulated_audio.len() < 1024 * 1024 {
                     metrics.accumulated_audio.extend_from_slice(&chunk[..n]);
+                }
+                // Full-fidelity buffer for host-local retain (barge-in FA without client SCP).
+                if retain_chunk_audio.len() < MAX_RETAIN_AUDIO_BYTES {
+                    let room = MAX_RETAIN_AUDIO_BYTES.saturating_sub(retain_chunk_audio.len());
+                    retain_chunk_audio.extend_from_slice(&chunk[..n.min(room)]);
                 }
 
                 let mut chunk_event = json!({
@@ -1777,7 +1803,78 @@ async fn stream_one_supertonic_text_chunk(
     if text_chunk_bytes == 0 {
         bail!("Supertonic returned zero response bytes for text chunk {text_chunk_index}");
     }
+
+    // Host-local retain for barge-in forced align (warm worker reads this path; no SCP).
+    if args.retain_wav && !args.retain_dir.as_os_str().is_empty() && !retain_chunk_audio.is_empty() {
+        if let Err(err) = retain_synthesized_wav(
+            &args.retain_dir,
+            &request.utterance_id,
+            text_chunk_index,
+            &retain_chunk_audio,
+        )
+        .await
+        {
+            warn!(
+                error = %err,
+                utterance_id = %request.utterance_id,
+                text_chunk_index,
+                "failed to retain synthesized wav for host align"
+            );
+        } else {
+            let path = retain_wav_path(&args.retain_dir, &request.utterance_id, text_chunk_index);
+            let _ = send_json_to_sink(
+                ws_tx,
+                json!({
+                    "event": "speech_out_audio_retained",
+                    "utterance_id": request.utterance_id,
+                    "text_chunk_index": text_chunk_index,
+                    "path": path.display().to_string(),
+                    "bytes": retain_chunk_audio.len(),
+                    "daemon_mono_ns": now_mono_ns(),
+                }),
+            )
+            .await;
+        }
+    }
+
     Ok(text_chunk_bytes)
+}
+
+fn retain_wav_path(retain_dir: &Path, utterance_id: &str, text_chunk_index: usize) -> PathBuf {
+    // Keep path shell-safe: uuid-like ids only in practice.
+    let safe: String = utterance_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    retain_dir.join(format!("{safe}_chunk_{text_chunk_index:04}.wav"))
+}
+
+async fn retain_synthesized_wav(
+    retain_dir: &Path,
+    utterance_id: &str,
+    text_chunk_index: usize,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(retain_dir)
+        .await
+        .with_context(|| format!("creating retain dir {}", retain_dir.display()))?;
+    let path = retain_wav_path(retain_dir, utterance_id, text_chunk_index);
+    tokio::fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("writing retained wav {}", path.display()))?;
+    // Best-effort: also publish a stable "latest" pointer for harness fallback.
+    let latest = retain_dir.join("latest.wav");
+    let _ = tokio::fs::write(&latest, bytes).await;
+    let latest_meta = retain_dir.join("latest.json");
+    let meta = json!({
+        "utterance_id": utterance_id,
+        "text_chunk_index": text_chunk_index,
+        "path": path.display().to_string(),
+        "bytes": bytes.len(),
+        "daemon_mono_ns": now_mono_ns(),
+    });
+    let _ = tokio::fs::write(&latest_meta, meta.to_string() + "\n").await;
+    Ok(path)
 }
 
 async fn read_child_stderr(child: &mut Child) -> Result<String> {

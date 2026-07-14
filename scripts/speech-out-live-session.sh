@@ -296,6 +296,10 @@ align_sock="${SPEECH_OUT_ALIGN_SOCK:-/tmp/speech-core-align-worker.sock}"
 align_worker_pid=""
 align_worker_started_here=0
 align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
+# Host-local retained TTS WAV (speech-out daemon writes here; no SCP for align).
+retain_dir_remote="${SPEECH_OUT_RETAIN_DIR_REMOTE:-/tmp/speech-out-retain}"
+assistant_utterance_id_file="$run_dir/assistant_utterance_id"
+assistant_retained_path_file="$run_dir/assistant_retained_host_path"
 assistant_b_feed_pid=""
 assistant_b_watch_pid=""
 assistant_cut_gen=0
@@ -1126,8 +1130,7 @@ finalize_assistant_cut_ctc() {
       --out "$out_json" \
       >>"$trigger_log" 2>&1 || true
   else
-    # 2) Remote warm worker on core host — still SCP wav (harness constraint),
-    #    but model stays loaded so we drop ~1–2s cold load.
+    # 2) Remote warm worker on core host — prefer host-retained WAV (no SCP).
     local use_remote=0 host
     host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
     if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
@@ -1137,25 +1140,59 @@ finalize_assistant_cut_ctc() {
         use_remote=1
       fi
     fi
-    if (( use_remote == 1 )) && [[ -n "$wav" && -f "$wav" && -n "$host" ]]; then
-      local remote_wav remote_py remote_worker remote_sock remote_line
+    if (( use_remote == 1 )) && [[ -n "$host" ]]; then
+      local remote_wav remote_py remote_worker remote_sock remote_line utt retained_hint
       remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
       remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
       remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
       ensure_remote_align_worker || true
-      remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
-      path_used="warm_remote"
-      scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
-      remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-        "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
-         $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
-         --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
-         --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
-        2>>"$trigger_log" || true)"
-      if [[ -n "$remote_line" ]]; then
-        printf '%s\n' "$remote_line" >"$out_json"
+      utt="$(cat "$assistant_utterance_id_file" 2>/dev/null || true)"
+      retained_hint="$(cat "$assistant_retained_path_file" 2>/dev/null || true)"
+      # Prefer deterministic host path (no preflight SSH probes — each costs RTT).
+      remote_wav=""
+      if [[ -n "$retained_hint" ]]; then
+        remote_wav="$retained_hint"
+        path_used="warm_remote_host"
+      elif [[ -n "$utt" ]]; then
+        remote_wav="${retain_dir_remote}/${utt}_chunk_0000.wav"
+        path_used="warm_remote_host"
+      else
+        remote_wav="$retain_dir_remote/latest.wav"
+        path_used="warm_remote_host_latest"
       fi
-      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
+      if [[ -n "$remote_wav" ]]; then
+        echo "[$(date --iso-8601=seconds)] assistant_cut: host-retained wav=$remote_wav (no scp)" >>"$trigger_log"
+        remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+          "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+           $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
+           --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
+           --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
+          2>>"$trigger_log" || true)"
+        if [[ -n "$remote_line" ]]; then
+          printf '%s\n' "$remote_line" >"$out_json"
+        fi
+      fi
+      # If host path failed (empty/missing), legacy SCP client tee.
+      if [[ ! -s "$out_json" ]]; then
+        if [[ -n "$wav" && -f "$wav" ]]; then
+          remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
+          path_used="warm_remote_scp"
+          echo "[$(date --iso-8601=seconds)] assistant_cut: host retain miss; scp fallback" >>"$trigger_log"
+          scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
+          remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+            "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+             $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
+             --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
+             --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
+            2>>"$trigger_log" || true)"
+          if [[ -n "$remote_line" ]]; then
+            printf '%s\n' "$remote_line" >"$out_json"
+          fi
+          ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
+        else
+          echo "[$(date --iso-8601=seconds)] assistant_cut: remote ctc skipped (no host wav / tee)" >>"$trigger_log"
+        fi
+      fi
     elif [[ -n "$align_script" && -f "$align_script" ]]; then
       # 3) Last resort: cold one-shot local python.
       path_used="cold_local"
@@ -1490,6 +1527,12 @@ run_speech_out() {
   )
   if [[ -n "$current_reference" ]]; then play_args+=(--reference "$current_reference"); fi
   if [[ -n "$current_style" ]]; then play_args+=(--style "$current_style"); fi
+  # Stable utterance id so host retain path is deterministic for barge-in align.
+  local utt_id
+  utt_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
+  printf '%s\n' "$utt_id" >"$assistant_utterance_id_file"
+  rm -f "$assistant_retained_path_file" 2>/dev/null || true
+  play_args+=(--utterance-id "$utt_id")
   printf '%s\n' "$current_response_text" >"$tts_expected_file"
   echo 0 >"$tts_echo_deadline_file"
 
@@ -1506,6 +1549,13 @@ run_speech_out() {
       # into sticky operator_alert events instead of raw stderr spam.
       if [[ "$out_line" == "{"* ]]; then
         emit_ui_event "$out_line"
+        # Capture host-retained WAV path for no-SCP align.
+        if [[ "$out_line" == *'"speech_out_audio_retained"'* || "$out_line" == *'speech_out_audio_retained'* ]]; then
+          if [[ -n "${PYTHON3_BIN:-}" ]]; then
+            "$PYTHON3_BIN" -c 'import json,sys; d=json.loads(sys.argv[1]); p=d.get("path") or "";
+print(p)' "$out_line" >"$assistant_retained_path_file" 2>/dev/null || true
+          fi
+        fi
       elif [[ "$out_line" == Error:* || "$out_line" == error:* || "$out_line" == *"playback failed"* ]]; then
         if [[ -n "${PYTHON3_BIN:-}" ]]; then
           emit_ui_event "$("$PYTHON3_BIN" -c 'import json,sys; print(json.dumps({"event":"operator_alert","diagnostic_mono_ns":0,"diagnostic_clock_origin":"harness_local_monotonic","message":sys.argv[1]}))' "$out_line")"
