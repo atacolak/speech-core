@@ -295,6 +295,7 @@ align_worker_script=""
 align_sock="${SPEECH_OUT_ALIGN_SOCK:-/tmp/speech-core-align-worker.sock}"
 align_tcp_port="${SPEECH_OUT_ALIGN_TCP_PORT:-8791}"
 align_tcp_target="${SPEECH_OUT_ALIGN_TCP:-}"  # host:port; auto-derived from core_ws_url when empty
+align_tcp_ready=0  # 1 after successful TCP ping this session (skip per-barge pings)
 align_worker_pid=""
 align_worker_started_here=0
 align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
@@ -1001,6 +1002,66 @@ record_barge_played_ms() {
 }
 
 # --- Warm CTC align worker (model stays loaded; no cold python per barge) ---
+# Bash TCP client: avoids ~100–500ms python process spawn per barge on the laptop.
+align_tcp_host_port() {
+  local target="${1:-$align_tcp_target}"
+  local host port
+  host="${target%:*}"
+  port="${target##*:}"
+  if [[ -z "$host" || -z "$port" || "$host" == "$port" ]]; then
+    return 1
+  fi
+  printf '%s %s' "$host" "$port"
+}
+
+# Send one JSON line to worker, print one JSON line response. Uses bash /dev/tcp.
+align_tcp_request() {
+  local target="$1" payload="$2" timeout_s="${3:-5}"
+  local hp host port
+  hp="$(align_tcp_host_port "$target")" || return 1
+  host="${hp%% *}"
+  port="${hp##* }"
+  # shellcheck disable=SC2094
+  timeout "$timeout_s" bash -c '
+    host="$1"; port="$2"; payload="$3"
+    exec 3<>"/dev/tcp/${host}/${port}" || exit 1
+    printf "%s\n" "$payload" >&3
+    IFS= read -r line <&3 || exit 2
+    printf "%s\n" "$line"
+    exec 3>&- 3<&-
+  ' bash "$host" "$port" "$payload"
+}
+
+align_tcp_ping() {
+  local target="${1:-$align_tcp_target}"
+  local resp
+  resp="$(align_tcp_request "$target" '{"cmd":"ping"}' 2)" || return 1
+  [[ "$resp" == *'"ok": true'* || "$resp" == *'"ok":true'* ]]
+}
+
+# Build align request JSON (jq if present, else python one-liner, else crude escape).
+align_build_request_json() {
+  local wav="$1" intended="$2" played_ms="$3" speed="$4" backend="$5"
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc \
+      --arg wav "$wav" \
+      --arg intended "$intended" \
+      --arg backend "$backend" \
+      --argjson played_ms "$played_ms" \
+      --argjson speed "$speed" \
+      '{cmd:"align",wav:$wav,intended:$intended,played_ms:$played_ms,speed:$speed,backend:$backend}'
+    return $?
+  fi
+  if [[ -n "${PYTHON3_BIN:-}" && -x "${PYTHON3_BIN:-}" ]]; then
+    "$PYTHON3_BIN" -c 'import json,sys; print(json.dumps({"cmd":"align","wav":sys.argv[1],"intended":sys.argv[2],"played_ms":int(sys.argv[3]),"speed":float(sys.argv[4]),"backend":sys.argv[5]}))' \
+      "$wav" "$intended" "$played_ms" "$speed" "$backend"
+    return $?
+  fi
+  # last resort: no special chars assumed
+  printf '{"cmd":"align","wav":"%s","intended":"%s","played_ms":%s,"speed":%s,"backend":"%s"}\n' \
+    "$wav" "$intended" "$played_ms" "$speed" "$backend"
+}
+
 align_worker_alive() {
   [[ -S "$align_sock" ]] || return 1
   [[ -n "$align_worker_script" && -f "$align_worker_script" ]] || return 1
@@ -1026,19 +1087,17 @@ start_align_worker_local() {
   SPEECH_OUT_CTC_MODEL="${SPEECH_OUT_CTC_MODEL:-wav2vec2_base}" \
   SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
   PYTHONPATH="$(dirname "$align_worker_script")/..${PYTHONPATH:+:$PYTHONPATH}" \
-    "$align_python" "$align_worker_script" --sock "$align_sock" --serve \
+    "$align_python" "$align_worker_script" --sock "$align_sock" --tcp-bind 0.0.0.0 --tcp-port "${align_tcp_port:-8791}" --serve \
     >>"$assistant_cut_dir/align_worker.log" 2>&1 &
   align_worker_pid=$!
   align_worker_started_here=1
   printf '%s\n' "$align_worker_pid" >"$assistant_cut_dir/align_worker.pid"
-  # Wait for socket + ping (model load can take a few seconds first time).
   local i
   for i in $(seq 1 60); do
     if align_worker_alive; then
       echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker ready pid=$align_worker_pid" >>"$trigger_log"
       return 0
     fi
-    # died?
     if ! kill -0 "$align_worker_pid" 2>/dev/null; then
       echo "[$(date --iso-8601=seconds)] assistant_cut: warm worker died during start" >>"$trigger_log"
       align_worker_pid=""
@@ -1052,7 +1111,7 @@ start_align_worker_local() {
 }
 
 ensure_remote_align_worker() {
-  # Keep a warm worker on the speech-core host listening on TCP (no per-barge SSH).
+  # Keep warm worker on speech-core host (TCP). Skip work if already ready this session.
   local host remote_py remote_worker remote_sock remote_port
   host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
   [[ -n "$host" ]] || return 1
@@ -1062,24 +1121,21 @@ ensure_remote_align_worker() {
   remote_port="${align_tcp_port:-8791}"
   align_tcp_target="${align_tcp_target:-${host}:${remote_port}}"
 
-  # Fast path: TCP ping (no SSH).
-  if [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
-    if "$align_python" "$align_worker_script" --tcp "$align_tcp_target" --ping >/dev/null 2>&1; then
-      echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker up $align_tcp_target" >>"$trigger_log"
-      return 0
-    fi
-  else
-    # Minimal TCP check without python client
-    if (echo '{"cmd":"ping"}' | timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${remote_port}" 2>/dev/null); then
-      :
-    fi
+  if (( align_tcp_ready == 1 )); then
+    return 0
+  fi
+
+  # Fast path: bash /dev/tcp ping (no python spawn).
+  if align_tcp_ping "$align_tcp_target"; then
+    align_tcp_ready=1
+    echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker up $align_tcp_target" >>"$trigger_log"
+    return 0
   fi
 
   echo "[$(date --iso-8601=seconds)] assistant_cut: starting remote TCP worker host=$host port=$remote_port" >>"$trigger_log"
-  # One-time SSH only to (re)start the daemon if TCP is down.
   ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
     "rm -f $(printf '%q' "$remote_sock"); \
-     pkill -f 'align_worker.py --sock' 2>/dev/null || true; \
+     pkill -f 'align_worker.py' 2>/dev/null || true; \
      SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} \
      SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} \
      SPEECH_OUT_ALIGN_TCP_PORT=${remote_port} \
@@ -1091,11 +1147,10 @@ ensure_remote_align_worker() {
 
   local i
   for i in $(seq 1 40); do
-    if [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
-      if "$align_python" "$align_worker_script" --tcp "$align_tcp_target" --ping >/dev/null 2>&1; then
-        echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker ready $align_tcp_target" >>"$trigger_log"
-        return 0
-      fi
+    if align_tcp_ping "$align_tcp_target"; then
+      align_tcp_ready=1
+      echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker ready $align_tcp_target" >>"$trigger_log"
+      return 0
     fi
     sleep 0.5
   done
@@ -1171,16 +1226,28 @@ finalize_assistant_cut_ctc() {
       retained_hint="$(cat "$assistant_retained_path_file" 2>/dev/null || true)"
       if [[ -n "$retained_hint" ]]; then
         remote_wav="$retained_hint"
-        path_used="warm_tcp_host"
+        path_used="warm_tcp_bash"
       elif [[ -n "$utt" ]]; then
         remote_wav="${retain_dir_remote}/${utt}_chunk_0000.wav"
-        path_used="warm_tcp_host"
+        path_used="warm_tcp_bash"
       else
         remote_wav="$retain_dir_remote/latest.wav"
-        path_used="warm_tcp_host_latest"
+        path_used="warm_tcp_bash_latest"
       fi
       echo "[$(date --iso-8601=seconds)] assistant_cut: TCP align $align_tcp_target wav=$remote_wav" >>"$trigger_log"
-      if [[ -n "$align_worker_script" && -f "$align_worker_script" ]]; then
+      # Hot path: bash /dev/tcp (no python process spawn). jq builds JSON.
+      local req_json resp_line
+      req_json="$(align_build_request_json "$remote_wav" "$intended" "$played_ms" "$speed" "$backend" 2>>"$trigger_log" || true)"
+      if [[ -n "$req_json" ]]; then
+        resp_line="$(align_tcp_request "$align_tcp_target" "$req_json" 10 2>>"$trigger_log" || true)"
+        if [[ -n "$resp_line" && "$resp_line" == *"spoken_prefix"* ]]; then
+          printf '%s\n' "$resp_line" >"$out_json"
+          align_tcp_ready=1
+        fi
+      fi
+      # Fallback: python client if bash tcp failed.
+      if [[ ! -s "$out_json" ]] && [[ -n "$align_worker_script" && -f "$align_worker_script" && -n "$align_python" ]]; then
+        echo "[$(date --iso-8601=seconds)] assistant_cut: bash tcp miss; python client fallback" >>"$trigger_log"
         SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
         "$align_python" "$align_worker_script" \
           --tcp "$align_tcp_target" \
