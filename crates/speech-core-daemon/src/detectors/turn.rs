@@ -1425,6 +1425,10 @@ impl TurnSession {
             // Clear turn_id from shared state so subsequent transcript_updates
             // carry turn_id: null.
             progress.set_current_turn_id(session_id, None);
+            // Freeze the snapshot ring through the closing turn's audio. Late
+            // tokens (especially trailing ".") must not accumulate for the next
+            // turn to inherit. Lifted when the next turn opens.
+            progress.freeze_tokens_through(session_id, snapshot_end_sample.max(decision_sample));
         }
         writer.write(&TranscriptCommittedEvent {
             event: "transcript_committed",
@@ -3146,11 +3150,11 @@ mod tests {
 
     #[test]
     fn per_turn_committed_snapshot_isolates_punctuation_by_turn_boundaries() {
-        // Verifies that punctuation tokens arriving after a turn close are
-        // included in the correct turn's snapshot and do not leak into the
-        // next turn's committed text.
+        // After commit, orphan punctuation must not enter the snapshot ring and
+        // must not leak into the next turn's committed text.
         let progress = ModelProgressMap::new();
         progress.start_session_for_test(SESSION_ID);
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:0")));
 
         // Turn 0: tokens "Hello" (0-8000) and "world" (8000-16000).
         progress.record_token_snapshot(
@@ -3180,7 +3184,11 @@ mod tests {
         assert_eq!(turn0_text, "Helloworld");
         assert_eq!(turn0_count, 2);
 
-        // Late punctuation "." for turn 0 arrives (index 2, between turns).
+        // Simulate commit freeze: clear open turn and freeze through close sample.
+        progress.set_current_turn_id(SESSION_ID, None);
+        progress.freeze_tokens_through(SESSION_ID, 17_920);
+
+        // Late punctuation "." for turn 0 — must be dropped (not stored).
         progress.record_token_snapshot(
             SESSION_ID,
             crate::model::CommittedTokenSnapshot {
@@ -3190,33 +3198,61 @@ mod tests {
                 end_sample: 17_240,
             },
         );
-        progress.update_committed_text(SESSION_ID, "Helloworld.", 3, 2);
-
-        // Turn 1 starts at sample 32_000. Baseline captured at token count 3.
         let baseline = progress
             .snapshot_token_count_at_turn_start(SESSION_ID)
             .unwrap();
-        assert_eq!(baseline, 3);
+        // Orphan "." did not advance the ring.
+        assert_eq!(baseline, 2);
 
-        // Turn 1: tokens "Yes" (32_000-40_000).
+        // Turn 1 opens and records speech.
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:1")));
         progress.record_token_snapshot(
             SESSION_ID,
             crate::model::CommittedTokenSnapshot {
-                index: 3,
+                index: 2,
                 text: "Yes".into(),
                 start_sample: 32_000,
                 end_sample: 40_000,
             },
         );
-        progress.update_committed_text(SESSION_ID, "Helloworld.Yes", 4, 3);
 
-        // Turn 1 closes at end_sample=49_920.
         let (turn1_text, turn1_count, _) = progress
             .per_turn_committed_snapshot(SESSION_ID, baseline, 32_000, 49_920)
             .unwrap();
-        // Turn 1 must NOT contain the late "." from turn 0 (index 2 < baseline 3).
         assert_eq!(turn1_text, "Yes");
         assert_eq!(turn1_count, 1);
+    }
+
+    #[test]
+    fn orphan_leading_period_stripped_even_if_snapshotted() {
+        // Defense in depth: if a punctuation token somehow sits at the front of
+        // a turn's slice, committed text must not start with it.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:1")));
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: ".".into(),
+                start_sample: 30_000,
+                end_sample: 30_100,
+            },
+        );
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 1,
+                text: " Yes".into(),
+                start_sample: 32_000,
+                end_sample: 40_000,
+            },
+        );
+        let (text, count, _) = progress
+            .per_turn_committed_snapshot(SESSION_ID, 0, 30_000, 49_920)
+            .unwrap();
+        assert_eq!(text, " Yes");
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -3287,6 +3323,8 @@ mod tests {
         // speech-evidence token after last_selected) and never reach ".".
         let progress = ModelProgressMap::new();
         progress.start_session_for_test(SESSION_ID);
+        // Keep a turn open so punctuation is still recorded for tail attachment.
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:open")));
 
         // Turn 1 token.
         progress.record_token_snapshot(
@@ -3345,6 +3383,7 @@ mod tests {
         // when it is the very next index after the last selected token.
         let progress = ModelProgressMap::new();
         progress.start_session_for_test(SESSION_ID);
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:open")));
 
         progress.record_token_snapshot(
             SESSION_ID,
@@ -3381,6 +3420,7 @@ mod tests {
         // successive index is punctuation-only.
         let progress = ModelProgressMap::new();
         progress.start_session_for_test(SESSION_ID);
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:open")));
 
         progress.record_token_snapshot(
             SESSION_ID,
@@ -3468,6 +3508,7 @@ mod tests {
         // tokens.
         let progress = ModelProgressMap::new();
         progress.start_session_for_test(SESSION_ID);
+        progress.set_current_turn_id(SESSION_ID, Some(format!("{SESSION_ID}:turn:0")));
 
         // "Let's see the" fits inside the VAD segment (0..84_992).
         for (idx, text, start, end) in [

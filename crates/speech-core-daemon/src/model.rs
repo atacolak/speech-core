@@ -47,6 +47,9 @@ pub struct ModelProgressState {
     /// The currently open turn_id, set by TurnManager on turn_started and cleared on
     /// turn_closed. Model worker reads this for transcript_update/token event tagging.
     pub current_turn_id: Option<String>,
+    /// While no turn is open, drop snapshot tokens with end_sample <= this.
+    /// Set on transcript_committed; cleared when the next turn opens.
+    pub suppress_tokens_at_or_before_sample: Option<u64>,
     /// The per-turn text dispatched in the last transcript_committed event. Used by
     /// transcript_finalized (diagnostic-only) to detect late session-end revisions.
     pub last_dispatched_text: Option<String>,
@@ -193,6 +196,7 @@ impl ModelProgressMap {
                     committed_token_count: 0,
                     revision: 0,
                     current_turn_id: None,
+                    suppress_tokens_at_or_before_sample: None,
                     last_dispatched_text: None,
                     last_dispatched_turn_id: None,
                     last_dispatched_turn_start_sample: None,
@@ -259,7 +263,24 @@ impl ModelProgressMap {
     pub fn set_current_turn_id(&self, session_id: &str, turn_id: Option<String>) {
         if let Ok(mut map) = self.inner.lock() {
             if let Some(state) = map.get_mut(session_id) {
-                state.current_turn_id = turn_id;
+                state.current_turn_id = turn_id.clone();
+                // Opening a turn lifts the post-close freeze so real new speech
+                // can be snapshotted again.
+                if turn_id.is_some() {
+                    state.suppress_tokens_at_or_before_sample = None;
+                }
+            }
+        }
+    }
+
+    /// After transcript_committed, freeze the snapshot ring so late tokens for
+    /// the closed turn (trailing ".", delayed ASR) are not stored for the next
+    /// turn to inherit. Cleared when the next turn opens.
+    pub fn freeze_tokens_through(&self, session_id: &str, sample: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(state) = map.get_mut(session_id) {
+                let prev = state.suppress_tokens_at_or_before_sample.unwrap_or(0);
+                state.suppress_tokens_at_or_before_sample = Some(prev.max(sample));
             }
         }
     }
@@ -298,6 +319,22 @@ impl ModelProgressMap {
     pub fn record_token_snapshot(&self, session_id: &str, snapshot: CommittedTokenSnapshot) {
         if let Ok(mut map) = self.inner.lock() {
             if let Some(state) = map.get_mut(session_id) {
+                let is_punct_only = !snapshot.text.chars().any(|ch| ch.is_alphanumeric());
+                // After commit, current_turn_id is None. Orphan punctuation (often
+                // a trailing ".") must not enter the snapshot ring or the next turn
+                // inherits it as a leading period.
+                if is_punct_only && state.current_turn_id.is_none() {
+                    return;
+                }
+                // Hard freeze watermark: while no turn is open, drop tokens whose
+                // audio is entirely at/before the closed turn's freeze sample.
+                if state.current_turn_id.is_none() {
+                    if let Some(min) = state.suppress_tokens_at_or_before_sample {
+                        if snapshot.end_sample <= min {
+                            return;
+                        }
+                    }
+                }
                 state.committed_tokens.push(snapshot);
                 state.committed_token_count = state.committed_tokens.len() as u32;
             }
@@ -372,6 +409,15 @@ impl ModelProgressMap {
                         expected_idx += 1;
                     }
                     selected.append(&mut extra);
+                }
+                // Drop leading punctuation-only tokens. A trailing "." from the
+                // previous utterance must never become the start of this turn's
+                // committed text even if it slipped into the snapshot ring.
+                while selected
+                    .first()
+                    .is_some_and(|t| !t.text.chars().any(|ch| ch.is_alphanumeric()))
+                {
+                    selected.remove(0);
                 }
                 let token_count = selected.len() as u32;
                 let text: String = selected
