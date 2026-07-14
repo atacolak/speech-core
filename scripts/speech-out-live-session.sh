@@ -293,9 +293,12 @@ align_remote="${SPEECH_OUT_ALIGN_REMOTE:-auto}"  # auto|1|0 — ssh to core host
 align_script=""
 align_worker_script=""
 align_sock="${SPEECH_OUT_ALIGN_SOCK:-/tmp/speech-core-align-worker.sock}"
+align_tcp_ready_file="${assistant_cut_dir}/align_tcp_ready"
+align_prefer_remote_file="${assistant_cut_dir}/align_prefer_remote"
 align_tcp_port="${SPEECH_OUT_ALIGN_TCP_PORT:-8791}"
 align_tcp_target="${SPEECH_OUT_ALIGN_TCP:-}"  # host:port; auto-derived from core_ws_url when empty
 align_tcp_ready=0  # 1 after successful TCP ping this session (skip per-barge pings)
+align_prefer_remote=-1  # -1 unknown, 0 local torch ok, 1 force remote TCP (cached)
 align_worker_pid=""
 align_worker_started_here=0
 align_window_ms="${SPEECH_OUT_ALIGN_WINDOW_MS:-2000}"
@@ -1121,13 +1124,17 @@ ensure_remote_align_worker() {
   remote_port="${align_tcp_port:-8791}"
   align_tcp_target="${align_tcp_target:-${host}:${remote_port}}"
 
-  if (( align_tcp_ready == 1 )); then
+  # File-backed ready flag (cut jobs run in subshells; in-memory flag does not stick).
+  if [[ -f "${align_tcp_ready_file:-}" ]] || (( align_tcp_ready == 1 )); then
+    align_tcp_ready=1
     return 0
   fi
 
   # Fast path: bash /dev/tcp ping (no python spawn).
   if align_tcp_ping "$align_tcp_target"; then
     align_tcp_ready=1
+    mkdir -p "$(dirname "$align_tcp_ready_file")" 2>/dev/null || true
+    : >"$align_tcp_ready_file" 2>/dev/null || true
     echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker up $align_tcp_target" >>"$trigger_log"
     return 0
   fi
@@ -1149,6 +1156,8 @@ ensure_remote_align_worker() {
   for i in $(seq 1 40); do
     if align_tcp_ping "$align_tcp_target"; then
       align_tcp_ready=1
+      mkdir -p "$(dirname "$align_tcp_ready_file")" 2>/dev/null || true
+      : >"$align_tcp_ready_file" 2>/dev/null || true
       echo "[$(date --iso-8601=seconds)] assistant_cut: remote TCP worker ready $align_tcp_target" >>"$trigger_log"
       return 0
     fi
@@ -1190,8 +1199,41 @@ finalize_assistant_cut_ctc() {
   t0="$(($(date +%s%N) / 1000000))"
   path_used="cold"
 
-  # 1) Local warm worker (sfUB dogfood when torch is local).
-  if align_worker_alive || start_align_worker_local; then
+  # Decide remote vs local once per session. Never spawn python just to learn
+  # "no torch on laptop" on every barge (~60–100ms cold start each probe).
+  local use_remote=0 host
+  host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
+  if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
+    use_remote=1
+    align_prefer_remote=1
+    mkdir -p "$(dirname "${align_prefer_remote_file:-/tmp}")" 2>/dev/null || true
+    : >"$align_prefer_remote_file" 2>/dev/null || true
+  elif [[ "$align_remote" == "0" || "$align_remote" == "false" || "$align_remote" == "no" ]]; then
+    use_remote=0
+    align_prefer_remote=0
+    rm -f "$align_prefer_remote_file" 2>/dev/null || true
+  elif [[ -f "${align_prefer_remote_file:-}" ]] || [[ -f "${align_tcp_ready_file:-}" ]] || (( align_prefer_remote == 1 )) || (( align_tcp_ready == 1 )); then
+    use_remote=1
+    align_prefer_remote=1
+  elif (( align_prefer_remote == 0 )); then
+    use_remote=0
+  elif [[ -S "$align_sock" ]] && align_worker_alive; then
+    use_remote=0
+    align_prefer_remote=0
+  else
+    # auto: prefer remote TCP when core host is set (laptop path). Skip torch probe.
+    if [[ -n "$host" ]]; then
+      use_remote=1
+      align_prefer_remote=1
+      mkdir -p "$(dirname "${align_prefer_remote_file:-/tmp}")" 2>/dev/null || true
+      : >"$align_prefer_remote_file" 2>/dev/null || true
+    else
+      use_remote=0
+    fi
+  fi
+
+  # 1) Local warm worker only when we already know local is preferred.
+  if (( use_remote == 0 )) && { align_worker_alive || start_align_worker_local; }; then
     path_used="warm_local"
     SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
     "$align_python" "$align_worker_script" \
@@ -1204,18 +1246,7 @@ finalize_assistant_cut_ctc() {
       --speed "$speed" \
       --out "$out_json" \
       >>"$trigger_log" 2>&1 || true
-  else
-    # 2) Remote warm worker via TCP (host-retained WAV). No SSH/SCP on hot path.
-    local use_remote=0 host
-    host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
-    if [[ "$align_remote" == "1" || "$align_remote" == "true" || "$align_remote" == "yes" ]]; then
-      use_remote=1
-    elif [[ "$align_remote" == "auto" ]]; then
-      if ! "$align_python" -c 'import torchaudio' >/dev/null 2>&1; then
-        use_remote=1
-      fi
-    fi
-    if (( use_remote == 1 )) && [[ -n "$host" ]]; then
+  elif (( use_remote == 1 )) && [[ -n "$host" ]]; then
       local remote_wav utt retained_hint
       if [[ -z "$align_tcp_target" ]]; then
         align_tcp_target="${host}:${align_tcp_port:-8791}"
@@ -1243,6 +1274,8 @@ finalize_assistant_cut_ctc() {
         if [[ -n "$resp_line" && "$resp_line" == *"spoken_prefix"* ]]; then
           printf '%s\n' "$resp_line" >"$out_json"
           align_tcp_ready=1
+          mkdir -p "$(dirname "$align_tcp_ready_file")" 2>/dev/null || true
+          : >"$align_tcp_ready_file" 2>/dev/null || true
         fi
       fi
       # Fallback: python client if bash tcp failed.
@@ -1281,22 +1314,21 @@ finalize_assistant_cut_ctc() {
         fi
         ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
       fi
-    elif [[ -n "$align_script" && -f "$align_script" ]]; then
-      # 3) Last resort: cold one-shot local python.
-      path_used="cold_local"
-      SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
-      "$align_python" "$align_script" \
-        --backend "$backend" \
-        --wav "${wav:-}" \
-        --intended "$intended" \
-        --played-ms "$played_ms" \
-        --speed "$speed" \
-        --out "$out_json" \
-        >>"$trigger_log" 2>&1 || true
-    else
-      echo "[$(date --iso-8601=seconds)] assistant_cut: ctc skipped (no worker/script)" >>"$trigger_log"
-      return 1
-    fi
+  elif [[ -n "$align_script" && -f "$align_script" ]]; then
+    # 3) Last resort: cold one-shot local python.
+    path_used="cold_local"
+    SPEECH_OUT_ALIGN_WINDOW_MS="$align_window_ms" \
+    "$align_python" "$align_script" \
+      --backend "$backend" \
+      --wav "${wav:-}" \
+      --intended "$intended" \
+      --played-ms "$played_ms" \
+      --speed "$speed" \
+      --out "$out_json" \
+      >>"$trigger_log" 2>&1 || true
+  else
+    echo "[$(date --iso-8601=seconds)] assistant_cut: ctc skipped (no worker/script)" >>"$trigger_log"
+    return 1
   fi
 
   t1="$(($(date +%s%N) / 1000000))"
@@ -1305,14 +1337,18 @@ finalize_assistant_cut_ctc() {
     return 1
   fi
 
-  # out may be pretty or single-line; normalize
-  if [[ -n "${PYTHON3_BIN:-}" ]]; then
+  # out may be pretty or single-line; prefer jq (no python spawn).
+  cut_line=""; conf=0; lat=0
+  if command -v jq >/dev/null 2>&1; then
+    cut_line="$(jq -r '.spoken_prefix // empty' "$out_json" 2>/dev/null || true)"
+    conf="$(jq -r '.confidence // 0' "$out_json" 2>/dev/null || echo 0)"
+    lat="$(jq -r '.align_latency_ms // 0' "$out_json" 2>/dev/null || echo 0)"
+    backend="$(jq -r '.backend_id // "ctc_forced"' "$out_json" 2>/dev/null || echo ctc_forced)"
+  elif [[ -n "${PYTHON3_BIN:-}" ]]; then
     cut_line="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("spoken_prefix") or "")' "$out_json" 2>/dev/null || true)"
     conf="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("confidence",0))' "$out_json" 2>/dev/null || echo 0)"
     lat="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("align_latency_ms",0))' "$out_json" 2>/dev/null || echo 0)"
     backend="$("$PYTHON3_BIN" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("backend_id","ctc_forced"))' "$out_json" 2>/dev/null || echo ctc_forced)"
-  else
-    cut_line=""
   fi
   [[ -n "$cut_line" ]] || return 1
 
