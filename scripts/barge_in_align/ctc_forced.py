@@ -1,20 +1,21 @@
-"""CTC forced aligner (torchaudio MMS_FA) on played assistant audio.
+"""CTC forced aligner on played assistant audio.
 
-Uses *both* waveform and intended text:
-  - audio → frame-level CTC emissions (acoustic evidence)
-  - intended words → token ids
-  - Viterbi forced alignment → per-word time spans on the *full* teed clip
-  - cut = words whose end_ms <= played_ms
+Uses *both* waveform and intended text (not text-only):
+  audio → CTC emissions, intended chars → targets, Viterbi → word end times,
+  cut = words with end_ms <= played_ms.
 
-Important: we do NOT trim the waveform to played_ms before alignment.
-Forced alignment always places the whole transcript into whatever audio you
-give it — trimming would squash every word into the short prefix and always
-look "fully spoken." Instead align on the full TTS wav, then gate by time.
+Default model: torchaudio WAV2VEC2_ASR_BASE_960H (~94M, English chars).
+Override with SPEECH_OUT_CTC_MODEL=mms_fa|wav2vec2_base (default wav2vec2_base).
+
+Important: align on the *full* teed clip, then gate by played_ms. Trimming the
+waveform before forced-align would squash the whole transcript into the short
+prefix and always look fully spoken.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from functools import lru_cache
@@ -23,13 +24,11 @@ from typing import Any
 
 from .backend import AlignCursor, approx_wallclock
 
-_NON_ALIGN_RE = re.compile(r"[^a-z']+")
+_NON_LETTER_RE = re.compile(r"[^a-z']+")
 
 
-def _normalize_word(w: str) -> str:
-    w = w.lower().strip()
-    w = _NON_ALIGN_RE.sub("", w)
-    return w
+def _normalize_word_en(w: str) -> str:
+    return _NON_LETTER_RE.sub("", w.lower().strip())
 
 
 def _load_wav_mono_16k(path: Path):
@@ -44,31 +43,276 @@ def _load_wav_mono_16k(path: Path):
     return wav.squeeze(0), sr
 
 
-@lru_cache(maxsize=1)
-def _load_mms_fa():
-    """Lazy singleton: model + tokenizer + aligner (CPU)."""
+def _model_choice() -> str:
+    return (os.environ.get("SPEECH_OUT_CTC_MODEL") or "wav2vec2_base").strip().lower()
+
+
+@lru_cache(maxsize=2)
+def _load_pack(model_id: str):
     import torch
-    from torchaudio.pipelines import MMS_FA
+    import torchaudio
+    from torchaudio.pipelines import MMS_FA, WAV2VEC2_ASR_BASE_960H
 
     device = torch.device("cpu")
-    model = MMS_FA.get_model()
-    model.eval()
-    model.to(device)
-    tokenizer = MMS_FA.get_tokenizer()
-    aligner = MMS_FA.get_aligner()
+    if model_id in ("mms_fa", "mms", "fa"):
+        bundle = MMS_FA
+        model = bundle.get_model()
+        model.eval().to(device)
+        return {
+            "id": "mms_fa",
+            "kind": "mms_fa",
+            "model": model,
+            "tokenizer": bundle.get_tokenizer(),
+            "aligner": bundle.get_aligner(),
+            "sample_rate": int(bundle.sample_rate),
+            "device": device,
+            "bundle": bundle,
+            "labels": list(bundle.get_labels()),
+        }
+
+    # Default: English wav2vec2 base ASR (smaller than MMS_FA).
+    bundle = WAV2VEC2_ASR_BASE_960H
+    model = bundle.get_model()
+    model.eval().to(device)
+    labels = list(bundle.get_labels())  # ('-', '|', 'E', 'T', ...)
+    # blank is index 0 ('-') in torchaudio ASR bundles
+    blank = 0
+    char_to_idx = {c: i for i, c in enumerate(labels)}
     return {
+        "id": "wav2vec2_base",
+        "kind": "wav2vec2_base",
         "model": model,
-        "tokenizer": tokenizer,
-        "aligner": aligner,
-        "sample_rate": int(MMS_FA.sample_rate),
+        "sample_rate": int(bundle.sample_rate),
         "device": device,
-        "bundle": MMS_FA,
+        "bundle": bundle,
+        "labels": labels,
+        "blank": blank,
+        "char_to_idx": char_to_idx,
+        "normalize_waveform": bool(getattr(bundle, "_normalize_waveform", False)),
     }
 
 
 def preload() -> dict[str, Any]:
-    """Warm weights into memory (call at session start)."""
-    return _load_mms_fa()
+    return _load_pack(_model_choice())
+
+
+def _align_wav2vec2_base(pack, waveform, words: list[str], played_ms: int, path: Path, t0: float, speed: float) -> AlignCursor:
+    import torch
+    import torchaudio.functional as F
+
+    device = pack["device"]
+    with torch.inference_mode():
+        emissions, _ = pack["model"](waveform.to(device))
+        # emissions: [batch, time, n_class]
+        if emissions.dim() == 3:
+            emission = emissions[0]
+        else:
+            emission = emissions
+        emission = emission.cpu()
+        log_probs = torch.log_softmax(emission, dim=-1)
+
+    # Build target char sequence with word-boundary '|' like LibriSpeech CTC.
+    # Map original word index → whether it contributed chars.
+    char_to_idx = pack["char_to_idx"]
+    targets: list[int] = []
+    # For each original word, the index of its last target token (or None if skipped)
+    word_last_target_index: list[int | None] = []
+    for i, w in enumerate(words):
+        nw = _normalize_word_en(w)
+        if not nw:
+            word_last_target_index.append(None)
+            continue
+        # uppercase letters as in labels
+        chars = list(nw.upper())
+        if any(c not in char_to_idx for c in chars):
+            word_last_target_index.append(None)
+            continue
+        if targets and targets[-1] != char_to_idx.get("|", -1):
+            # word separator
+            if "|" in char_to_idx:
+                targets.append(char_to_idx["|"])
+        for c in chars:
+            targets.append(char_to_idx[c])
+        word_last_target_index.append(len(targets) - 1)
+
+    if not targets:
+        fb = approx_wallclock(" ".join(words), played_ms, speed=speed)
+        fb.detail = {**(fb.detail or {}), "fallback_reason": "no_alignable_words", "model": pack["id"]}
+        return fb
+
+    targets_t = torch.tensor(targets, dtype=torch.int32)
+    # forced_align expects [batch, time, n_class] log_probs and [batch, target_len]
+    try:
+        aligned_tokens, scores = F.forced_align(
+            log_probs.unsqueeze(0),
+            targets_t.unsqueeze(0),
+            blank=pack["blank"],
+        )
+    except Exception as exc:
+        fb = approx_wallclock(" ".join(words), played_ms, speed=speed)
+        fb.detail = {
+            **(fb.detail or {}),
+            "fallback_reason": "forced_align_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "model": pack["id"],
+        }
+        fb.align_latency_ms = (time.perf_counter() - t0) * 1000.0
+        return fb
+
+    # aligned_tokens: [batch, time] token ids per frame (blank-filled)
+    aligned = aligned_tokens[0].tolist()
+    n_frames = len(aligned)
+    audio_s = float(waveform.size(-1)) / float(pack["sample_rate"])
+    # waveform was [1, samples]
+    frame_hz = (n_frames / audio_s) if audio_s > 0 else 50.0
+
+    # For each non-blank target token index, find last frame where it appears
+    # after accounting for CTC path. Simpler: use merge_tokens if available.
+    try:
+        spans = F.merge_tokens(aligned_tokens[0], scores[0])
+        # spans: list of TokenSpan for non-blank runs in order of targets
+        # Map target position → end frame
+        target_end_frame: list[int] = []
+        for sp in spans:
+            target_end_frame.append(int(sp.end))
+    except Exception:
+        # Fallback: walk frames
+        target_end_frame = []
+        ti = 0
+        last_f = 0
+        for f, tok in enumerate(aligned):
+            if tok == pack["blank"]:
+                continue
+            if ti < len(targets) and tok == targets[ti]:
+                last_f = f
+                # peek if next nonblank continues same? CTC can repeat
+                # record end when token changes or end
+                target_end_frame.append(f)
+                # advance only when next different target needed — crude
+                ti += 1
+        # This fallback is imperfect; prefer merge_tokens path.
+
+    # word end = end frame of last char of that word
+    word_ends_ms: list[float] = []
+    spoken = 0
+    cutoff = float(played_ms + 40)
+    for wi, last_ti in enumerate(word_last_target_index):
+        if last_ti is None:
+            # unalignable punctuation word: inherit previous timing decision
+            if spoken == wi and wi > 0:
+                # count as spoken if previous was
+                spoken = wi + 1
+            word_ends_ms.append(word_ends_ms[-1] if word_ends_ms else 0.0)
+            continue
+        if last_ti >= len(target_end_frame):
+            break
+        end_f = target_end_frame[last_ti]
+        end_ms = 1000.0 * end_f / frame_hz
+        word_ends_ms.append(end_ms)
+        if end_ms <= cutoff:
+            spoken = wi + 1
+        else:
+            break
+
+    if spoken <= 0:
+        if played_ms >= 80 and words:
+            prefix, spoken = words[0], 1
+        else:
+            prefix, spoken = "", 0
+    else:
+        prefix = " ".join(words[:spoken])
+
+    ms = (time.perf_counter() - t0) * 1000.0
+    return AlignCursor(
+        spoken_prefix=prefix,
+        word_index=spoken,
+        intended_text=" ".join(words),
+        backend_id="ctc_forced",
+        confidence=0.7 if spoken else 0.2,
+        align_latency_ms=ms,
+        played_ms=played_ms,
+        audio_path=str(path),
+        detail={
+            "model": pack["id"],
+            "n_frames": n_frames,
+            "frame_hz": frame_hz,
+            "audio_ms": int(audio_s * 1000),
+            "cutoff_ms": cutoff,
+            "word_ends_ms": [round(x, 1) for x in word_ends_ms],
+            "n_targets": len(targets),
+        },
+    )
+
+
+def _align_mms_fa(pack, waveform, words: list[str], played_ms: int, path: Path, t0: float, speed: float) -> AlignCursor:
+    import torch
+
+    with torch.inference_mode():
+        emission, _ = pack["model"](waveform.to(pack["device"]))
+        if emission.dim() == 3:
+            emission = emission[0]
+        emission = emission.cpu()
+
+    norm_words: list[str] = []
+    orig_index: list[int] = []
+    for i, w in enumerate(words):
+        nw = _normalize_word_en(w)
+        if not nw:
+            continue
+        if any(c not in pack["tokenizer"].dictionary for c in nw):
+            continue
+        norm_words.append(nw)
+        orig_index.append(i)
+    if not norm_words:
+        fb = approx_wallclock(" ".join(words), played_ms, speed=speed)
+        fb.detail = {**(fb.detail or {}), "fallback_reason": "no_alignable_words", "model": pack["id"]}
+        return fb
+
+    token_batches = pack["tokenizer"](norm_words)
+    word_spans = pack["aligner"](emission, token_batches)
+    n_frames = int(emission.size(0))
+    audio_s = float(waveform.size(-1)) / float(pack["sample_rate"])
+    frame_hz = (n_frames / audio_s) if audio_s > 0 else 50.0
+    cutoff = float(played_ms + 40)
+    spoken_norm = 0
+    word_ends_ms: list[float] = []
+    for spans in word_spans:
+        if not spans:
+            break
+        end_f = int(spans[-1].end)
+        end_ms = 1000.0 * end_f / frame_hz
+        word_ends_ms.append(end_ms)
+        if end_ms <= cutoff:
+            spoken_norm += 1
+        else:
+            break
+    if spoken_norm <= 0:
+        if played_ms >= 80 and words:
+            last_orig, prefix = 1, words[0]
+        else:
+            last_orig, prefix = 0, ""
+    else:
+        last_orig = orig_index[spoken_norm - 1] + 1
+        prefix = " ".join(words[:last_orig])
+    ms = (time.perf_counter() - t0) * 1000.0
+    return AlignCursor(
+        spoken_prefix=prefix,
+        word_index=last_orig if spoken_norm else (1 if prefix else 0),
+        intended_text=" ".join(words),
+        backend_id="ctc_forced",
+        confidence=0.7 if prefix else 0.2,
+        align_latency_ms=ms,
+        played_ms=played_ms,
+        audio_path=str(path),
+        detail={
+            "model": pack["id"],
+            "n_frames": n_frames,
+            "frame_hz": frame_hz,
+            "audio_ms": int(audio_s * 1000),
+            "cutoff_ms": cutoff,
+            "word_ends_ms": [round(x, 1) for x in word_ends_ms],
+        },
+    )
 
 
 def align_ctc_forced(
@@ -77,10 +321,8 @@ def align_ctc_forced(
     played_ms: int,
     wav_path: str | Path | None = None,
     speed: float = 1.0,
-    tail_slack_ms: int = 40,
     **_kwargs: Any,
 ) -> AlignCursor:
-    """Force-align intended text onto full teed audio; cut by played_ms."""
     t0 = time.perf_counter()
     words = intended_text.split()
     if not words:
@@ -102,7 +344,7 @@ def align_ctc_forced(
 
     path = Path(wav_path)
     try:
-        pack = _load_mms_fa()
+        pack = _load_pack(_model_choice())
         import torch
 
         wav, sr = _load_wav_mono_16k(path)
@@ -113,127 +355,17 @@ def align_ctc_forced(
 
         audio_ms = int(1000.0 * float(wav.numel()) / float(sr))
         use_played = played_ms if played_ms > 0 else audio_ms
-        # Cap to audio length (+slack); can't have spoken past the file.
-        use_played = min(use_played, audio_ms + tail_slack_ms)
+        use_played = min(use_played, audio_ms + 40)
 
         waveform = wav.unsqueeze(0)
-        if getattr(pack["bundle"], "_normalize_waveform", False):
+        if pack.get("normalize_waveform") or (
+            pack["kind"] == "mms_fa" and getattr(pack["bundle"], "_normalize_waveform", False)
+        ):
             waveform = torch.nn.functional.layer_norm(waveform, waveform.shape)
 
-        with torch.inference_mode():
-            emission, _ = pack["model"](waveform.to(pack["device"]))
-            if emission.dim() == 3:
-                emission = emission[0]
-            emission = emission.cpu()
-
-        norm_words: list[str] = []
-        orig_index: list[int] = []
-        for i, w in enumerate(words):
-            nw = _normalize_word(w)
-            if not nw:
-                continue
-            if any(c not in pack["tokenizer"].dictionary for c in nw):
-                continue
-            norm_words.append(nw)
-            orig_index.append(i)
-
-        if not norm_words:
-            fb = approx_wallclock(intended_text, use_played, speed=speed)
-            fb.detail = {**(fb.detail or {}), "fallback_reason": "no_alignable_words"}
-            return fb
-
-        token_batches = pack["tokenizer"](norm_words)
-        word_spans = pack["aligner"](emission, token_batches)
-
-        n_frames = int(emission.size(0))
-        audio_s = float(wav.numel()) / float(sr)
-        frame_hz = (n_frames / audio_s) if audio_s > 0 else 50.0
-
-        word_ends_ms: list[float] = []
-        word_scores: list[float] = []
-        for spans in word_spans:
-            if not spans:
-                word_ends_ms.append(float("inf"))
-                word_scores.append(0.0)
-                continue
-            end_f = int(spans[-1].end)
-            try:
-                score = sum(float(s.score) for s in spans) / max(1, len(spans))
-            except Exception:
-                score = float(getattr(spans[-1], "score", 0.0))
-            word_ends_ms.append(1000.0 * end_f / frame_hz)
-            word_scores.append(score)
-
-        # How many *normalized* words fully ended by played time?
-        cutoff = float(use_played + tail_slack_ms)
-        spoken_norm = 0
-        for end_ms in word_ends_ms:
-            if end_ms <= cutoff:
-                spoken_norm += 1
-            else:
-                break
-
-        if spoken_norm <= 0:
-            # Very early barge — at most first word if any audio played
-            if use_played >= 80 and words:
-                prefix = words[0]
-                last_orig = 1
-            else:
-                prefix, last_orig = "", 0
-            ms = (time.perf_counter() - t0) * 1000.0
-            return AlignCursor(
-                spoken_prefix=prefix,
-                word_index=last_orig,
-                intended_text=intended_text,
-                backend_id="ctc_forced",
-                confidence=0.25,
-                align_latency_ms=ms,
-                played_ms=use_played,
-                audio_path=str(path),
-                detail={
-                    "n_frames": n_frames,
-                    "frame_hz": frame_hz,
-                    "audio_ms": audio_ms,
-                    "cutoff_ms": cutoff,
-                    "aligned_norm_words": 0,
-                    "note": "before_first_word_end",
-                    "model": "torchaudio.pipelines.MMS_FA",
-                },
-            )
-
-        last_orig = orig_index[spoken_norm - 1] + 1
-        last_orig = max(1, min(len(words), last_orig))
-        prefix = " ".join(words[:last_orig])
-
-        scores_used = word_scores[:spoken_norm]
-        conf = 0.5
-        if scores_used:
-            conf = max(
-                0.15,
-                min(0.99, 1.0 / (1.0 + math.exp(-sum(scores_used) / len(scores_used)))),
-            )
-
-        ms = (time.perf_counter() - t0) * 1000.0
-        return AlignCursor(
-            spoken_prefix=prefix,
-            word_index=last_orig,
-            intended_text=intended_text,
-            backend_id="ctc_forced",
-            confidence=float(conf),
-            align_latency_ms=ms,
-            played_ms=use_played,
-            audio_path=str(path),
-            detail={
-                "n_frames": n_frames,
-                "frame_hz": frame_hz,
-                "audio_ms": audio_ms,
-                "cutoff_ms": cutoff,
-                "aligned_norm_words": spoken_norm,
-                "norm_vocab_words": len(norm_words),
-                "word_ends_ms": [round(x, 1) for x in word_ends_ms],
-                "model": "torchaudio.pipelines.MMS_FA",
-            },
-        )
+        if pack["kind"] == "mms_fa":
+            return _align_mms_fa(pack, waveform, words, use_played, path, t0, speed)
+        return _align_wav2vec2_base(pack, waveform, words, use_played, path, t0, speed)
     except Exception as exc:
         fb = approx_wallclock(intended_text, played_ms, speed=speed)
         fb.detail = {

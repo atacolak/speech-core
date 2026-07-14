@@ -313,7 +313,8 @@ helper_dir="${SPEECH_CORE_HELPER_DIR:-$script_dir}"
 if [[ ! -f "$helper_dir/speech-out-tee-play.sh" && -f "$libexec_dir/speech-out-tee-play.sh" ]]; then
   helper_dir="$libexec_dir"
 fi
-# CTC / aligner package (scripts/barge_in_align)
+# CTC / aligner package (scripts/barge_in_align).
+# NOTE: PYTHON3_BIN is resolved later (set -u) — do not expand it here.
 align_script=""
 for cand in \
   "$helper_dir/barge_in_align/run_align.py" \
@@ -322,19 +323,16 @@ for cand in \
   "$repo_root/scripts/barge_in_align/run_align.py"; do
   if [[ -f "$cand" ]]; then align_script="$cand"; break; fi
 done
-if [[ -z "$align_python" ]]; then
+if [[ -z "${align_python:-}" ]]; then
   for cand in \
     "$HOME/workspace/.venvs/pyannote-cpu/bin/python" \
     /home/sf/workspace/.venvs/pyannote-cpu/bin/python \
     "${SPEECH_CORE_PYTHON3:-}" \
-    "$PYTHON3_BIN"; do
+    "${SPEECH_CORE_ALIGN_PYTHON:-}"; do
     [[ -n "$cand" && -x "$cand" ]] || continue
     align_python="$cand"
     break
   done
-fi
-if [[ -z "$align_python" ]]; then
-  align_python="${PYTHON3_BIN:-python3}"
 fi
 
 dual_asr_dir="${SPEECH_CORE_DUAL_ASR_DIR:-}"
@@ -385,6 +383,10 @@ resolve_python3() {
   return 1
 }
 PYTHON3_BIN="$(resolve_python3 || true)"
+# Late-bind align python once PYTHON3_BIN is known (set -u safe).
+if [[ -z "${align_python:-}" ]]; then
+  align_python="${PYTHON3_BIN:-python3}"
+fi
 
 cat <<EOF_START
 speech-out developer live session
