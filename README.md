@@ -2,6 +2,8 @@
 
 Real-time speech substrate for human/agent interaction.
 
+> **Branch `feature/assistant-self-asr`:** live dogfood loop with barge-in cut (provisional wall-clock → async CTC) and TUI greying. Not merged to `main` yet.
+
 ```text
 speech-in   → microphone audio → transcript + turn events
 speech-out  → text → audible speech
@@ -23,7 +25,11 @@ speech-in
   speech-core-protocol    shared messages
 
 speech-out
-  speech-out              TTS + playback streaming
+  speech-out              TTS + playback (HTTP TTS → websocket audio frames)
+
+dogfood (laptop)
+  speech-out-live-session[-dogfood]   mic + TUI + TTS + barge-in cut
+  scripts/barge_in_align/             host warm CTC worker (optional refine)
 ```
 
 ## Core invariants
@@ -34,6 +40,7 @@ speech-out
 - VAD proposes boundaries; smart-turn checks semantic completion; a 2500 ms acoustic fallback prevents hangs.
 - Sustained speech-like audio without ASR tokens for 7500 ms emits `turn_human_hold` and forces a degraded close.
 - RMS energy gating is available server-side as an onset veto. It is currently a fixed-threshold gate and is intentionally conservative.
+- Barge-in (dogfood): pause playback on the first alphanumeric user ASR token; provisional cut from wall-clock playback; async CTC refine when the warm align worker is up. Greying updates the same assistant line (dim spoken / white unsaid).
 
 ## Environment
 
@@ -44,8 +51,12 @@ speech-out
 | `SPEECH_CORE_MODEL_PATH` | Nemotron GGUF |
 | `SPEECH_CORE_VAD_MODEL_PATH` | Silero VAD ONNX |
 | `SPEECH_CORE_SMART_TURN_MODEL_PATH` | smart-turn-v3 ONNX |
+| `SPEECH_OUT_STEPS` | Supertonic quality steps (dogfood default **5**; lower is faster, worse) |
+| `SPEECH_OUT_ASSISTANT_SELF_ASR` | dual-Nemotron self-ASR (`0` default — off) |
+| `SPEECH_OUT_CUPE_LIVE` | experimental live position tracker (`0` default — off) |
+| `SPEECH_OUT_ALIGN_BACKEND` | barge refine backend (`ctc_forced` when align stack present) |
 
-Install scripts write these to `~/.config/speech-core/daemon.env` and `client.env`.
+Install scripts write core URLs/paths to `~/.config/speech-core/daemon.env` and `client.env`.
 
 ## Run
 
@@ -61,7 +72,25 @@ Laptop (NixOS — build natively):
 ```bash
 ./scripts/speech-core-sync-build-adapter.sh
 speech-core-live-session
-speech-out-live-session --response-text "hello"
+```
+
+### Dogfood (barge-in + greying)
+
+On the laptop, after client install. Prefer an absolute path if `~/.local/bin` is not on `PATH`:
+
+```bash
+SPEECH_OUT_CUPE_LIVE=0 \
+SPEECH_OUT_ASSISTANT_SELF_ASR=0 \
+~/.local/bin/speech-out-live-session-dogfood
+```
+
+Or from `~/.local/bin`: `./speech-out-live-session-dogfood`.
+
+Mid-phrase barge → playback stops; assistant line greys (dim spoken / white unsaid). Session artifacts:
+
+```text
+~/.local/state/speech-core/session/speech-out-<id>/
+  mic.wav  trigger.log  watch.jsonl  ui-events.jsonl
 ```
 
 Inspect events:
@@ -76,10 +105,25 @@ tail -f ~/.local/state/speech-core/logs/events.jsonl
 - `docs/turn-detection.md` — exact EOU triggers and tuning knobs
 - `docs/seams.md` — component boundaries and contracts
 - `docs/speech-output.md` — speech-out protocol and cancellation
+- `docs/barge-in-dual-asr.md` — dual-Nemotron path notes (historical; not the default)
 
-## What we are doing next
+## Now vs later
 
-- Controller skeleton: consume `transcript_committed`, dispatch agent turns, and manage assistant/user turn alternation.
-- Barge-in alignment: when the user interrupts assistant playback, cut the assistant transcript at the sample where user speech began.
-- Adaptive RMS gate: replace the fixed threshold with a noise-floor-relative onset veto, especially during TTS playback.
-- Monolith cleanup: split `turn.rs`, `speech-core-watch/src/main.rs`, and `speech-core-golden.py` into smaller modules once the controller contract is stable.
+**On this branch (dogfood):**
+
+- Barge-in stop on first alphanumeric user token; provisional wall-clock cut; CTC refine via warm TCP worker when available
+- TUI greying on the original assistant line (no orphan cut line)
+- Deterministic turn finalize / ghost-turn guards on the speech-in path
+
+**Honest limits:**
+
+- Supertonic at steps ≥ 5 is ~0.5 s synth floor on the current host (full WAV, not progressive PCM stream)
+- GPU ONNX path was tried on GTX 1060 and failed (cuDNN); production TTS stays CPU
+- CUPE live and dual-Nemotron self-ASR are off by default
+
+**Later:**
+
+- Controller: consume `transcript_committed`, dispatch agent turns, manage assistant/user alternation
+- Streaming TTS or a working accelerator without dropping quality below steps 5
+- Mic-open empty first turn / adaptive energy gate during TTS
+- Monolith cleanup (`turn.rs`, watch TUI, golden scripts) once the controller contract is stable
