@@ -19,3 +19,17 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# Pi terminal settlement checkpoints (local session artifacts)
+.checkpoints/
+
+# Beads runtime (ledger export lives under .beads/ with its own ignore)
+.beads/*.db
+.beads/*.db-*
+.beads/*.lock
+.beads/last-touched
+.beads/.br_history/
+.beads/.br_recovery/

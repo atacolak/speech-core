@@ -28,7 +28,8 @@ speech-out
   speech-out              TTS + playback (HTTP TTS → websocket audio frames)
 
 dogfood (laptop)
-  speech-out-live-session[-dogfood]   mic + TUI + TTS + barge-in cut
+  speech-out-live-session[-dogfood]   mic + TUI + TTS + barge-in cut (canned reply)
+  speech-talker-session               mic → Talker profile → TTS + interrupt triple
   scripts/barge_in_align/             host warm CTC worker (optional refine)
 ```
 
@@ -85,6 +86,18 @@ SPEECH_OUT_ASSISTANT_SELF_ASR=0 \
 ```
 
 Or from `~/.local/bin`: `./speech-out-live-session-dogfood`.
+
+**Talker voice loop (MVP B)** — real `pi --profile talker` answers (not canned text), reasoner tools stubbed:
+
+```bash
+# synthetic one turn (no mic)
+./scripts/speech-talker-session.sh --no-mic --once-text "what are you?"
+
+# live mic → Talker → Supertonic (uses client.env WS URLs)
+./scripts/speech-talker-session.sh
+```
+
+Interrupt triple on barge: stop playout, cancel Talker gen, truncate assistant history to heard prefix.
 
 Mid-phrase barge → playback stops; assistant line greys (dim spoken / white unsaid). Session artifacts:
 
