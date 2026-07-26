@@ -1,6 +1,9 @@
-# speech-core current state
+# Speech Core current state
 
-this is the reality as of the current working tree. if another doc disagrees, trust this file and the repo code first.
+**status:** maintained current-implementation guide
+**authority:** repository code and installed configuration establish current reality; this document explains them
+
+If this file disagrees with code, tests, traces, or installed configuration, treat the mismatch as a documentation defect. Do not average conflicting values.
 
 ## one-line summary
 
@@ -125,10 +128,10 @@ this is less magical and less chatty. good.
 
 ## what is still rough
 
-- smart turn v3 needs live laptop validation across actual conversational pauses.
-- smart turn preprocessing is implemented directly in rust; parity against python is smoke-tested through the real model, not numerically golden-tested against transformers.
+- smart turn v3 needs broader live laptop validation across actual conversational pauses.
+- smart turn preprocessing is implemented directly in Rust; parity against Python is smoke-tested through the real model, not numerically golden-tested against Transformers.
 - cross-host capture latency is preserved but not calibrated.
-- docs under `~/workspace/docs/speech-core` contain older planning/spec history; useful archaeology, not current runtime source of truth.
+- the CosyVoice/session-control/player replacement described under `docs/evolution/` is selected target architecture, not current implementation.
 
 ## manual testing commands
 

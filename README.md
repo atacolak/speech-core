@@ -1,8 +1,25 @@
-# speech-core
+# Speech Core
 
-Real-time speech substrate for human/agent interaction.
+Real-time speech substrate for human-agent interaction.
 
-> **Branch `feature/assistant-self-asr`:** live dogfood loop with barge-in cut (provisional wall-clock → async CTC) and TUI greying. Not merged to `main` yet.
+> **current branch:** `feature/assistant-self-asr` contains the live dogfood loop with barge-in cut (provisional wall-clock → async CTC) and TUI greying. It is not merged to `main` yet.
+
+## Start here
+
+This file is the front door. It tells you what exists and how to run it.
+
+| Need | Read |
+|---|---|
+| Enduring purpose, product boundary, and invariants | [`CHARTER.md`](CHARTER.md) |
+| Full documentation map and cold-agent reading order | [`docs/README.md`](docs/README.md) |
+| Current implementation, installed defaults, and honest limits | [`docs/current-state.md`](docs/current-state.md) |
+| Accepted architectural directions | [`docs/decisions/`](docs/decisions/) |
+| Active target and delivery sequence | [`docs/evolution/ACTIVE.md`](docs/evolution/ACTIVE.md) |
+| Manager, worker, and reviewer authority | [`governance/ROLES.md`](governance/ROLES.md) |
+| Repository-memory v1 specification | [`docs/memory/hindsight-v1.md`](docs/memory/hindsight-v1.md) |
+| Authorized work and status | the city work ledger |
+
+No planning document proves implementation, and no memory projection proves current state. Code, tests, traces, and the city work ledger remain authoritative for their own claims.
 
 ```text
 speech-in   → microphone audio → transcript + turn events
@@ -46,7 +63,7 @@ dogfood (laptop)
 ## Environment
 
 | variable | purpose |
-|----------|---------|
+|---|---|
 | `SPEECH_CORE_WS_URL` | `ws://host:8765/ws/audio-ingress` |
 | `SPEECH_OUT_WS_URL` | `ws://host:8788/ws/speech-out` |
 | `SPEECH_CORE_MODEL_PATH` | Nemotron GGUF |
@@ -58,6 +75,8 @@ dogfood (laptop)
 | `SPEECH_OUT_ALIGN_BACKEND` | barge refine backend (`ctc_forced` when align stack present) |
 
 Install scripts write core URLs/paths to `~/.config/speech-core/daemon.env` and `client.env`.
+
+The full installed-default table lives in [`docs/current-state.md`](docs/current-state.md). Defaults originate in code and installed configuration; documentation must not become an independent configuration source.
 
 ## Run
 
@@ -114,11 +133,13 @@ tail -f ~/.local/state/speech-core/logs/events.jsonl
 
 ## Documentation
 
-- `docs/current-state.md` — what works right now
-- `docs/turn-detection.md` — exact EOU triggers and tuning knobs
-- `docs/seams.md` — component boundaries and contracts
-- `docs/speech-output.md` — speech-out protocol and cancellation
-- `docs/barge-in-dual-asr.md` — dual-Nemotron path notes (historical; not the default)
+Use [`docs/README.md`](docs/README.md) as the canonical map. The most common references are:
+
+- [`docs/current-state.md`](docs/current-state.md) — what works right now;
+- [`docs/seams.md`](docs/seams.md) — current component boundaries and contracts;
+- [`docs/turn-detection.md`](docs/turn-detection.md) — exact EOU triggers and tuning knobs;
+- [`docs/speech-output.md`](docs/speech-output.md) — speech-out protocol and cancellation;
+- [`docs/evolution/ACTIVE.md`](docs/evolution/ACTIVE.md) — accepted target, current gap, and delivery sequence.
 
 ## Now vs later
 

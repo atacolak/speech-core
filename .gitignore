@@ -9,6 +9,7 @@
 *.tmp
 .DS_Store
 
+# Repo-local agent/session memory is runtime residue, not project truth.
 .pi/
 
 # Golden suite run artifacts (local recordings, rejected takes, raw captures)
@@ -26,10 +27,15 @@ __pycache__/
 # Pi terminal settlement checkpoints (local session artifacts)
 .checkpoints/
 
-# Beads runtime (ledger export lives under .beads/ with its own ignore)
+# City work-ledger runtime. The tracked export/config created by rig registration
+# remains visible; local database/backend/cache files do not.
 .beads/*.db
 .beads/*.db-*
 .beads/*.lock
 .beads/last-touched
+.beads/.local_version
+.beads/.auto-import-issues.jsonl
 .beads/.br_history/
 .beads/.br_recovery/
+.beads/backup/
+.beads/embeddeddolt/
