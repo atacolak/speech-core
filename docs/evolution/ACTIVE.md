@@ -47,7 +47,7 @@ See the numbered specifications in this directory.
 
 ## Immediate delivery sequence
 
-The manager should create small city work items from this sequence, preserving dependency and independent-review boundaries:
+The candidate dependency order is:
 
 1. **baseline evidence:** capture reproducible current service topology, commands, test results, representative traces, and known defects;
 2. **CosyVoice qualification:** pin repository, model, runtime, voice assets, dependencies, GPU/VRAM behavior, first-PCM latency, cancellation granularity, and rollback without touching deployed paths;
@@ -59,11 +59,9 @@ The manager should create small city work items from this sequence, preserving d
 8. **coordinated interruption:** implement stop/cancel/steer/history transaction and provisional/BFA refinement;
 9. **Discord and cutover evidence:** pass deterministic, pinned-model, physical, and Discord gates before operator-approved cutover.
 
-The city work ledger is expected to contain only the currently authorized subset, not a pre-created graph for every future slice.
+Only the currently authorized subset belongs in the work ledger; this sequence is not a pre-created work graph.
 
 ## Known blockers and required operator decisions
-
-Raise these only when the relevant work reaches them:
 
 - exact CosyVoice repository/model/runtime/voice pin;
 - exact supported Pi RPC/SDK interface and version;
@@ -71,16 +69,6 @@ Raise these only when the relevant work reaches them:
 - measurable audibility calibration and BFA model choice;
 - cutover approval after end-to-end dogfood and rollback evidence.
 
-Do not reopen the city/role ontology while executing these slices unless a concrete authority contradiction blocks work.
+## Evidence
 
-## Status maintenance
-
-The rig manager updates this file only from operator decisions and independently reviewed evidence. For each completed slice it must link:
-
-- city work item;
-- commit(s);
-- review verdict;
-- tests/traces;
-- remaining gaps.
-
-The manager may update implementation status. It may not mark a material decision accepted or change this direction without operator ratification.
+Completed slices link the relevant work item, commits, tests or traces, review evidence when required by that work item, and remaining product gaps. A material direction changes only through an operator-ratified decision.

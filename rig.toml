@@ -1,0 +1,24 @@
+schema = "ata.reference-rig/v1"
+name = "speech-core"
+
+[surfaces]
+front_door = "README.md"
+charter = "CHARTER.md"
+docs_map = "docs/README.md"
+current_state = "docs/current-state.md"
+decisions = "docs/decisions"
+active_evolution = "docs/evolution/ACTIVE.md"
+
+[work]
+system = "city-ledger"
+prefix = "sc"
+
+[roles]
+authority = "city"
+standard = "ata.city-roles/reference-rig-v1"
+
+[memory]
+authority = "reviewed-history-only"
+standard = "hindsight-v1"
+bank = "speech-core"
+status = "not-implemented"

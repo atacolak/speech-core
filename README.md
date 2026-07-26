@@ -10,16 +10,15 @@ This file is the front door. It tells you what exists and how to run it.
 
 | Need | Read |
 |---|---|
-| Enduring purpose, product boundary, and invariants | [`CHARTER.md`](CHARTER.md) |
-| Full documentation map and cold-agent reading order | [`docs/README.md`](docs/README.md) |
+| Enduring Speech Core purpose, authority boundaries, and invariants | [`CHARTER.md`](CHARTER.md) |
+| Product documentation map | [`docs/README.md`](docs/README.md) |
 | Current implementation, installed defaults, and honest limits | [`docs/current-state.md`](docs/current-state.md) |
-| Accepted architectural directions | [`docs/decisions/`](docs/decisions/) |
-| Active target and delivery sequence | [`docs/evolution/ACTIVE.md`](docs/evolution/ACTIVE.md) |
-| Manager, worker, and reviewer authority | [`governance/ROLES.md`](governance/ROLES.md) |
-| Repository-memory v1 specification | [`docs/memory/hindsight-v1.md`](docs/memory/hindsight-v1.md) |
-| Authorized work and status | the city work ledger |
+| Accepted Speech Core architectural directions | [`docs/decisions/`](docs/decisions/) |
+| Active Speech Core target and delivery sequence | [`docs/evolution/ACTIVE.md`](docs/evolution/ACTIVE.md) |
+| City-standard mapping and work namespace | [`rig.toml`](rig.toml) |
+| Authorized work and status | the city `sc` work ledger |
 
-No planning document proves implementation, and no memory projection proves current state. Code, tests, traces, and the city work ledger remain authoritative for their own claims.
+This repository contains Speech Core product truth and a small city binding. No planning document proves implementation, and no memory projection proves current state.
 
 ```text
 speech-in   → microphone audio → transcript + turn events
