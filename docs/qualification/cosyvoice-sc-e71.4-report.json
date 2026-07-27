@@ -1,0 +1,521 @@
+{
+  "bead": "sc-e71.4",
+  "run_id": "20260727T051625Z",
+  "started_at": "2026-07-27T05:16:25Z",
+  "pin": {
+    "code_repo": "https://github.com/QwenAudio/CosyVoice",
+    "code_commit": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+    "model_id": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "model_dir": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/models/Fun-CosyVoice3-0.5B",
+    "python": "3.10.20 (main, Mar 10 2026, 18:16:33) [Clang 21.1.4 ]",
+    "qual_root": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4",
+    "submodule_matcha": "dd9105b34bf2be2230f4aa1e4769fb586a3c824e",
+    "hashes": {
+      "llm.pt": {
+        "sha256": "69f43bd545131c30e98947fb360ea8b4dc9916d8e83dded7757c7ea4f5a24970",
+        "bytes": 2024669519
+      },
+      "flow.pt": {
+        "sha256": "a6fab32a7825e5b0bc855ddd948f8db9370b0a786fbc249caa4595e95b608e4b",
+        "bytes": 1329116148
+      },
+      "hift.pt": {
+        "sha256": "b279d7641eb97ae55b3b540cfba4f953c26492a2df758328a89a4d007ab87a65",
+        "bytes": 83202622
+      },
+      "speech_tokenizer_v3.onnx": {
+        "sha256": "23236a74175dbdda47afc66dbadd5bcb41303c467a57c261cb8539ad9db9208d",
+        "bytes": 969451503
+      },
+      "campplus.onnx": {
+        "sha256": "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73",
+        "bytes": 28303423
+      },
+      "CosyVoice-BlankEN/model.safetensors": {
+        "sha256": "130282af0dfa9fe5840737cc49a0d339d06075f83c5a315c3372c9a0740d0b96",
+        "bytes": 988097824
+      },
+      "cosyvoice3.yaml": {
+        "sha256": "f5a6b2c6f05139d0f18861a1fe506f751e787026b77c05f7e8fef9f8a4405965",
+        "bytes": 6934
+      },
+      "asset/zero_shot_prompt.wav": {
+        "sha256": "c7b31d6dbe7cc6a716dded00550db5b50940bf209e424e4ad207b12e657c8ff6",
+        "bytes": 334138,
+        "path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/src/CosyVoice/asset/zero_shot_prompt.wav"
+      }
+    }
+  },
+  "host_before": {
+    "ts": "2026-07-27T05:16:25Z",
+    "speech_processes": [
+      "1731  3-18:01:17 /home/sf/.local/bin/speech-core-daemon",
+      "1733  3-18:01:17 /home/sf/.local/bin/speech-core-daemon",
+      "1744  3-18:01:17 /home/sf/.local/bin/speech-out daemon"
+    ],
+    "listen_ports": [
+      "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"
+    ],
+    "nvidia_kernel": "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.71.05  Release Build  (dvs-builder@U22-I3-G08-03-1)  Fri Apr 24 06:42:30 UTC 2026\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+    "gpu_info": {
+      "Model": "NVIDIA GeForce RTX 4070",
+      "GPU UUID": "GPU-0657bdd0-d69d-308e-aed7-4e124c39decc",
+      "Bus Location": "0000:06:00.0",
+      "GPU Firmware": "595.71.05"
+    }
+  },
+  "legal": {
+    "code_license_tag": "Apache-2.0",
+    "model_card_license_tag": "apache-2.0",
+    "model_card_disclaimer": "The content provided above is for academic purposes only and is intended to demonstrate technical capabilities.",
+    "ambiguity": "License tag is Apache-2.0 but model card disclaimer restricts to academic purposes. Legal review required before product use."
+  },
+  "gates": {
+    "warm_first_pcm_ms": "300-500",
+    "cancel_hop": "<=1 hop after cancel wrapper",
+    "vram_solo_gb": "<=8-9",
+    "rtf": "<1",
+    "host_impact": "no existing service replaced/stopped"
+  },
+  "results": {
+    "cold_load_s": 78.00297325500287,
+    "sample_rate": 24000,
+    "vram_after_load_mb": {
+      "free_mb": 7019.4375,
+      "total_mb": 11852.875,
+      "allocated_mb": 3283.95947265625,
+      "reserved_mb": 3482.0,
+      "peak_allocated_mb": 3370.4365234375,
+      "used_mb": 4833.4375
+    },
+    "utterances": [
+      {
+        "name": "en_zero_shot_stream_cold",
+        "mode": "stream",
+        "text": "CosyVoice is undergoing a comprehensive upgrade, providing more accurate, stable, faster, and better voice generation capabilities.",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:17:47Z",
+        "first_pcm_s": 3.3313448049593717,
+        "total_s": 6.75677508697845,
+        "audio_duration_s": 8.68,
+        "rtf": 0.7784303095597294,
+        "n_chunks": 4,
+        "n_samples": 208320,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 7019.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3283.95947265625,
+          "reserved_mb": 3482.0,
+          "peak_allocated_mb": 3283.95947265625,
+          "used_mb": 4833.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3430.5380859375,
+          "used_mb": 4919.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3430.5380859375,
+          "peak_reserved_mb": 3772.0,
+          "used_mb": 4919.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 3.3313448049593717,
+            "n_samples": 32640,
+            "duration_s": 1.36
+          },
+          {
+            "index": 1,
+            "t_rel_s": 4.215978057996836,
+            "n_samples": 48000,
+            "duration_s": 2.0
+          },
+          {
+            "index": 2,
+            "t_rel_s": 5.990938399976585,
+            "n_samples": 96000,
+            "duration_s": 4.0
+          },
+          {
+            "index": 3,
+            "t_rel_s": 6.749575319990981,
+            "n_samples": 31680,
+            "duration_s": 1.32
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_cold.wav",
+        "cancelled": false,
+        "cancel_after_chunks": null,
+        "cancel_ack_s": null,
+        "post_cancel_chunks": 0
+      },
+      {
+        "name": "en_zero_shot_stream_warm",
+        "mode": "stream",
+        "text": "CosyVoice is undergoing a comprehensive upgrade, providing more accurate, stable, faster, and better voice generation capabilities.",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:17:53Z",
+        "first_pcm_s": 2.3801678359741345,
+        "total_s": 3.6875566319795325,
+        "audio_duration_s": 7.2,
+        "rtf": 0.5121606433304906,
+        "n_chunks": 2,
+        "n_samples": 172800,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3312.85595703125,
+          "used_mb": 4919.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3417.779296875,
+          "used_mb": 4919.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3417.779296875,
+          "peak_reserved_mb": 3700.0,
+          "used_mb": 4919.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 2.3801678359741345,
+            "n_samples": 104640,
+            "duration_s": 4.36
+          },
+          {
+            "index": 1,
+            "t_rel_s": 3.682176741946023,
+            "n_samples": 68160,
+            "duration_s": 2.84
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_warm.wav",
+        "cancelled": false,
+        "cancel_after_chunks": null,
+        "cancel_ack_s": null,
+        "post_cancel_chunks": 0
+      },
+      {
+        "name": "en_short_stream_warm",
+        "mode": "stream",
+        "text": "Hello. This is a short warm-path latency probe.",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:17:57Z",
+        "first_pcm_s": 1.8640383750316687,
+        "total_s": 1.867709800018929,
+        "audio_duration_s": 3.64,
+        "rtf": 0.5131070879172882,
+        "n_chunks": 1,
+        "n_samples": 87360,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3312.85595703125,
+          "used_mb": 4919.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3397.33447265625,
+          "used_mb": 4919.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3397.33447265625,
+          "peak_reserved_mb": 3624.0,
+          "used_mb": 4919.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 1.8640383750316687,
+            "n_samples": 87360,
+            "duration_s": 3.64
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_short_stream_warm.wav",
+        "cancelled": false,
+        "cancel_after_chunks": null,
+        "cancel_ack_s": null,
+        "post_cancel_chunks": 0
+      },
+      {
+        "name": "zh_zero_shot_stream_warm",
+        "mode": "stream",
+        "text": "\u516b\u767e\u6807\u5175\u5954\u5317\u5761\uff0c\u5317\u5761\u70ae\u5175\u5e76\u6392\u8dd1\uff0c\u70ae\u5175\u6015\u628a\u6807\u5175\u78b0\uff0c\u6807\u5175\u6015\u78b0\u70ae\u5175\u70ae\u3002",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:17:59Z",
+        "first_pcm_s": 2.5208363460260443,
+        "total_s": 5.355853670043871,
+        "audio_duration_s": 9.56,
+        "rtf": 0.5602357395443379,
+        "n_chunks": 3,
+        "n_samples": 229440,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3312.85595703125,
+          "used_mb": 4919.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3436.06298828125,
+          "used_mb": 4919.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3436.06298828125,
+          "peak_reserved_mb": 3792.0,
+          "used_mb": 4919.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 2.5208363460260443,
+            "n_samples": 104640,
+            "duration_s": 4.36
+          },
+          {
+            "index": 1,
+            "t_rel_s": 4.6438254290260375,
+            "n_samples": 96000,
+            "duration_s": 4.0
+          },
+          {
+            "index": 2,
+            "t_rel_s": 5.348474722006358,
+            "n_samples": 28800,
+            "duration_s": 1.2
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/zh_zero_shot_stream_warm.wav",
+        "cancelled": false,
+        "cancel_after_chunks": null,
+        "cancel_ack_s": null,
+        "post_cancel_chunks": 0
+      },
+      {
+        "name": "en_zero_shot_buffered_warm",
+        "mode": "buffered",
+        "text": "Buffered path check. This utterance disables stream mode on purpose.",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:18:04Z",
+        "first_pcm_s": 2.51918167702388,
+        "total_s": 2.5236363889998756,
+        "audio_duration_s": 5.48,
+        "rtf": 0.4605175892335539,
+        "n_chunks": 1,
+        "n_samples": 131520,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3312.85595703125,
+          "used_mb": 4919.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3399.41064453125,
+          "used_mb": 4919.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3399.41064453125,
+          "peak_reserved_mb": 3660.0,
+          "used_mb": 4919.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 2.51918167702388,
+            "n_samples": 131520,
+            "duration_s": 5.48
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_buffered_warm.wav",
+        "cancelled": false,
+        "cancel_after_chunks": null,
+        "cancel_ack_s": null,
+        "post_cancel_chunks": 0
+      },
+      {
+        "name": "en_cancel_break_after_1_chunk",
+        "mode": "stream",
+        "text": "This utterance is intentionally long so cancellation can be observed after the first progressive PCM chunk arrives from the streaming synthesis path. We keep speaking to give the worker thread more tokens to produce.",
+        "ok": true,
+        "error": null,
+        "t_start": "2026-07-27T05:18:07Z",
+        "first_pcm_s": 2.207830216968432,
+        "total_s": 2.2078538819914684,
+        "audio_duration_s": 4.36,
+        "rtf": 0.5063885050439147,
+        "n_chunks": 1,
+        "n_samples": 104640,
+        "sample_rate": 24000,
+        "vram_before_mb": {
+          "free_mb": 6933.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3312.85595703125,
+          "reserved_mb": 3494.0,
+          "peak_allocated_mb": 3312.85595703125,
+          "used_mb": 4919.4375
+        },
+        "vram_after_mb": {
+          "free_mb": 6761.4375,
+          "total_mb": 11852.875,
+          "allocated_mb": 3321.96337890625,
+          "reserved_mb": 3666.0,
+          "peak_allocated_mb": 3415.55078125,
+          "used_mb": 5091.4375
+        },
+        "vram_peak_mb": {
+          "peak_allocated_mb": 3415.55078125,
+          "peak_reserved_mb": 3666.0,
+          "used_mb": 5091.4375
+        },
+        "chunks": [
+          {
+            "index": 0,
+            "t_rel_s": 2.207830216968432,
+            "n_samples": 104640,
+            "duration_s": 4.36
+          }
+        ],
+        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_cancel_break_after_1_chunk.wav",
+        "cancelled": true,
+        "cancel_after_chunks": 1,
+        "cancel_ack_s": 2.207853461964987,
+        "post_cancel_chunks": 0
+      }
+    ],
+    "summary": {
+      "warm_first_pcm_s": 2.3801678359741345,
+      "warm_rtf": 0.5121606433304906,
+      "short_first_pcm_s": 1.8640383750316687,
+      "cancel_consumer_break": {
+        "first_pcm_s": 2.207830216968432,
+        "cancel_ack_s": 2.207853461964987,
+        "n_chunks_kept": 1,
+        "post_cancel_chunks_observed_after_break": 0,
+        "note": "break stops consuming generator; CosyVoice worker thread still joins. Not a true synthesis cancel."
+      },
+      "peak_vram_used_mb_across_utts": 5091.4375,
+      "cold_load_s": 78.00297325500287
+    },
+    "vram_after_cleanup_mb": {
+      "free_mb": 7979.4375,
+      "total_mb": 11852.875,
+      "allocated_mb": 3320.55517578125,
+      "reserved_mb": 3504.0,
+      "peak_allocated_mb": 3415.55078125,
+      "used_mb": 3873.4375
+    },
+    "services_intact": {
+      "before_pids": [
+        "1731",
+        "1733",
+        "1744"
+      ],
+      "after_pids": [
+        "1731",
+        "1733",
+        "1744"
+      ],
+      "pids_unchanged": true,
+      "port_8788_before": [
+        "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"
+      ],
+      "port_8788_after": [
+        "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"
+      ]
+    },
+    "process_cancel": {
+      "ok": true,
+      "method": "process-per-utterance-SIGKILL",
+      "saw_first_chunk": true,
+      "first_chunk_at_s": "19.617535515",
+      "kill_at_s": "19.671616272",
+      "returncode": "137",
+      "stdout_tail": [
+        "Downloading Model to directory: /home/sf/.cache/modelscope/hub/pengzhendong/wetext",
+        "Downloading Model to directory: /home/sf/.cache/modelscope/hub/pengzhendong/wetext",
+        "LOADED 12.830",
+        "CHUNK 0 2.8260 32640"
+      ],
+      "log_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/logs/process-cancel-20260727T051625Z.log",
+      "note": "SIGKILL after first CHUNK stops synthesis at process boundary; GPU context reclaimed with process. In-process generator break is not sufficient."
+    }
+  },
+  "failures": [],
+  "env": {
+    "torch": "2.3.1+cu121",
+    "cuda": "12.1",
+    "cuda_available": true,
+    "device_name": "NVIDIA GeForce RTX 4070",
+    "device_capability": [
+      8,
+      9
+    ],
+    "vram_idle_mb": {
+      "free_mb": 11567.4375,
+      "total_mb": 11852.875,
+      "allocated_mb": 0.0,
+      "reserved_mb": 0.0,
+      "peak_allocated_mb": 0.0,
+      "used_mb": 285.4375
+    }
+  },
+  "host_after": {
+    "ts": "2026-07-27T05:18:09Z",
+    "speech_processes": [
+      "1731  3-18:03:02 /home/sf/.local/bin/speech-core-daemon",
+      "1733  3-18:03:02 /home/sf/.local/bin/speech-core-daemon",
+      "1744  3-18:03:02 /home/sf/.local/bin/speech-out daemon"
+    ],
+    "listen_ports": [
+      "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"
+    ],
+    "nvidia_kernel": "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.71.05  Release Build  (dvs-builder@U22-I3-G08-03-1)  Fri Apr 24 06:42:30 UTC 2026\nGCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+    "gpu_info": {
+      "Model": "NVIDIA GeForce RTX 4070",
+      "GPU UUID": "GPU-0657bdd0-d69d-308e-aed7-4e124c39decc",
+      "Bus Location": "0000:06:00.0",
+      "GPU Firmware": "595.71.05"
+    }
+  },
+  "finished_at": "2026-07-27T05:18:09Z",
+  "resource_ru_maxrss_kb": 5901072
+}
