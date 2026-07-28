@@ -68,6 +68,15 @@ try:
         errors.append("rig.toml roles.authority must be city")
     if roles.get("standard") != "ata.city-roles/reference-rig-v1":
         errors.append("rig.toml must pin ata.city-roles/reference-rig-v1")
+    memory = manifest.get("memory", {})
+    if memory.get("authority") != "reviewed-history-only":
+        errors.append("rig.toml memory.authority must be reviewed-history-only")
+    if memory.get("standard") != "hindsight-v1":
+        errors.append("rig.toml memory.standard must be hindsight-v1")
+    if memory.get("bank") != "speech-core":
+        errors.append("rig.toml memory.bank must be speech-core")
+    if memory.get("status") != "active":
+        errors.append('rig.toml memory.status must be "active" (city-managed bank is live)')
 except (OSError, tomllib.TOMLDecodeError) as exc:
     errors.append(f"invalid rig.toml: {exc}")
 
