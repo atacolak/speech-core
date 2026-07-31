@@ -1,6 +1,6 @@
 # Speech Core charter
 
-**status:** draft — binding only after explicit operator ratification
+**status:** binding — ratified by the operator on 2026-07-31
 
 ## Purpose
 
