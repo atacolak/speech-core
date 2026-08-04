@@ -6,6 +6,7 @@
 
 | Question | Canonical home |
 |---|---|
+| How does every mechanism behave, and why? | [`../spec/`](../spec/README.md) — accepted truth |
 | What is Speech Core allowed to be? | [`../CHARTER.md`](../CHARTER.md) |
 | What is implemented now? | [`current-state.md`](current-state.md) plus repository inspection |
 | Where are current component boundaries? | [`seams.md`](seams.md) |
@@ -14,7 +15,10 @@
 | What work is authorized and who owns it? | the city `sc` work ledger |
 | What proves a completed claim? | linked commits, tests, traces, and review evidence when required by the work item |
 
-If sources conflict, identify the claim type and inspect its canonical authority. Do not blend values.
+If sources conflict, behavior/why claims resolve toward `../spec/` (then the
+charter); this docs tree is reference and evidence material, not a competing
+claim home. Identify the claim type and inspect its canonical authority. Do not
+blend values.
 
 ## Current implementation
 

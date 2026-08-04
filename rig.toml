@@ -3,6 +3,7 @@ name = "speech-core"
 
 [surfaces]
 front_door = "README.md"
+behavior_truth = "spec/README.md"
 charter = "CHARTER.md"
 docs_map = "docs/README.md"
 current_state = "docs/current-state.md"

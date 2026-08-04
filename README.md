@@ -10,8 +10,9 @@ This file is the front door. It tells you what exists and how to run it.
 
 | Need | Read |
 |---|---|
+| **Accepted behavior truth — how every mechanism works, and why** | [`spec/README.md`](spec/README.md) |
 | Enduring Speech Core purpose, authority boundaries, and invariants | [`CHARTER.md`](CHARTER.md) |
-| Product documentation map | [`docs/README.md`](docs/README.md) |
+| Product documentation map (reference & evidence) | [`docs/README.md`](docs/README.md) |
 | Current implementation, installed defaults, and honest limits | [`docs/current-state.md`](docs/current-state.md) |
 | Accepted Speech Core architectural directions | [`docs/decisions/`](docs/decisions/) |
 | Active Speech Core target and delivery sequence | [`docs/evolution/ACTIVE.md`](docs/evolution/ACTIVE.md) |

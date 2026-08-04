@@ -18,6 +18,8 @@ REQUIRED = {
     "README.md": ("## Start here", "rig.toml", "CHARTER.md"),
     "CHARTER.md": ("## Product authority boundaries", "## Product invariants", "## Amendment authority"),
     "docs/README.md": ("## Canonical product surfaces",),
+    "spec/README.md": ("# spec/ — Speech Core's source of truth", "accepted truth"),
+    "spec/decisions.md": ("revisit when",),
     "docs/current-state.md": ("# Speech Core current state",),
     "docs/evolution/ACTIVE.md": ("## Current reality", "## Immediate delivery sequence"),
     "rig.toml": ('schema = "ata.reference-rig/v1"', 'prefix = "sc"'),
