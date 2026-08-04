@@ -182,6 +182,37 @@ def load_accepted_requirements() -> dict[str, str]:
     return mapping
 
 
+def accepted_chapter_for_delta(delta_path: Path, specs_root: Path) -> Path | None:
+    """Derive the target accepted chapter from a delta path.
+
+    Dogfood layout: changes/<id>/specs/<chapter>/spec.md -> specs/<chapter>.md
+    Flat layout:    changes/<id>/specs/<chapter>.md     -> specs/<chapter>.md
+    """
+    try:
+        rel_parts = delta_path.resolve().relative_to(specs_root.resolve()).parts
+    except ValueError:
+        return None
+    if not rel_parts:
+        return None
+
+    chapter: str | None = None
+    if len(rel_parts) >= 2 and rel_parts[-1].lower() == "spec.md":
+        chapter = rel_parts[0]
+    elif len(rel_parts) == 1 and rel_parts[0].endswith(".md"):
+        chapter = Path(rel_parts[0]).stem
+    if not chapter:
+        return None
+
+    candidates = [
+        SPECS_DIR / f"{chapter}.md",
+        SPECS_DIR / chapter / "spec.md",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def parse_delta_sections(text: str) -> dict[str, list[str]]:
     """Return {ADDED|MODIFIED|REMOVED|RENAMED: [ids...]} from a delta file."""
     sections: dict[str, list[str]] = defaultdict(list)
@@ -350,6 +381,36 @@ def check_placement(report: Report) -> None:
             )
 
 
+def _check_delta_target_in_chapter(
+    report: Report,
+    *,
+    where: str,
+    kind: str,
+    req_id: str,
+    accepted: dict[str, str],
+    target_rel: str | None,
+) -> None:
+    """G2: MODIFIED/REMOVED/RENAMED sources must live in the delta's target chapter."""
+    if target_rel is None:
+        report.fail(
+            f"{where}: {kind} target `{req_id}` — cannot derive target accepted "
+            f"chapter from delta path (expected specs/<chapter>/spec.md or "
+            f"specs/<chapter>.md)"
+        )
+        return
+    live_chapter = accepted.get(req_id)
+    if live_chapter is None:
+        report.fail(
+            f"{where}: {kind} target `{req_id}` does not match a live requirement "
+            f"in target accepted chapter {target_rel}"
+        )
+    elif live_chapter != target_rel:
+        report.fail(
+            f"{where}: {kind} target `{req_id}` is not in target accepted chapter "
+            f"{target_rel} (found in {live_chapter})"
+        )
+
+
 def check_deltas(report: Report, accepted: dict[str, str]) -> dict[str, set[str]]:
     """Validate active change deltas. Returns map change_id -> ADDED ids."""
     added_by_change: dict[str, set[str]] = {}
@@ -363,29 +424,40 @@ def check_deltas(report: Report, accepted: dict[str, str]) -> dict[str, set[str]
             text = read_text(path)
             sections = parse_delta_sections(text)
             where = rel(path)
+            target_chapter = accepted_chapter_for_delta(path, specs_root)
+            target_rel = rel(target_chapter) if target_chapter is not None else None
 
             for req_id in sections.get("MODIFIED", []):
-                if req_id not in accepted:
-                    report.fail(
-                        f"{where}: MODIFIED target `{req_id}` does not match a live "
-                        f"requirement in spec/specs/"
-                    )
+                _check_delta_target_in_chapter(
+                    report,
+                    where=where,
+                    kind="MODIFIED",
+                    req_id=req_id,
+                    accepted=accepted,
+                    target_rel=target_rel,
+                )
             for req_id in sections.get("REMOVED", []):
-                if req_id not in accepted:
-                    report.fail(
-                        f"{where}: REMOVED target `{req_id}` does not match a live "
-                        f"requirement in spec/specs/"
-                    )
+                _check_delta_target_in_chapter(
+                    report,
+                    where=where,
+                    kind="REMOVED",
+                    req_id=req_id,
+                    accepted=accepted,
+                    target_rel=target_rel,
+                )
             for entry in sections.get("RENAMED", []):
                 if "->" in entry:
                     src, _dst = entry.split("->", 1)
                 else:
                     src = entry
-                if src not in accepted:
-                    report.fail(
-                        f"{where}: RENAMED source `{src}` does not match a live "
-                        f"requirement in spec/specs/"
-                    )
+                _check_delta_target_in_chapter(
+                    report,
+                    where=where,
+                    kind="RENAMED",
+                    req_id=src,
+                    accepted=accepted,
+                    target_rel=target_rel,
+                )
             for req_id in sections.get("ADDED", []):
                 added_by_change[change_id].add(req_id)
                 if req_id in accepted:

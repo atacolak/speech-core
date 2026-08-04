@@ -186,6 +186,40 @@ class SpecContractFixtureTest(unittest.TestCase):
             report.failures,
         )
 
+    def test_modified_cross_chapter_target_fails(self) -> None:
+        """G2: MODIFIED must hit the delta path's target chapter, not any global id."""
+        write(
+            self.spec / "specs" / "alpha.md",
+            chapter("ACCEPTED — 2026-08-04", ["alpha.1"]),
+        )
+        write(
+            self.spec / "specs" / "beta.md",
+            chapter("ACCEPTED — 2026-08-04", ["beta.1"]),
+        )
+        change = self.spec / "changes" / "demo"
+        write(change / "proposal.md", "| **Status** | ACCEPTED |\n")
+        write(change / "tasks.md", "- [ ] x\n")
+        # Delta path targets alpha, but MODIFIED cites beta.1 which lives only in beta.
+        write(
+            change / "specs" / "alpha" / "spec.md",
+            """
+            ## MODIFIED Requirements
+
+            ### beta.1 — wrong chapter
+            body
+            """,
+        )
+        write_manifest(change, change_id="demo")
+        report = self.run_check()
+        self.assertTrue(
+            any(
+                "MODIFIED target `beta.1`" in f
+                and "not in target accepted chapter" in f
+                for f in report.failures
+            ),
+            report.failures,
+        )
+
     def test_added_existing_id_fails(self) -> None:
         write(
             self.spec / "specs" / "alpha.md",
@@ -323,6 +357,86 @@ class SpecContractFixtureTest(unittest.TestCase):
         self.assertTrue(
             any("stale" in w for w in report.warnings),
             report.warnings,
+        )
+
+    def test_archive_missing_implementation_commit_fails(self) -> None:
+        """G7: archived change.toml without implementation_commit fails."""
+        write(
+            self.spec / "specs" / "alpha.md",
+            chapter("ACCEPTED — 2026-08-04", ["alpha.1"]),
+        )
+        arch = self.spec / "archive" / "2026-08-04-demo"
+        write(
+            arch / "proposal.md",
+            """
+            | | |
+            |---|---|
+            | **Status** | SHIPPED |
+            """,
+        )
+        write(arch / "tasks.md", "- [x] done\n")
+        write(arch / "outcome.md", "shipped.\n")
+        write(
+            arch / "change.toml",
+            """
+            schema = "ata.spec-change/v1"
+            id = "demo"
+            class = "tooling"
+            status = "accepted"
+            canonical_base_branch = "feature/assistant-self-asr"
+            canonical_base_commit = "baa2785950a1a98ec33504c2175f46d148782645"
+            intent_revision = 1
+            intent_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            affected_capabilities = []
+            """,
+        )
+        report = self.run_check()
+        self.assertTrue(
+            any(
+                "missing implementation_commit" in f for f in report.failures
+            ),
+            report.failures,
+        )
+
+    def test_archive_nonexistent_implementation_commit_fails(self) -> None:
+        """G7: archived change.toml with unknown implementation_commit fails."""
+        write(
+            self.spec / "specs" / "alpha.md",
+            chapter("ACCEPTED — 2026-08-04", ["alpha.1"]),
+        )
+        arch = self.spec / "archive" / "2026-08-04-demo"
+        write(
+            arch / "proposal.md",
+            """
+            | | |
+            |---|---|
+            | **Status** | SHIPPED |
+            """,
+        )
+        write(arch / "tasks.md", "- [x] done\n")
+        write(arch / "outcome.md", "shipped.\n")
+        write(
+            arch / "change.toml",
+            """
+            schema = "ata.spec-change/v1"
+            id = "demo"
+            class = "tooling"
+            status = "accepted"
+            canonical_base_branch = "feature/assistant-self-asr"
+            canonical_base_commit = "baa2785950a1a98ec33504c2175f46d148782645"
+            intent_revision = 1
+            intent_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            affected_capabilities = []
+            implementation_commit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            """,
+        )
+        report = self.run_check()
+        self.assertTrue(
+            any(
+                "implementation_commit" in f and "does not exist" in f
+                for f in report.failures
+            ),
+            report.failures,
         )
 
 
