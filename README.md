@@ -56,7 +56,7 @@ dogfood (laptop)
 - `transcript_committed` is the authoritative per-turn snapshot. It is emitted after model drain and before `turn_closed`. Controllers dispatch on it.
 - `transcript_finalized` is diagnostic-only.
 - VAD proposes boundaries; smart-turn checks semantic completion; a 2500 ms acoustic fallback prevents hangs.
-- Sustained speech-like audio without ASR tokens for 7500 ms emits `turn_human_hold` and forces a degraded close.
+- Human-hold degraded close: see [`spec/specs/speech-in-turn-lifecycle.md`](spec/specs/speech-in-turn-lifecycle.md) (do not restate the threshold here).
 - RMS energy gating is available server-side as an onset veto. It is currently a fixed-threshold gate and is intentionally conservative.
 - Barge-in (dogfood): pause playback on the first alphanumeric user ASR token; provisional cut from wall-clock playback; async CTC refine when the warm align worker is up. Greying updates the same assistant line (dim spoken / white unsaid).
 

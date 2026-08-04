@@ -7,7 +7,8 @@ behavior_truth = "spec/README.md"
 charter = "CHARTER.md"
 docs_map = "docs/README.md"
 current_state = "docs/current-state.md"
-decisions = "docs/decisions"
+spec_decisions = "spec/decisions.md"
+architecture_decisions = "docs/decisions"
 active_evolution = "docs/evolution/ACTIVE.md"
 
 [work]
