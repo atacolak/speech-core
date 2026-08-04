@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted intent (operator ruling 2026-08-04) — awaiting implementation |
+| **Status** | **SHIPPED 2026-08-04** — implemented (`sc-rfi` → `a8886ef`), independently verified (`sc-9li` PASS), integrated (`sc-p5s`), steward-merged; see `outcome.md` |
 | **Touches** | `specs/speech-in-turn-lifecycle.md` (open question), daemon config default |
 
 ## Why
