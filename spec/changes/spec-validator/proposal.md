@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | PROPOSED — guarantee list ratified 2026-08-04 (decisions.md); implementation is execution-side |
 | **Class** | tooling — validates the spec area itself; changes no product behavior |
+| **Manifest** | `change.toml` in this folder (first dogfood of the transaction spine) |
 
 ## Why
 
@@ -25,6 +26,18 @@ mechanical checks don't.
    with no unchecked boxes, and an outcome.md.
 4. **No leaks** — no requirement ID introduced by an unarchived change appears
    in `spec/specs/` (deltas apply only via steward merge).
+
+## Tranche 2 (transaction-spine checks, adopted 2026-08-04)
+
+5. **Manifest presence** — every accepted change folder carries a valid
+   `change.toml` (`ata.spec-change/v1`) with required fields.
+6. **Digest current** — recomputing the intent digest from the folder's
+   semantic input yields `change.toml`'s recorded `intent_digest`.
+7. **Archive transaction completion** — an archived change's `change.toml`
+   carries `implementation_commit`, and the commit exists.
+8. **Lens freshness** — each `spec/flows/` lens records which chapters it
+   cites; a lens citing a chapter whose revision moved after the lens'
+   recorded check date is flagged `stale` (report only, not a failure).
 
 Non-goals: lint prose style, parse WHEN/THEN bodies, judge content quality.
 That judgment stays human/steward; the validator guards *placement and

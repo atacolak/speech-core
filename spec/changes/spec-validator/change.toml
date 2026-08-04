@@ -1,0 +1,24 @@
+schema = "ata.spec-change/v1"
+id = "spec-validator"
+class = "tooling"
+status = "accepted"
+
+canonical_base_branch = "feature/assistant-self-asr"
+canonical_base_commit = "baa2785950a1a98ec33504c2175f46d148782645"
+intent_revision = 1
+intent_digest = "sha256:e96dece38c83334cdad89209b2e233f6927fb567fa4fa769b653767171689e17"
+
+affected_capabilities = []
+affected_requirements = []
+exclusions = """
+Validates spec/ structure only. Touches no product behavior. Prose style,
+WHEN/THEN content, and content quality are explicitly NOT validator concerns —
+judgment stays with the steward/operator."""
+
+operator_authorization = """
+2026-08-04: "also a small validator to make this work as well" (commission);
+guarantee list ratified same day (decisions.md, validator entry); tranche-2
+adopted 2026-08-04 under the transaction-spine program."""
+
+# implementation_root / implementation_target_branch / implementation_commit:
+# filled at dispatch and reconcile time.

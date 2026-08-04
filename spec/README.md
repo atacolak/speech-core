@@ -15,6 +15,7 @@ Stewarded by the **steward**. Nothing outside `spec/` is theirs to touch.
 | `changes/` | proposals under discussion (uncommitted drafts; conversation in progress) |
 | `archive/` | shipped history — dated folders `archive/YYYY-MM-DD-<name>/`; closed means *complete*: tasks checked, proposal marked shipped, outcome recorded |
 | `flows/` | reading lenses — end-to-end walks (e.g. a spoken sentence through the system) that cite chapters; re-checked whenever a cited chapter changes |
+| `change-toml.md` | the manifest schema (`ata.spec-change/v1`) — every change folder carries a machine-readable `change.toml` spine; states describe artifacts, never conversations |
 | `decisions.md` | the why-log: every choice, why, alternatives, revisit-trigger |
 
 ## How to read a spec (pick your altitude)

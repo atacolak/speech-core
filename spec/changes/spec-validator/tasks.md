@@ -9,5 +9,8 @@ Downstream implementation; spawn as a bead only on the operator's word.
       `spec/` and report zero findings
 - [ ] Report findings in plain human language with file paths (the reader is
       the operator, not a CI parser)
-- [ ] Steward: verify the four guarantees against the real tree, then archive
-      this change
+- [ ] Tranche 2: manifest presence, digest recomputation, archive transaction
+      completion, lens-freshness flags (see `proposal.md` §Tranche 2)
+- [ ] Steward: verify all guarantees against the real tree, then archive
+      this change — archiving this specific change is ALSO the dogfood archive
+      under the manifest rules (eating our own cooking)

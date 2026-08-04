@@ -8,6 +8,66 @@ over time they get indexed here so there is one place to look.
 
 ---
 
+## 2026-08-04 — the spec-transaction spine is adopted; Gas City builds it
+
+Choice: adopt the transaction architecture: (a) a **spec transaction root**
+outlives implementation beads — it closes only at canonical convergence, never
+at "verified code"; (b) every change carries `change.toml` (`ata.spec-change/v1`)
+— id, class, canonical base, intent digest, affected requirements, exclusions;
+(c) a second receipt `ata.spec-convergence/v1` sits beside the implementation
+verification receipt — it proves *this exact delta matches this exact code*,
+with constrained verdicts (match / code-repair-required / evidence-required /
+intent-revision-required / blocked); (d) a fingerprinted order wakes the
+steward on spec-change roots reaching integrated-verified; (e) root closure
+gains a spec-aware branch (convergence receipt + digest equality + validator
++ archive commit) — ordinary operational roots are untouched; (f) construction
+sequence: wiring repairs → change.toml + one manual run → steward registration
++ reconciliation wake + receipts → closure gate → controlled autonomy.
+Why: an independent review verified the gap is real (managers cold-start
+spec-blind; `behavior_truth` unenforced; verified work can bypass the spec).
+The machinery is plumbing, not cognition — it hardens the agreed floor into
+checkable receipts and stays compatible with "the manager derives its own
+work graph."
+Constraint recorded: transaction states describe **artifacts, not
+conversations** — no state may gate what the operator and steward may discuss.
+Alternatives: staged OpenSpec CLI adoption (previously rejected); verbal
+conventions only (failed today — the spec-change binding was hand-authored).
+Revisit when: two transactions have run through the full spine; the closure
+gate is live and its false-positive cost is known. Also recorded: the city
+itself has no spec area yet — transaction machinery will be built without a
+living spec of its own; debt, named.
+
+## 2026-08-04 — two-act authorization: shaping vs implementation
+
+Choice: operator sentences split into two durable acts. **Act 1 (authorize
+shaping)**: "this feels wrong / I want this" mints a change-request bead — the
+steward investigates and drafts the exact delta; no worker may touch product
+behavior on Act 1 alone. **Act 2 (accept exact intent)**: the operator accepts
+the frozen delta (digest recorded) — only then may an implementation root
+exist. Fast path: naming an already-accepted change ("implement
+changes/<name>") is Act 2 already satisfied.
+Operator's restatement, recorded as the intended interaction: *"I talk to the
+manager about the ways I want the software to change; it raises it to the
+steward; with the steward I talk implementation, where we decide how we
+actually want to spec this thing."* Precision added in conversation: with the
+steward you settle **what must be true**; the manager owns **how to make it
+true**. Routing through the manager is convenience, not a wall — the operator
+may bring changes directly to the steward.
+Revisit when: root intake implements the two routes (`authorize-change-request`,
+`accept-spec-change`) and the first shaped change has run both acts.
+
+## 2026-08-04 — branch of record: `feature/assistant-self-asr`
+
+Choice: `feature/assistant-self-asr` is the branch of record; merging to
+`main` is deferred until the product is satisfactory for real use.
+`spec/recon-001` was merged into it (fast-forward `e377491 → baa2785`,
+2026-08-04, executed by the steward under explicit operator instruction —
+scoped one-off exception to the no-merge rule) and the working checkout now
+tracks `feature/assistant-self-asr`. `change.toml` records `canonical_base_*`
+against this branch. Branch-of-record changes are operator rulings, recorded
+here; never inferred from "current checkout" or city defaults.
+Revisit when: the dogfood loop is satisfactory → the `main` conversation.
+
 ## 2026-08-04 — spec compartmentalization: layers and lenses, not one book
 
 Choice: the spec system is compartmentalized along two axes: (1) **capability
