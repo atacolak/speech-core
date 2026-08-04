@@ -62,6 +62,10 @@ two competing truths; new behavior mislabeled as MODIFIED has nothing to replace
 | `specs/speech-in-turn-lifecycle.md` | how speech input becomes a committed turn | **accepted 2026-08-04** |
 | `specs/audio-ingress-transport.md` | the wire contract between adapters and daemon | *converging from recon draft B* |
 
+| archive | shipped |
+|---|---|
+| `archive/human-hold-threshold/` | **2026-08-04** — first full loop: ruling → managed delivery → independent pass → merge |
+
 The charter (`../CHARTER.md`) is the constitution of this rig: purpose, authority
 boundaries, invariants. Specs must never contradict it; when one would, the
 charter wins and we bring the conflict to the operator. The steward sweeps every

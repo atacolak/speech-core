@@ -73,13 +73,29 @@ snapshot yields an empty string and the events still flow in the guaranteed
 order. *(OBSERVED: `turn.rs:1411` `unwrap_or_default`; human-hold path
 `turn.rs:455-529`)*
 
-### turn.6 — close sources and the degraded flag
+### turn.6 — close sources, the degraded flag, and the human-hold threshold
 Closers: `vad`, `smart_turn`, `model_eou` (disabled by default), `human_hold`,
 `transcript_silence`, `vad_acoustic_fallback`, `session_end`, `audio_gap`.
 A VAD-only close marks the turn `degraded=true`; a smart-turn close is
 `degraded=false`. *(INFERRED: `degraded` is the code's operationalization of
 charter invariant 5 — qualified estimates, not unqualified facts; the charter
 does not name the flag. OBSERVED: close-source arms in `handle_signal`)*
+
+The human-hold close SHALL use a threshold of **7500 ms of speech-like audio
+without committed tokens**, single-sourced across all configuration surfaces.
+*WHEN* any code path constructs the turn-manager configuration — CLI defaults,
+`TurnManagerConfig::default()`, or a test fixture — *THEN* the human-hold
+threshold is 7500 ms or an explicit override, and no surface carries a
+conflicting literal. *(OBSERVED: CLI default `main.rs:293-299`, wired at
+`main.rs:443`; struct default `turn.rs:52`; regression test
+`turn_manager_config_default_human_hold_silence_ms_is_7500` `turn.rs:2672`.
+Change `human-hold-threshold`, beads `sc-rfi` (impl), `sc-9li` (independent
+pass), `sc-p5s` (integrate), commit `a8886ef`.)*
+*WHEN* speech-like audio (voice or ambient noise) persists for 7500 ms while
+the model commits zero tokens — detection evidence never matures into words —
+*THEN* the turn closes as `human_hold`, committing possibly-empty text in the
+guaranteed close order (turn.3). *(OBSERVED: human-hold path
+`turn.rs:455-529`)*
 
 ### turn.7 — semantic gating fails open
 Smart-turn's "not complete" verdict suppresses a VAD close only when semantic
@@ -150,19 +166,20 @@ multi-turn exercised in `turn.rs mod tests`)*
 - **One authoritative alignment budget** — two numbers live (3000 default,
   800 floor) — UNRESOLVED (revisit when an operator latency budget or SLO must
   pick one).
-- **human-hold default conflict** — running daemon wires CLI default 7500 ms;
-  `TurnManagerConfig::default()` says 12000 ms; a code comment says "typically
-  7500ms". Both values exist today — UNRESOLVED (revisit when tests build
-  `TurnManagerConfig` via `Default`, or a config/UX change must name one
-  threshold).
 - **Who consumes `transcript_committed`** — currently no controller; event log
   and broadcast only — UNRESOLVED (revisit when a controller or external
   consumer is introduced).
 
 ## Evidence & reconciliation notes
 
-*Verified 2026-08-04 against `crates/` @ `spec/recon-001` (14d6fe4).*
-All structural claims of recon draft A confirmed. Divergences from the draft:
+*Verified 2026-08-04 against `crates/` @ `spec/recon-001` (`a8886ef`).*
+All structural claims of recon draft A confirmed. Change
+`human-hold-threshold` merged 2026-08-04 after code convergence: implementation
+`sc-rfi` CLOSED at commit `a8886ef`, independent verification `sc-9li` PASS
+(distinct verifier session), integration `sc-p5s` CLOSED with typed closure
+memory; steward Road-1 check re-ran the regression test and re-classified all
+remaining `12000` literals (unrelated: sample/timeline fixtures only).
+Divergences from the draft:
 
 - **Test count drifted**: draft said "69 unit tests in daemon"; today 59
   `#[test]` functions exist in the daemon crate (plus 7 in the protocol
