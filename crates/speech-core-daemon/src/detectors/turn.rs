@@ -47,7 +47,9 @@ impl Default for TurnManagerConfig {
             model_progress: None,
             model_drain: None,
             model_alignment_timeout_ms: 3000,
-            human_hold_silence_ms: 12000,
+            // Spec-change human-hold-threshold: single-source default is 7500 ms
+            // (operator-ratified; matches daemon CLI default).
+            human_hold_silence_ms: 7500,
             transcript_silence_close_ms: 700,
             semantic_gate_enabled: false,
             semantic_gate_close_enabled: false,
@@ -2665,6 +2667,13 @@ mod tests {
         );
         assert_suppressed(&events, "vad", "vad_too_short");
         assert_no_event(&events, "turn_closed");
+    }
+
+    #[test]
+    fn turn_manager_config_default_human_hold_silence_ms_is_7500() {
+        // Spec-change human-hold-threshold: protect the operator-ratified default
+        // so TurnManagerConfig::default() cannot drift back to the latent 12000 ms.
+        assert_eq!(TurnManagerConfig::default().human_hold_silence_ms, 7500);
     }
 
     #[test]
