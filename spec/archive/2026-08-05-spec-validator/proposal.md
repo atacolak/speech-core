@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | PROPOSED — guarantee list ratified 2026-08-04 (decisions.md); implementation is execution-side |
+| **Status** | SHIPPED 2026-08-05 — impl sc-o6j `9d78b2a`; review FAIL sc-6yu; remediation sc-p6d `285cc1c`; independent re-review PASS sc-qm1 (`verification:sc-qm1-g2-g7-remediation-review`); steward verified live (guarantees 1–8 clean, 13 tests green) |
 | **Class** | tooling — validates the spec area itself; changes no product behavior |
 | **Manifest** | `change.toml` in this folder (first dogfood of the transaction spine) |
 

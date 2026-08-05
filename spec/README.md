@@ -80,6 +80,7 @@ two competing truths; new behavior mislabeled as MODIFIED has nothing to replace
 | archive | shipped |
 |---|---|
 | `archive/2026-08-04-human-hold-threshold/` | **2026-08-04** — first full loop: ruling → managed delivery → independent pass → merge |
+| `archive/2026-08-05-spec-validator/` | **2026-08-05** — transaction spine exercised: review FAIL → bounded remediation → re-review PASS; own-dogfood archive |
 
 The charter (`../CHARTER.md`) is the constitution of this rig: purpose, authority
 boundaries, invariants. Specs must never contradict it; when one would, the

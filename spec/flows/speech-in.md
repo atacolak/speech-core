@@ -1,5 +1,8 @@
 # Flow: a spoken sentence through Speech Core
 
+| **Checked** | 2026-08-04 |
+| **Cites** | audio-ingress-transport, speech-in-turn-lifecycle, event-observability-surface |
+
 A reading lens, not a contract. Every claim below points at the chapter that
 owns it; when a cited chapter changes, this flow gets re-checked.
 

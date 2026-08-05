@@ -8,6 +8,22 @@ over time they get indexed here so there is one place to look.
 
 ---
 
+## 2026-08-04 — workflow continuation activated (end of ball-boy mode)
+
+Ruling: operator authorized enabling `our-town-v2/orders/managed-delivery-continue.toml`
+(`enabled = true`) — verbatim: *"ok i authorize for you to turn it on if it
+means they will execute this e2e."* Mechanical step advancement (review and
+close steps sling themselves on `bead.closed`) no longer requires an operator
+poke per step. Executed by the steward as a scoped one-off exception (town
+machinery is outside the steward surface); the edit is uncommitted in the
+town's shared working tree per the town's current dirty-tree posture.
+Boundary preserved: this automates **advancement**, never **authority** —
+operator gates (ratifications, change acceptance, steward convergence) remain
+human acts. Sibling order `managed-rig-graph-continue` left disabled until a
+rig-graph run needs it.
+Revisit when: the first self-chained round completes — if stalls persist, the
+next reflex is witness-style stall detection (Phase 2), not more pokes.
+
 ## 2026-08-04 — the spec-transaction spine is adopted; Gas City builds it
 
 Choice: adopt the transaction architecture: (a) a **spec transaction root**

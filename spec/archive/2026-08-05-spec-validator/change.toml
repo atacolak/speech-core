@@ -20,5 +20,10 @@ operator_authorization = """
 guarantee list ratified same day (decisions.md, validator entry); tranche-2
 adopted 2026-08-04 under the transaction-spine program."""
 
-# implementation_root / implementation_target_branch / implementation_commit:
-# filled at dispatch and reconcile time.
+implementation_root = "sc-cq9"
+implementation_target_branch = "feature/assistant-self-asr"
+# original candidate 9d78b2a failed review sc-6yu (G2 scoping, G7 untested);
+# remediation 285cc1c re-reviewed PASS (sc-qm1). Final landed candidate:
+implementation_commit = "285cc1c95a4a56325d13e566821508b0fc07a92a"
+independent_review = "verification:sc-qm1-g2-g7-remediation-review"
+prior_review_fail = "verification:sc-6yu-spec-validator-impl-review"
