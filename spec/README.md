@@ -77,6 +77,17 @@ two competing truths; new behavior mislabeled as MODIFIED has nothing to replace
 | `specs/audio-ingress-transport.md` | the wire contract between adapters and daemon | **accepted 2026-08-04** |
 | `specs/event-observability-surface.md` | which events exist, what is live-only, what is durable | **accepted 2026-08-04** |
 
+### not yet accepted (parked / direction)
+
+| path / name | what it would cover | current home | status |
+|---|---|---|---|
+| `speech-out` (chapter not opened) | synthesis, playback, cancel, qualified audibility | ADR-001 + `docs/evolution/` progressive-audio / interruption specs | **parked** — do not invent an accepted chapter until operator opens a real change |
+| other evolution drafts | Talker/Pi binding, event identity target, delivery plan, eval gates | `docs/evolution/*.md` | **direction only** — not `spec/specs/` truth; acceptance is per future change |
+
+Parked names are navigational honesty, not promises. Nothing in this table is
+accepted behavior. A parked row becomes a real chapter only through the normal
+change loop (proposal → operator accept → implementation → steward merge).
+
 | archive | shipped |
 |---|---|
 | `archive/2026-08-04-human-hold-threshold/` | **2026-08-04** — first full loop: ruling → managed delivery → independent pass → merge |
