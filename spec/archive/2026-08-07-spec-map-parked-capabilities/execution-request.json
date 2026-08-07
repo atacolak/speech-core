@@ -1,0 +1,23 @@
+{
+  "acceptance": "- `spec/README.md` contains a **not yet accepted (parked / direction)** table\n  placed after the accepted-chapters TOC and before the archive TOC.\n- Table includes a `speech-out` parked row pointing at ADR-001 +\n  `docs/evolution/` (progressive-audio / interruption), marked **parked**.\n- Table notes other `docs/evolution/*.md` drafts as **direction only**, not\n  `spec/specs/` truth.\n- One honesty sentence under the table states parked names are navigational\n  only and become chapters only through the normal change loop.\n- Diff is README-only (no `spec/specs/`, runtime, charter, ADR, flow, or\n  validator edits).\n- `scripts/check-spec-contract.py` still reports zero findings on the tree\n  after the edit (if run).",
+  "accepted_revision": 2,
+  "change_path": "/home/sf/workspace/speech-core/spec/changes/spec-map-parked-capabilities",
+  "exclusions": "Map/docs only. Does not open a speech-out chapter, does not ratify any ADR,\ndoes not edit spec/specs/, does not change runtime, config, validator\nguarantees, charter, or flows. Parked rows are navigational honesty only.",
+  "intent_digest": "sha256:4579621adeb675b938db58849f023e60f1b08257f9d2772e82f75f85e92d6db9",
+  "objective": "Make the `spec/README.md` table of contents honestly show capabilities that are not yet accepted chapters — so the existing flow pointer to “speech-out parked on ADR-001 — see spec/README map” resolves to a real map row, without opening any new accepted chapter or claiming product behavior.",
+  "operator_authorization": {
+    "accept_content_hash": "sha256:56657372ea75c121e2cce5778f4c6118b14a4ddc8e00501d1f1cbb10fe8db665",
+    "accept_message_record_id": "3db05d20",
+    "accept_timestamp": "2026-08-07T09:26:02Z",
+    "authorization_phrase": "alr lgtm!!",
+    "source": "steward-accept",
+    "steward_session_id": "speech-core/steward",
+    "transcript_ref": "pi-transcript:steward:019fcff2-eff0-75b6-acb1-f57cc1b489e0#3db05d20"
+  },
+  "rig": "speech-core",
+  "schema": "ata.execution-request/v1",
+  "scope": "spec-bound change spec-map-parked-capabilities at accepted revision 2",
+  "spec_change_id": "spec-map-parked-capabilities",
+  "title": "Add parked-capabilities row to the speech-core spec map",
+  "unresolved_questions": []
+}

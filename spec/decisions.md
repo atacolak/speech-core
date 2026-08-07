@@ -289,3 +289,16 @@ deferred: churn for no information gain; index them instead.
 
 **Revisit when:** the city defines a cross-rig spec-area standard, or the operator
 finds the four-question file shape fails the "easy to read" test in practice.
+
+---
+
+## 2026-08-07 — park speech-out on the spec map (navigational honesty only)
+
+**Choice:** Add a **not yet accepted (parked / direction)** table to `spec/README.md` with a `speech-out` parked row (ADR-001 + evolution progressive-audio/interruption) and a direction-only note for other `docs/evolution/*.md` drafts — without opening a speech-out chapter or claiming product behavior.
+
+**Why:** `spec/flows/speech-in.md` already pointed readers at “speech-out parked on ADR-001 — see spec/README map”, but the map listed only accepted chapters and archives. Closing that one-screen gap keeps the reading lens honest. Process dogfood for steward-accept mint → managed-rig-graph → independent PASS → steward-convergence-wake.
+
+**Alternatives:** Open a full speech-out accepted chapter now — rejected: no operator commission for behavior truth; would invent contract. Leave the dangling pointer — rejected: map/lens disagreement is exactly the honesty failure the spec area exists to prevent. Fold evolution drafts into accepted specs — rejected: direction ≠ acceptance.
+
+**Revisit when:** operator opens a real speech-out (or other parked) change; or town aligns city intent_digest canonicalization with local G6 (`proposal+tasks` vs change.toml intent-spine) so active-package validation matches freeze.
+

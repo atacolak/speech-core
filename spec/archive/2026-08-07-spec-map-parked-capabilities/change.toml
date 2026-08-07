@@ -1,0 +1,34 @@
+schema = "ata.spec-change/v1"
+id = "spec-map-parked-capabilities"
+class = "process"
+status = "accepted"
+
+canonical_base_branch = "feature/assistant-self-asr"
+canonical_base_commit = "f4a0ea4a9f53949c04954cccc3a104c16ac62da3"
+intent_revision = 2
+intent_digest = "sha256:4579621adeb675b938db58849f023e60f1b08257f9d2772e82f75f85e92d6db9"
+
+affected_capabilities = []
+affected_requirements = []
+exclusions = """
+Map/docs only. Does not open a speech-out chapter, does not ratify any ADR,
+does not edit spec/specs/, does not change runtime, config, validator
+guarantees, charter, or flows. Parked rows are navigational honesty only."""
+
+operator_authorization = """
+2026-08-07 steward session otv-o040u / speech-core/steward: operator accept
+phrase exactly: alr lgtm!!
+accept_message_record_id: 3db05d20
+pi session: 019fcff2-eff0-75b6-acb1-f57cc1b489e0 @ 2026-08-07T08:39:11.906Z
+Re-freeze intent_revision=2 same session: proposal repaired to human H1 +
+## Objective + ## Acceptance contract before mint (Why is not objective).
+"""
+
+implementation_root = "sc-9c9"
+implementation_target_branch = "feature/assistant-self-asr"
+implementation_commit = "84acb81dbf4892db6f67b0c48ef7d843ca8acc5b"
+independent_review = "sc-po4 PASS (rf__verifier-otv-qok6g; distinct session from implementer sc-cp0/rf__worker-otv-ychbt)"
+# intent_digest above is the city freeze (execution-request canonical meaning
+# including change.toml intent-spine). Local scripts/check-spec-contract.py G6
+# uses proposal.md+tasks.md only and recomputes a different value; G6 applies
+# to active changes/ only. See outcome.md.

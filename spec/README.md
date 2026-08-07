@@ -92,6 +92,7 @@ change loop (proposal → operator accept → implementation → steward merge).
 |---|---|
 | `archive/2026-08-04-human-hold-threshold/` | **2026-08-04** — first full loop: ruling → managed delivery → independent pass → merge |
 | `archive/2026-08-05-spec-validator/` | **2026-08-05** — transaction spine exercised: review FAIL → bounded remediation → re-review PASS; own-dogfood archive |
+| `archive/2026-08-07-spec-map-parked-capabilities/` | **2026-08-07** — parked/direction TOC on map; process dogfood (steward-accept → graph → PASS → convergence wake) |
 
 The charter (`../CHARTER.md`) is the constitution of this rig: purpose, authority
 boundaries, invariants. Specs must never contradict it; when one would, the
