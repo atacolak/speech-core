@@ -25,7 +25,7 @@ Reproduce: [`../../scripts/cosyvoice_qual/reproduce.sh`](../../scripts/cosyvoice
 | Runtime path | in-process `AutoModel` → `inference_zero_shot(..., stream=True)` @ **24 kHz** float PCM |
 | Python | 3.10.20 (uv-managed) |
 | Torch | `2.3.1+cu121` / torchaudio `2.3.1` |
-| Isolation root | `/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4` (not Supertonic venvs) |
+| Isolation root | `~/.cache/speech-out/cosyvoice-qual-sc-e71.4` (not Supertonic venvs) |
 
 ### Fallback pin (not executed this run)
 
@@ -69,9 +69,9 @@ Byte sizes match the navigator tree listing; content digests differ from LFS poi
 
 Supertonic paths **not** modified:
 
-- `/home/sf/.cache/speech-out/supertonic-venv`
-- `/home/sf/.cache/speech-out/supertonic-venv-gpu`
-- `/home/sf/.cache/supertonic3`
+- `~/.cache/speech-out/supertonic-venv`
+- `~/.cache/speech-out/supertonic-venv-gpu`
+- `~/.cache/supertonic3`
 
 Optional packages skipped vs upstream `requirements.txt` (not required for `AutoModel` zero-shot path): `deepspeed`, `tensorrt-*`, `gradio`, `fastapi` stack. Full freeze: lockfile above. `openai-whisper==20231117` required by frontend import (installed with `setuptools==69.5.1`).
 
@@ -93,7 +93,7 @@ Optional packages skipped vs upstream `requirements.txt` (not required for `Auto
 | `en_cancel_break_after_1_chunk` | long EN paragraph | stream, break after 1 chunk |
 
 WAV artifacts (local cache, not committed):  
-`/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/*.wav`
+`~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/*.wav`
 
 ---
 
@@ -183,7 +183,7 @@ Criteria from bead notes / navigator (warm first PCM 300–500 ms, cancel ≤1 h
 
 1. Do **not** point `speech-out` at CosyVoice; leave `SPEECH_OUT_BACKEND=supertonic-http` / managed Supertonic as today.  
 2. Qualification tree is disposable:  
-   `rm -rf /home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4`  
+   `rm -rf ~/.cache/speech-out/cosyvoice-qual-sc-e71.4`  
    (does not affect Supertonic caches).  
 3. wetext side cache: `~/.cache/modelscope/hub/pengzhendong/wetext` (optional remove).  
 4. No production config, unit, or binary was changed by this run.
@@ -196,7 +196,7 @@ Criteria from bead notes / navigator (warm first PCM 300–500 ms, cancel ≤1 h
 # from speech-core checkout
 ./scripts/cosyvoice_qual/reproduce.sh
 # or with explicit roots:
-COSYVOICE_QUAL_ROOT=/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4 \
+COSYVOICE_QUAL_ROOT=~/.cache/speech-out/cosyvoice-qual-sc-e71.4 \
   ./scripts/cosyvoice_qual/reproduce.sh --skip-download
 ```
 
@@ -233,6 +233,6 @@ Expected independent checks:
 | `docs/qualification/cosyvoice-sc-e71.4-requirements-lock.txt` | pip freeze |
 | `scripts/cosyvoice_qual/run_qualification.py` | harness |
 | `scripts/cosyvoice_qual/reproduce.sh` | reproducible commands |
-| `/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/` | isolated env, models, WAVs, logs |
+| `~/.cache/speech-out/cosyvoice-qual-sc-e71.4/` | isolated env, models, WAVs, logs |
 
 Navigator pin source: `our-town-v2` transcript `run_cc05d0b5d727`.

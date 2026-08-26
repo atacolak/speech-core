@@ -2,8 +2,6 @@
 
 Real-time speech substrate for human-agent interaction.
 
-> **current branch:** `feature/assistant-self-asr` contains the live dogfood loop with barge-in cut (provisional wall-clock → async CTC) and TUI greying. It is not merged to `main` yet.
-
 ## Start here
 
 This file is the front door. It tells you what exists and how to run it.
@@ -29,7 +27,7 @@ agent loop  → decides what to do with a completed turn
 
 The mature seam is **speech-in**. It runs a separate **speech-core-daemon** that ingests timestamped PCM, transcribes with Nemotron, detects voice activity with Silero, semantically endpoints with smart-turn v3, and emits immutable per-turn transcripts.
 
-**speech-out** is a separate TTS/playback daemon. Input and output do not share a process because their failure modes differ: speech-in must stay low-latency; speech-out owns model warmup, queues, and interruption.
+**speech-out** is a separate TTS/playback daemon. live pin is **qwentts.cpp Q8 CustomVoice** (`ata-speech-tts.service` on `:18091`, daemon on `:8788`). CosyVoice is rollback only. Input and output do not share a process because their failure modes differ.
 
 ## Components
 
@@ -42,7 +40,7 @@ speech-in
   speech-core-protocol    shared messages
 
 speech-out
-  speech-out              TTS + playback (HTTP TTS → websocket audio frames)
+  speech-out              TTS + playback (qwentts progressive PCM over websocket)
 
 dogfood (laptop)
   speech-out-live-session[-dogfood]   mic + TUI + TTS + barge-in cut (canned reply)
@@ -69,7 +67,7 @@ dogfood (laptop)
 | `SPEECH_CORE_MODEL_PATH` | Nemotron GGUF |
 | `SPEECH_CORE_VAD_MODEL_PATH` | Silero VAD ONNX |
 | `SPEECH_CORE_SMART_TURN_MODEL_PATH` | smart-turn-v3 ONNX |
-| `SPEECH_OUT_STEPS` | Supertonic quality steps (dogfood default **5**; lower is faster, worse) |
+| `SPEECH_OUT_QWENTTS_VOICE` | live named speaker (default **ryan**; `default` aliases here) |
 | `SPEECH_OUT_ASSISTANT_SELF_ASR` | dual-Nemotron self-ASR (`0` default — off) |
 | `SPEECH_OUT_CUPE_LIVE` | experimental live position tracker (`0` default — off) |
 | `SPEECH_OUT_ALIGN_BACKEND` | barge refine backend (`ctc_forced` when align stack present) |
@@ -84,7 +82,7 @@ Server:
 
 ```bash
 ./scripts/install-speech-core-daemon.sh
-systemctl --user restart speech-core-daemon
+systemctl --user restart ata-speech-core
 ```
 
 Laptop (NixOS — build natively):
@@ -151,13 +149,13 @@ Use [`docs/README.md`](docs/README.md) as the canonical map. The most common ref
 
 **Honest limits:**
 
-- Supertonic at steps ≥ 5 is ~0.5 s synth floor on the current host (full WAV, not progressive PCM stream)
-- GPU ONNX path was tried on GTX 1060 and failed (cuDNN); production TTS stays CPU
+- speech-out pcm **out** streams (~70 ms first usable). text **in** is one complete `speak`. CosyVoice is not live.
+- GPU TTS is qwentts.cpp on the 4070 (~2.4 GB), not CPU Supertonic
 - CUPE live and dual-Nemotron self-ASR are off by default
 
 **Later:**
 
 - Controller: consume `transcript_committed`, dispatch agent turns, manage assistant/user alternation
-- Streaming TTS or a working accelerator without dropping quality below steps 5
+- call-side first-clause flush (voicecat SENTENCE → clause). not CosyVoice token-bistream
 - Mic-open empty first turn / adaptive energy gate during TTS
 - Monolith cleanup (`turn.rs`, watch TUI, golden scripts) once the controller contract is stable

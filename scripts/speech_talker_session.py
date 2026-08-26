@@ -713,7 +713,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=os.environ.get("TALKER_MODEL", "cpa/deepseek-v4-flash"))
     p.add_argument("--thinking", default=os.environ.get("TALKER_THINKING", "low"))
     p.add_argument("--pi-session", default="", help="stable pi session id for multi-turn")
-    p.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "/home/sf/workspace/.pi/bin/pi"))
+    p.add_argument("--pi-bin", default=os.environ.get("PI_BIN", str(home / "workspace/.pi/bin/pi")))
     p.add_argument("--voice", default=os.environ.get("SPEECH_OUT_VOICE", env.get("SPEECH_OUT_VOICE", "M1")))
     p.add_argument("--lang", default=os.environ.get("SPEECH_OUT_LANG", "en"))
     p.add_argument("--steps", type=int, default=int(os.environ.get("SPEECH_OUT_STEPS", env.get("SPEECH_OUT_STEPS", "5"))))

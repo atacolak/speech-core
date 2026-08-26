@@ -376,7 +376,7 @@ for cand in \
   "$libexec_dir/barge_in_align/align_worker.py" \
   "$script_dir/barge_in_align/align_worker.py" \
   "$repo_root/scripts/barge_in_align/align_worker.py" \
-  /home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py; do
+  $HOME/workspace/speech-core/scripts/barge_in_align/align_worker.py; do
   if [[ -f "$cand" ]]; then align_worker_script="$cand"; break; fi
 done
 
@@ -386,13 +386,13 @@ for cand in \
   "$libexec_dir/align_spike/cupe_live_track.py" \
   "$script_dir/align_spike/cupe_live_track.py" \
   "$repo_root/scripts/align_spike/cupe_live_track.py" \
-  /home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py; do
+  $HOME/workspace/speech-core/scripts/align_spike/cupe_live_track.py; do
   if [[ -f "$cand" ]]; then cupe_live_script="$cand"; break; fi
 done
 if [[ -z "${align_python:-}" ]]; then
   for cand in \
     "$HOME/workspace/.venvs/pyannote-cpu/bin/python" \
-    /home/sf/workspace/.venvs/pyannote-cpu/bin/python \
+    $HOME/workspace/.venvs/pyannote-cpu/bin/python \
     "${SPEECH_CORE_PYTHON3:-}" \
     "${SPEECH_CORE_ALIGN_PYTHON:-}"; do
     [[ -n "$cand" && -x "$cand" ]] || continue
@@ -1230,8 +1230,8 @@ ensure_remote_align_worker() {
   local host remote_py remote_worker remote_sock remote_port
   host="$(printf '%s' "$core_ws_url" | sed -E 's#^ws://([^/:]+).*#\1#')"
   [[ -n "$host" ]] || return 1
-  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-  remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
+  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-$HOME/workspace/.venvs/pyannote-cpu/bin/python}"
+  remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-$HOME/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
   remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
   remote_port="${align_tcp_port:-8791}"
   align_tcp_target="${align_tcp_target:-${host}:${remote_port}}"
@@ -1252,13 +1252,13 @@ ensure_remote_align_worker() {
   fi
 
   echo "[$(date --iso-8601=seconds)] assistant_cut: starting remote TCP worker host=$host port=$remote_port" >>"$trigger_log"
-  ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+  ssh -o BatchMode=yes -o ConnectTimeout=3 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
     "rm -f $(printf '%q' "$remote_sock"); \
      pkill -f 'align_worker.py' 2>/dev/null || true; \
      SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} \
      SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} \
      SPEECH_OUT_ALIGN_TCP_PORT=${remote_port} \
-     PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+     PYTHONPATH=$HOME/workspace/speech-core/scripts \
      nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") \
        --sock $(printf '%q' "$remote_sock") --tcp-bind 0.0.0.0 --tcp-port ${remote_port} --serve \
        >/tmp/speech-core-align-worker.log 2>&1 &" \
@@ -1320,8 +1320,8 @@ ensure_cupe_warm_worker() {
   if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
     return 0
   fi
-  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-  remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-/home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
+  remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-$HOME/workspace/.venvs/pyannote-cpu/bin/python}"
+  remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-$HOME/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
   remote_sock="${SPEECH_OUT_CUPE_SOCK_REMOTE:-/tmp/speech-core-cupe-live.sock}"
   echo "[$(date --iso-8601=seconds)] cupe_live: starting warm worker $host:$port" >>"$trigger_log"
   # Prefer local start when we are the speech host (dogfood host == core).
@@ -1331,7 +1331,7 @@ ensure_cupe_warm_worker() {
       nohup "$remote_py" "$remote_script" --serve --sock "$remote_sock" --tcp-bind 0.0.0.0 --tcp-port "$port" \
       >/tmp/speech-core-cupe-worker.log 2>&1 &
   else
-    ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
       "pkill -f 'cupe_live_track.py --serve' 2>/dev/null || true; \
        PYTHONPATH=/tmp/align-spike/bournemouth-forced-aligner:\$PYTHONPATH \
        nohup $(printf '%q' "$remote_py") $(printf '%q' "$remote_script") \
@@ -1383,7 +1383,7 @@ start_cupe_live_tracker() {
 
   target="$(cupe_worker_tcp_target)"
   host="${target%%:*}"
-  py="${align_python:-${SPEECH_CORE_ALIGN_PYTHON:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}}"
+  py="${align_python:-${SPEECH_CORE_ALIGN_PYTHON:-$HOME/workspace/.venvs/pyannote-cpu/bin/python}}"
   if [[ ! -x "$py" ]]; then py="${PYTHON3_BIN:-python3}"; fi
 
   remote_events="/tmp/speech-core-cupe-live-${session_id}.jsonl"
@@ -1391,7 +1391,7 @@ start_cupe_live_tracker() {
   rm -f "$remote_stop" 2>/dev/null || true
   # if host is remote and we can ssh, clear stop there too
   if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
-    ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" "rm -f $(printf '%q' "$remote_stop")" 2>/dev/null || true
+    ssh -o BatchMode=yes -o ConnectTimeout=2 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" "rm -f $(printf '%q' "$remote_stop")" 2>/dev/null || true
   fi
   printf '%s\n' "$remote_events" >"$assistant_cut_dir/cupe_live.remote_events"
   printf '%s\n' "$remote_stop" >"$assistant_cut_dir/cupe_live.remote_stop"
@@ -1405,14 +1405,14 @@ start_cupe_live_tracker() {
       sleep 0.1
       _w=$((_w + 1))
     done
-    remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-    remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-/home/sf/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
+    remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-$HOME/workspace/.venvs/pyannote-cpu/bin/python}"
+    remote_script="${SPEECH_OUT_CUPE_LIVE_REMOTE_SCRIPT:-$HOME/workspace/speech-core/scripts/align_spike/cupe_live_track.py}"
     ps_ms="${play_ms:-0}"
     if [[ -f "$assistant_cut_dir/hear_start_ms" ]]; then
       ps_ms="$(cat "$assistant_cut_dir/hear_start_ms" 2>/dev/null || echo "$ps_ms")"
     fi
     if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
-      ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
+      ssh -o BatchMode=yes -o ConnectTimeout=3 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
         "PYTHONPATH=/tmp/align-spike/bournemouth-forced-aligner:\$PYTHONPATH \
          $(printf '%q' "$remote_py") $(printf '%q' "$remote_script") \
            --tcp 127.0.0.1:${target##*:} \
@@ -1452,7 +1452,7 @@ start_cupe_live_tracker() {
       if [[ -f "$remote_events" ]]; then
         cp -f "$remote_events" "$cupe_live_events" 2>/dev/null || true
       elif [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
-        ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" \
+        ssh -o BatchMode=yes -o ConnectTimeout=2 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
           "test -f $(printf '%q' "$remote_events") && cat $(printf '%q' "$remote_events")" \
           2>/dev/null >"$cupe_live_events" || true
       fi
@@ -1498,7 +1498,7 @@ stop_cupe_live_tracker() {
   if [[ -n "$remote_stop" ]]; then
     touch "$remote_stop" 2>/dev/null || true
     if [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
-      ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" \
+      ssh -o BatchMode=yes -o ConnectTimeout=2 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
         "touch $(printf '%q' "$remote_stop")" >>"$trigger_log" 2>&1 || true
     fi
   fi
@@ -1506,7 +1506,7 @@ stop_cupe_live_tracker() {
     if [[ -f "$remote_events" ]]; then
       cp -f "$remote_events" "${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" 2>/dev/null || true
     elif [[ -n "$host" && "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
-      ssh -o BatchMode=yes -o ConnectTimeout=2 "sf@${host}" "cat $(printf '%q' "$remote_events") 2>/dev/null" \
+      ssh -o BatchMode=yes -o ConnectTimeout=2 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" "cat $(printf '%q' "$remote_events") 2>/dev/null" \
         >"${cupe_live_events:-$assistant_cut_dir/cupe_live.jsonl}" 2>/dev/null || true
     fi
   fi
@@ -1649,15 +1649,15 @@ finalize_assistant_cut_ctc() {
       # Last-ditch: SCP+SSH only if TCP path produced nothing.
       if [[ ! -s "$out_json" ]] && [[ -n "$wav" && -f "$wav" ]]; then
         local remote_py remote_worker remote_sock remote_line
-        remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-/home/sf/workspace/.venvs/pyannote-cpu/bin/python}"
-        remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-/home/sf/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
+        remote_py="${SPEECH_CORE_ALIGN_PYTHON_REMOTE:-$HOME/workspace/.venvs/pyannote-cpu/bin/python}"
+        remote_worker="${SPEECH_CORE_ALIGN_WORKER_REMOTE:-$HOME/workspace/speech-core/scripts/barge_in_align/align_worker.py}"
         remote_sock="${SPEECH_OUT_ALIGN_SOCK_REMOTE:-/tmp/speech-core-align-worker.sock}"
         remote_wav="/tmp/speech-align-${session_id}-$(date +%s).wav"
         path_used="warm_remote_scp"
         echo "[$(date --iso-8601=seconds)] assistant_cut: TCP miss; scp+ssh fallback" >>"$trigger_log"
-        scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "sf@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
-        remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" \
-          "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=/home/sf/workspace/speech-core/scripts \
+        scp -o BatchMode=yes -o ConnectTimeout=3 "$wav" "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}:${remote_wav}" >>"$trigger_log" 2>&1 || true
+        remote_line="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" \
+          "SPEECH_OUT_CTC_MODEL=${SPEECH_OUT_CTC_MODEL:-wav2vec2_base} SPEECH_OUT_ALIGN_WINDOW_MS=${align_window_ms} PYTHONPATH=$HOME/workspace/speech-core/scripts \
            $(printf '%q' "$remote_py") $(printf '%q' "$remote_worker") --sock $(printf '%q' "$remote_sock") --align \
            --backend $(printf '%q' "$backend") --wav $(printf '%q' "$remote_wav") \
            --intended $(printf '%q' "$intended") --played-ms $played_ms --speed $speed" \
@@ -1665,7 +1665,7 @@ finalize_assistant_cut_ctc() {
         if [[ -n "$remote_line" ]]; then
           printf '%s\n' "$remote_line" >"$out_json"
         fi
-        ssh -o BatchMode=yes -o ConnectTimeout=3 "sf@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
+        ssh -o BatchMode=yes -o ConnectTimeout=3 "${SPEECH_CORE_REMOTE_USER:-$USER}@${host}" "rm -f $(printf '%q' "$remote_wav")" >/dev/null 2>&1 || true
       fi
   elif [[ -n "$align_script" && -f "$align_script" ]]; then
     # 3) Last resort: cold one-shot local python.

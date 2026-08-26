@@ -45,3 +45,14 @@ __pycache__/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# local beads migration backups
+.beads.dolt-bak-*/
+
+# desk / city runtime — not product truth
+.gc/
+AGENTS.md
+
+# local beads jsonl dump (machine paths, closed city archive)
+.beads/issues.jsonl
+

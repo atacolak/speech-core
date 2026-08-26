@@ -131,7 +131,9 @@ this is less magical and less chatty. good.
 - smart turn v3 needs broader live laptop validation across actual conversational pauses.
 - smart turn preprocessing is implemented directly in Rust; parity against Python is smoke-tested through the real model, not numerically golden-tested against Transformers.
 - cross-host capture latency is preserved but not calibrated.
-- the CosyVoice/session-control/player replacement described under `docs/evolution/` is selected target architecture, not current implementation.
+- `docs/evolution/` still names CosyVoice as a *selected target*. that is direction archive. **live mouth is qwentts.** CosyVoice is rollback only.
+- speech-out **pcm out** streams. **text in** is one complete `speak` / one HTTP `input`. there is no append. first-clause flush is a call-side hop (voicecat SENTENCE), not an engine missing-feature on `:18091`.
+- WordVoice (CosyVoice3 word-level tags, [arXiv:2607.06461](https://arxiv.org/abs/2607.06461)) is **not** a streamer and **not** loaded. research: [`qualification/wordvoice-research.md`](qualification/wordvoice-research.md).
 
 ## manual testing commands
 
@@ -187,9 +189,9 @@ These are the exports. They let you replay or inspect a session after it ends.
 server daemon:
 
 ```bash
-systemctl --user status speech-core-daemon.service
-systemctl --user restart speech-core-daemon.service
-journalctl --user -u speech-core-daemon.service -f
+systemctl --user status ata-speech-core.service
+systemctl --user restart ata-speech-core.service
+journalctl --user -u ata-speech-core.service -f
 cat ~/.config/speech-core/daemon.env
 ```
 
@@ -210,6 +212,48 @@ SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-
 ./scripts/install-speech-core-daemon.sh
 ./scripts/speech-core-sync-build-adapter.sh
 ```
+
+
+## speech-out live pin (2026-08-18)
+
+**live mouth is qwentts.cpp Q8 CustomVoice.** CosyVoice is **not** the production pin. it is rollback + historical qual only.
+
+```text
+voicecat CosyVoiceTTSService  (name is a lie; SENTENCE-aggregates the whole reply)
+  ws://127.0.0.1:8788/ws/speech-out
+    ata-speech-out.service   (aa86b67 *binary*, handshake still says progressive-cosyvoice)
+      qwentts_progressive_worker.py
+        POST http://127.0.0.1:18091/v1/audio/speech
+          ata-speech-tts.service   (tts-server, 24 kHz s16 pcm stream)
+```
+
+| unit | role |
+| --- | --- |
+| `ata-speech-out.service` | ws `:8788`, speak/cancel/pcm frames |
+| `ata-speech-tts.service` | inference `:18091` |
+| voice | `default`/`m1`/`informal` → **ryan**, instruct = informal lock |
+| VRAM | **~2438 MiB** (unit pid after leftover adopt) |
+
+clocks (do **not** subtract domains):
+
+- isolated http first-usable p50 **~70 ms** informal/crisp/clip
+- clause vs full paragraph first-usable: **71.0 vs 71.3 ms** (`bench/ttfp-oneshot-vs-clause.json`). extra text does **not** delay first audio.
+- live `:8788` first-pcm (first codec frame, often hush) warm **~33 ms**
+- cancel ack **~41 ms**
+
+evidence: [`docs/qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md), [`docs/qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md).
+
+**one-shot vs stream:** pcm **out** already streams (`response_format=pcm`, `--codec-chunk-dur 0.08`). text **in** is one complete `input` string. empty / `append` / missing `input` → HTTP 400. daemon `ClientMessage` is `Speak` with `text: String` — no `append` / `text_delta`. `stream:true` on the HTTP body is ignored.
+
+the hundreds-of-ms win is: **flush the first speakable clause as soon as the agent emits it**, then more `speak`s. that hop is voicecat (`TextAggregationMode.SENTENCE` waits for the whole reply). do not invent CosyVoice token-bistream (`sc-01p` closed). do not pretend qwentts can chew tokens while pcm is already leaving.
+
+rollback: `SPEECH_OUT_COSYVOICE_WORKER_SCRIPT=$SPEECH_OUT_COSYVOICE_WORKER_SCRIPT_ROLLBACK`, stop `ata-speech-tts.service`, restart the daemon. ~6 GB CosyVoice3 TRT. do **not** load both engines on this 12 GB card.
+
+historical CosyVoice2 Unet (~225 ms finished-sentence) is an isolated container, not this pin.
+
+voicecat adapters are a `:8788` client. do not retune them from an `sc` bead.
+
+
 
 
 ## manual tui convention

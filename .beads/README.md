@@ -1,81 +1,29 @@
-# Beads - AI-Native Issue Tracking
+# beads (speech-core)
 
-Welcome to Beads! This repository uses **Beads** for issue tracking - a modern, AI-native tool designed to live directly in your codebase alongside your code.
+issue ledger for this repo. prefix **`sc`**.
 
-## What is Beads?
+**2026-08-17:** ledger is **empty on purpose**. Last committed jsonl was
+Voice House `vh-*` (deleted in `821e021`). Do not restore it. New work is
+new `sc-*` seam beads after BOARD names them.
 
-Beads is issue tracking that lives in your repo, making it perfect for AI coding agents and developers who want their issues close to their code. No web UI required - everything works through the CLI and integrates seamlessly with git.
+## tools
 
-**Learn more:** [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
+| | |
+|---|---|
+| **`br`** | create / ready / claim / close / deps |
+| **`mg`** | board UI on the jsonl mirror |
 
-## Quick Start
-
-### Essential Commands
-
-```bash
-# Create new issues
-bd create "Add user authentication"
-
-# View all issues
-bd list
-
-# View issue details
-bd show <issue-id>
-
-# Update issue status
-bd update <issue-id> --claim
-bd update <issue-id> --status done
-
-# Sync with Dolt remote
-bd dolt push
-```
-
-### Working with Issues
-
-Issues in Beads are:
-- **Git-native**: Stored in Dolt database with version control and branching
-- **AI-friendly**: CLI-first design works perfectly with AI coding agents
-- **Branch-aware**: Issues can follow your branch workflow
-- **Sync-ready**: Uses Dolt remotes for backup and team sharing
-
-## Why Beads?
-
-✨ **AI-Native Design**
-- Built specifically for AI-assisted development workflows
-- CLI-first interface works seamlessly with AI coding agents
-- No context switching to web UIs
-
-🚀 **Developer Focused**
-- Issues live in your repo, right next to your code
-- Works offline, syncs when you push
-- Fast, lightweight, and stays out of your way
-
-🔧 **Git Integration**
-- Dolt-native sync via bd dolt push / bd dolt pull
-- Branch-aware issue tracking
-- Dolt-native three-way merge resolution
-
-## Get Started with Beads
-
-Try Beads in your own projects:
 
 ```bash
-# Install Beads
-curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-
-# Initialize in your repo
-bd init
-
-# Create your first issue
-bd create "Try out Beads"
+cd /path/to/speech-core
+br ready --json
+br create "…" --json
+br update sc-xxx --claim --assignee=worker --json
+br close sc-xxx -r "done" --json
+br sync --flush-only          # refresh issues.jsonl if the board looks stale
+mg -path .beads/issues.jsonl
 ```
 
-## Learn More
+storage lives under `.beads/` (`beads.db` + `issues.jsonl`). see `br robot-docs guide` for the full command surface.
 
-- **Documentation**: [github.com/steveyegge/beads/docs](https://github.com/steveyegge/beads/tree/main/docs)
-- **Quick Start Guide**: Run `bd quickstart`
-- **Examples**: [github.com/steveyegge/beads/examples](https://github.com/steveyegge/beads/tree/main/examples)
-
----
-
-*Beads: Issue tracking that moves at the speed of thought* ⚡
+orchestration with omp: skill **`beads-ready-front`** (`skill://beads-ready-front`).

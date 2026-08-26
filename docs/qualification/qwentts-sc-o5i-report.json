@@ -1,0 +1,59 @@
+{
+  "schema": "speech-out.qwentts.sc-o5i.v1",
+  "bead": "sc-o5i",
+  "finished_at": "2026-08-18T08:00:00+00:00",
+  "host": "sfub",
+  "gpu": "RTX 4070 12GB",
+  "verdict": {
+    "live_mouth": "qwentts.cpp Q8 CustomVoice behind aa86b67 daemon",
+    "voicecat_edited": false,
+    "wire_moved": false
+  },
+  "live": {
+    "unit": "speech-out-daemon.service",
+    "description": "Speech Out qwentts.cpp 0.6B CustomVoice (aa86b67 daemon + qwentts worker)",
+    "candidate_binary": "~/.local/share/discord-voice-agent/candidates/speech-out-cosy3-trt-aa86b67-20260812/bin/speech-out-aa86b67",
+    "bind": "0.0.0.0:8788",
+    "worker_script": "~/.cache/speech-out/qwen3-tts-0.6b-20260817/worker/qwentts_progressive_worker.py",
+    "rollback_worker_script": "~/.local/share/discord-voice-agent/candidates/speech-out-cosy3-trt-aa86b67-20260812/worker/cosyvoice_progressive_worker.py",
+    "inference_unit": "qwentts-tts-server.service",
+    "inference_url": "http://127.0.0.1:18091/v1/audio/speech",
+    "voice": "ryan",
+    "instruct": "Fast and informal, drop the politeness, keep moving, no pauses.",
+    "main_pid_at_probe": 2667128,
+    "worker_pid_at_probe": 2667142,
+    "tts_server_pid_leftover": 2434118,
+    "tts_server_pid_unit": 2693825,
+    "vram_mib": 2438,
+    "vram_mib_leftover_before_adopt": 3266,
+    "active_enter": "Tue 2026-08-18 17:51:39 AEST",
+    "tts_server_active_enter": "Tue 2026-08-18 18:01:34 AEST"
+  },
+  "clocks": {
+    "note": "never subtract D-W-http. usable energy is the product number.",
+    "isolated_locked_styles_http_first_use_p50_ms": {
+      "informal": 69.72,
+      "crisp": 70.67,
+      "clip": 70.17
+    },
+    "live_8788_play_D_first_pcm_ms": [77.551729, 37.850643, 33.015463, 33.185797, 32.921314],
+    "live_8788_play_W_first_pcm_ms": [77.49486, 37.80115, 32.968143, 33.140752, 32.865999],
+    "live_8788_warm_D_p50_ms": 33.02,
+    "post_adopt_D_first_pcm_ms": [216.295835, 44.777577, 32.795955, 32.739027],
+    "cancel": {
+      "first_ms": 81.23,
+      "cancel_ack_after_send_ms": 41.15,
+      "terminal": "speech_out_cancelled",
+      "n_pcm": 4,
+      "n_after_cancel_send": 3
+    }
+  },
+  "voicecat_hop": {
+    "client": "sdc_pipecat.services.cosyvoice.CosyVoiceTTSService",
+    "ws": "ws://127.0.0.1:8788/ws/speech-out",
+    "default_voice": "default",
+    "alias": "default/m1/informal -> ryan",
+    "aggregation": "SENTENCE",
+    "handshake_backend_label": "progressive-cosyvoice"
+  }
+}

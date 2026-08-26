@@ -7,9 +7,9 @@
     "code_commit": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
     "model_id": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
     "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
-    "model_dir": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/models/Fun-CosyVoice3-0.5B",
+    "model_dir": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/models/Fun-CosyVoice3-0.5B",
     "python": "3.10.20 (main, Mar 10 2026, 18:16:33) [Clang 21.1.4 ]",
-    "qual_root": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4",
+    "qual_root": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4",
     "submodule_matcha": "dd9105b34bf2be2230f4aa1e4769fb586a3c824e",
     "hashes": {
       "llm.pt": {
@@ -43,16 +43,16 @@
       "asset/zero_shot_prompt.wav": {
         "sha256": "c7b31d6dbe7cc6a716dded00550db5b50940bf209e424e4ad207b12e657c8ff6",
         "bytes": 334138,
-        "path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/src/CosyVoice/asset/zero_shot_prompt.wav"
+        "path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/src/CosyVoice/asset/zero_shot_prompt.wav"
       }
     }
   },
   "host_before": {
     "ts": "2026-07-27T05:16:25Z",
     "speech_processes": [
-      "1731  3-18:01:17 /home/sf/.local/bin/speech-core-daemon",
-      "1733  3-18:01:17 /home/sf/.local/bin/speech-core-daemon",
-      "1744  3-18:01:17 /home/sf/.local/bin/speech-out daemon"
+      "1731  3-18:01:17 ~/.local/bin/speech-core-daemon",
+      "1733  3-18:01:17 ~/.local/bin/speech-core-daemon",
+      "1744  3-18:01:17 ~/.local/bin/speech-out daemon"
     ],
     "listen_ports": [
       "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"
@@ -151,7 +151,7 @@
             "duration_s": 1.32
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_cold.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_cold.wav",
         "cancelled": false,
         "cancel_after_chunks": null,
         "cancel_ack_s": null,
@@ -206,7 +206,7 @@
             "duration_s": 2.84
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_warm.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_stream_warm.wav",
         "cancelled": false,
         "cancel_after_chunks": null,
         "cancel_ack_s": null,
@@ -255,7 +255,7 @@
             "duration_s": 3.64
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_short_stream_warm.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_short_stream_warm.wav",
         "cancelled": false,
         "cancel_after_chunks": null,
         "cancel_ack_s": null,
@@ -316,7 +316,7 @@
             "duration_s": 1.2
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/zh_zero_shot_stream_warm.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/zh_zero_shot_stream_warm.wav",
         "cancelled": false,
         "cancel_after_chunks": null,
         "cancel_ack_s": null,
@@ -365,7 +365,7 @@
             "duration_s": 5.48
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_buffered_warm.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_zero_shot_buffered_warm.wav",
         "cancelled": false,
         "cancel_after_chunks": null,
         "cancel_ack_s": null,
@@ -414,7 +414,7 @@
             "duration_s": 4.36
           }
         ],
-        "wav_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_cancel_break_after_1_chunk.wav",
+        "wav_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/runs/20260727T051625Z/artifacts/en_cancel_break_after_1_chunk.wav",
         "cancelled": true,
         "cancel_after_chunks": 1,
         "cancel_ack_s": 2.207853461964987,
@@ -470,12 +470,12 @@
       "kill_at_s": "19.671616272",
       "returncode": "137",
       "stdout_tail": [
-        "Downloading Model to directory: /home/sf/.cache/modelscope/hub/pengzhendong/wetext",
-        "Downloading Model to directory: /home/sf/.cache/modelscope/hub/pengzhendong/wetext",
+        "Downloading Model to directory: ~/.cache/modelscope/hub/pengzhendong/wetext",
+        "Downloading Model to directory: ~/.cache/modelscope/hub/pengzhendong/wetext",
         "LOADED 12.830",
         "CHUNK 0 2.8260 32640"
       ],
-      "log_path": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/logs/process-cancel-20260727T051625Z.log",
+      "log_path": "~/.cache/speech-out/cosyvoice-qual-sc-e71.4/logs/process-cancel-20260727T051625Z.log",
       "note": "SIGKILL after first CHUNK stops synthesis at process boundary; GPU context reclaimed with process. In-process generator break is not sufficient."
     }
   },
@@ -501,9 +501,9 @@
   "host_after": {
     "ts": "2026-07-27T05:18:09Z",
     "speech_processes": [
-      "1731  3-18:03:02 /home/sf/.local/bin/speech-core-daemon",
-      "1733  3-18:03:02 /home/sf/.local/bin/speech-core-daemon",
-      "1744  3-18:03:02 /home/sf/.local/bin/speech-out daemon"
+      "1731  3-18:03:02 ~/.local/bin/speech-core-daemon",
+      "1733  3-18:03:02 ~/.local/bin/speech-core-daemon",
+      "1744  3-18:03:02 ~/.local/bin/speech-out daemon"
     ],
     "listen_ports": [
       "LISTEN 0      128                        0.0.0.0:8788       0.0.0.0:*    users:((\"speech-out\",pid=1744,fd=9))"

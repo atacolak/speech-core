@@ -1,5 +1,7 @@
 # speech-out seam
 
+**stale protocol essay.** live pin is **qwentts.cpp Q8 CustomVoice** — see [`current-state.md`](current-state.md) and [`qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md). this file still describes the old Supertonic / WAV-chunk MVP. CosyVoice is rollback only. do not treat `M1` / `steps` / `/v1/tts` as the dogfood mouth.
+
 `speech-out` is the local text-to-speech / utterance side of this repo. It is intentionally separate from the existing `speech-core-daemon` speech-in path: no microphone ingress, ASR, VAD, smart-turn, or turn-taking code is changed by this seam.
 
 ## current MVP

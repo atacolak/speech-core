@@ -6,15 +6,16 @@
 
 ## Current reality
 
-The live branch contains a mature speech-input path and a dogfood speech-output/Talker path:
+**2026-08-18 live mouth is qwentts.cpp Q8 CustomVoice**, not CosyVoice and not Supertonic. see [`../current-state.md`](../current-state.md). CosyVoice in this file is a *selected 2026-07 target*, not the installed pin.
+
+The live branch contains a mature speech-input path and a dogfood speech-output path:
 
 - Nemotron streaming ASR, Silero VAD, smart-turn v3 endpointing, and immutable `transcript_committed`;
-- a separate Supertonic-based speech-out daemon and local playback harness;
-- Talker dogfood routing through a real Pi profile with incomplete reasoner/tool integration;
-- provisional barge cut and optional warm CTC refinement;
-- current components and limits documented in [`../current-state.md`](../current-state.md).
+- a separate speech-out daemon (`:8788`) whose inference is `qwentts-tts-server` (`:18091`);
+- voicecat as the call (SmallWebRTC / leftover Discord), still a `:8788` client;
+- CosyVoice3 TRT `aa86b67` kept as rollback only.
 
-This is not the accepted final production architecture. Supertonic and the current Talker shell remain rollback/dogfood paths while the replacement is built and verified.
+This directory is not the accepted final production architecture. It remains direction archive until the operator opens a speech-out spec change.
 
 ## Accepted decisions
 

@@ -266,4 +266,36 @@ scripts/install-speech-core-client.sh
 ~/.local/bin/speech-core-live-session
 ```
 
-installed defaults should be inspected from env files, not guessed.
+
+## 8. speech-out live pin (2026-08-18)
+
+producer:
+
+```text
+speech-out-daemon.service   (:8788 progressive ws)
+qwentts-tts-server.service  (:18091 qwentts.cpp Q8 CustomVoice)
+```
+
+consumer:
+
+```text
+voicecat CosyVoiceTTSService  (name is leftover; :8788 client only)
+speech-out play
+```
+
+contract today:
+
+- one `speak` with a complete `text` string. pcm **out** streams. text **in** does not append.
+- `voice=default` aliases to ryan / informal on the worker.
+- CosyVoice3 TRT aa86b67 is rollback (`SPEECH_OUT_COSYVOICE_WORKER_SCRIPT_ROLLBACK`), not live inference.
+- first-clause flush is a call-side hop. see `docs/qualification/qwentts-stream-leftover.md`.
+
+files:
+
+```text
+~/.config/speech-core/speech-out.env
+~/.config/systemd/user/speech-out-daemon.service
+~/.config/systemd/user/qwentts-tts-server.service
+docs/current-state.md
+docs/qualification/qwentts-sc-o5i.md
+```

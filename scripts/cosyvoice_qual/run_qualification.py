@@ -382,7 +382,7 @@ def main() -> int:
         "--qual-root",
         default=os.environ.get(
             "COSYVOICE_QUAL_ROOT",
-            "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4",
+            os.path.expanduser("~/.cache/speech-out/cosyvoice-qual-sc-e71.4"),
         ),
     )
     ap.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))

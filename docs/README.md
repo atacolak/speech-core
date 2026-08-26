@@ -22,11 +22,13 @@ blend values.
 
 ## Current implementation
 
-- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands.
+- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.**
+- [`qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md) — live cutover evidence.
+- [`qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md) — pcm-out streams; text-in is one-shot.
 - [`seams.md`](seams.md) — current component contracts.
 - [`turn-detection.md`](turn-detection.md) — VAD, smart-turn, close policy, diagnostics, and tuning.
 - [`smart-turn-v3.md`](smart-turn-v3.md) — model artifact, preprocessing, runtime behavior, and verification.
-- [`speech-output.md`](speech-output.md) — current speech-out protocol, playback, and cancellation.
+- [`speech-output.md`](speech-output.md) — **stale** Supertonic/WAV essay. not the live pin.
 
 ## Selected product architecture
 

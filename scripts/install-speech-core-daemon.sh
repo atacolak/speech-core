@@ -133,7 +133,7 @@ SPEECH_OUT_CURL_COMMAND=$speech_out_curl_command
 RUST_LOG=speech_out=info
 EOF_ENV
 
-cat >"$systemd_user_dir/speech-core-daemon.service" <<EOF_UNIT
+cat >"$systemd_user_dir/ata-speech-core.service" <<EOF_UNIT
 [Unit]
 Description=Speech Core Nemotron websocket daemon
 After=network-online.target
@@ -151,9 +151,9 @@ WorkingDirectory=$repo_root
 WantedBy=default.target
 EOF_UNIT
 
-cat >"$systemd_user_dir/speech-out-daemon.service" <<EOF_UNIT
+cat >"$systemd_user_dir/ata-speech-out.service" <<EOF_UNIT
 [Unit]
-Description=Speech Out Supertonic websocket daemon
+Description=Speech Out websocket daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -170,8 +170,8 @@ WantedBy=default.target
 EOF_UNIT
 
 systemctl --user daemon-reload
-systemctl --user enable speech-core-daemon.service speech-out-daemon.service
-systemctl --user restart speech-core-daemon.service speech-out-daemon.service
+systemctl --user enable ata-speech-core.service ata-speech-out.service
+systemctl --user restart ata-speech-core.service ata-speech-out.service
 
 cat <<EOF_DONE
 installed speech-core + speech-out daemons
@@ -181,12 +181,12 @@ installed speech-core + speech-out daemons
   file-adapter: $bin_dir/speech-core-file-adapter
   core env:     $config_dir/daemon.env
   out env:      $config_dir/speech-out.env
-  core service: $systemd_user_dir/speech-core-daemon.service
-  out service:  $systemd_user_dir/speech-out-daemon.service
+  core service: $systemd_user_dir/ata-speech-core.service
+  out service:  $systemd_user_dir/ata-speech-out.service
   logs:         $state_dir/logs/events.jsonl
 
 status:
 EOF_DONE
-systemctl --user --no-pager --full status speech-core-daemon.service || true
+systemctl --user --no-pager --full status ata-speech-core.service || true
 
-systemctl --user --no-pager --full status speech-out-daemon.service || true
+systemctl --user --no-pager --full status ata-speech-out.service || true
