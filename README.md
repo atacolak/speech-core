@@ -21,13 +21,15 @@ This repository contains Speech Core product truth and a small city binding. No 
 
 ```text
 speech-in   → microphone audio → transcript + turn events
-speech-out  → text → audible speech
+speech-out  → text → audible speech  (leftover: speak then append)
 agent loop  → decides what to do with a completed turn
 ```
 
 The mature seam is **speech-in**. It runs a separate **speech-core-daemon** that ingests timestamped PCM, transcribes with Nemotron, detects voice activity with Silero, semantically endpoints with smart-turn v3, and emits immutable per-turn transcripts.
 
 **speech-out** is a separate TTS/playback daemon. live pin is **qwentts.cpp Q8 CustomVoice** (`ata-speech-tts.service` on `:18091`, daemon on `:8788`). CosyVoice is rollback only. Isolated CosyVoice3 RL playground: `~/workspace/cosyvoice_playground` (not live). Input and output do not share a process because their failure modes differ.
+
+**the live call** is not this repo. sibling `voicecat` is the phone line (desk `/desk` or phone `/ws-phone`). headed omp in `~/worlds/talker` is the brain. this repo stays ear + mouth. see `../voicecat/README.md`.
 
 ## Components
 
