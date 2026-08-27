@@ -22,7 +22,7 @@ blend values.
 
 ## Current implementation
 
-- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.**
+- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.** isolated CosyVoice3 RL playground: `~/workspace/cosyvoice_playground`.
 - [`qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md) — live cutover evidence.
 - [`qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md) — pcm-out streams; text-in is one-shot.
 - [`seams.md`](seams.md) — current component contracts.

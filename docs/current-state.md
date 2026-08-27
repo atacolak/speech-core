@@ -249,6 +249,8 @@ the hundreds-of-ms win is: **flush the first speakable clause as soon as the age
 
 rollback: `SPEECH_OUT_COSYVOICE_WORKER_SCRIPT=$SPEECH_OUT_COSYVOICE_WORKER_SCRIPT_ROLLBACK`, stop `ata-speech-tts.service`, restart the daemon. ~6 GB CosyVoice3 TRT. do **not** load both engines on this 12 GB card.
 
+isolated CosyVoice3 RL lab (clone / instruct / tags / export, **not** live): `~/workspace/cosyvoice_playground`. launch `./run.sh --port 7861`. do **not** load it beside live qwentts on this 12 GB card.
+
 historical CosyVoice2 Unet (~225 ms finished-sentence) is an isolated container, not this pin.
 
 voicecat adapters are a `:8788` client. do not retune them from an `sc` bead.
