@@ -1,10 +1,10 @@
 # Speech Core evolution
 
-**status:** active operator-selected target; implementation remains partial
+**status:** 2026-07 operator-selected *target*; **not live law**. live mouth is qwentts; live call is voicecat. see [`../current-state.md`](../current-state.md) and [`../../README.md`](../../README.md).
 **current implementation truth:** [`../current-state.md`](../current-state.md) and repository evidence
 **work authorization:** city work ledger, not this directory
 
-This directory describes the selected target architecture and the current sequence for reaching it. It is not a second charter, a current-state report, or a work ledger.
+This directory describes a selected target architecture from 2026-07 and the sequence that was meant to reach it. It is not a second charter, a current-state report, or a work ledger. CosyVoice / Discord-first / BFA in these files are **not** the installed pin.
 
 ## Reading order
 

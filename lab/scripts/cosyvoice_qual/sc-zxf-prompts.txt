@@ -1,0 +1,27 @@
+# Shared prompts for sc-zxf live :8788 now-stamp and isolated CosyVoice2 TTFP.
+# Identical to latency-campaign-20260812 lane2 ttfp_harness DEFAULT_PROMPTS.
+Hello. This is a short warm-path latency probe.
+Yes, I can hear you clearly.
+The system is ready for progressive speech output.
+Please continue when you are ready.
+Short answer: latency check complete.
+Acknowledged. Running the next measurement now.
+Latency campaign sample number seven.
+Keep the progressive stream continuous and real.
+Quick reply for first audio timing.
+Warm path validation utterance ten.
+Eleven. Non-silent PCM must be measured.
+Twelve. Request to first frame under test.
+Thirteen. Isolated worker only, no live daemon.
+Fourteen. Preserve cancel and stream semantics.
+Fifteen. Fun CosyVoice three point five B.
+Sixteen. RTX four zero seven zero local only.
+Seventeen. Report p fifty and p ninety five.
+Eighteen. Real generated audio, not silence.
+Nineteen. Streaming frames at twenty four kilohertz.
+Twenty. Final baseline sample for median.
+Twenty one. Extra sample for tail stability.
+Twenty two. Extra sample for warm variance.
+Twenty three. Extra sample for p ninety five.
+Twenty four. Extra sample after warm steady state.
+Twenty five. Closing sample for the set.

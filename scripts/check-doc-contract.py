@@ -83,7 +83,7 @@ except (OSError, tomllib.TOMLDecodeError) as exc:
     errors.append(f"invalid rig.toml: {exc}")
 
 for path in ROOT.rglob("*.md"):
-    if any(part in {".git", "target", "vendor", ".beads", ".pi"} for part in path.parts):
+    if any(part in {".git", "target", "vendor", ".beads", ".pi", "lab"} for part in path.parts):
         continue
     text = path.read_text(encoding="utf-8", errors="replace")
     for raw in LINK_RE.findall(text):

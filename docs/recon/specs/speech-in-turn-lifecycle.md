@@ -143,8 +143,8 @@ estimates, not unqualified facts" — a VAD-only close is `degraded=true`, smart
 
 ## next probes
 
-- Run `tests/test-barge-in-dual-asr.sh` and confirm turn-policy event order on the
-  current commit.
+- Run parked `lab/tests/test-barge-in-dual-asr.sh` only if resurrecting dual-ASR.
+  live turn-policy evidence is the daemon crate tests.
 - File-adapter replay of a recorded `mic.wav` through a fresh daemon; assert exact
   event sequence for a known-close wav.
 - Feed pure noise ≥ human_hold threshold and capture whether empty-text

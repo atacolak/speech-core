@@ -44,7 +44,7 @@ Low while unratified and unimplemented. Moderate after gateway work/subscription
 ## Current implementation status
 
 - OBSERVED: repository ADRs previously stated direct native Pi steer and single sticky shadow as accepted direction; those assumptions are superseded here as proposed product law pending ratification.
-- OBSERVED: current Talker scripts accept an optional exact Pi session and do not yet implement the full hybrid gateway tool surface (`scripts/speech_talker_session.py`).
+- OBSERVED: current Talker scripts accept an optional exact Pi session and do not yet implement the full hybrid gateway tool surface (`lab/scripts/speech_talker_session.py`, parked).
 - INFERRED: Herdr-exposed live profiles are the intended addressable set once gateway discovery is authorized; exact discovery API is not fixed by this record.
 - UNKNOWN: final wire schema for work/subscription IDs and tool payloads.
 

@@ -62,14 +62,14 @@ OBSERVED `scripts/install-speech-core-daemon.sh:136-174` writes two systemd user
 - `speech-out-daemon.service` → `~/.local/bin/speech-out daemon`, env
   `~/.config/speech-core/speech-out.env`
 
-Steady-state server processes: daemon (ws 8765) + speech-out daemon (ws 8788) +
-Supertonic HTTP server (managed on demand, warm TTL 20 min, speech-out main.rs
-`DEFAULT_WARM_TTL_SECS`, or external via `SPEECH_OUT_EXTERNAL_SUPERTONIC`).
+Steady-state server processes: `ata-speech-core` (ws 8765) + `ata-speech-out` (ws 8788) +
+`ata-speech-tts` (qwentts `:18091`, GPU) + `ata-speech-align` (wav2vec2 CTC unix sock).
+Supertonic in this recon snapshot is historical; live mouth is qwentts.
 
-Laptop session: `scripts/speech-core-live-session.sh` runs mic-adapter + watch (both built
-from source, line 52). Dogfood: `scripts/speech-out-live-session.sh` (99.6K bash harness:
-mic + TUI + TTS + barge-in cut + greying), `scripts/speech_talker_session.py` (pi-profile
-Talker loop, MVP B).
+Laptop diagnostic: `scripts/speech-core-live-session.sh` runs mic-adapter + watch.
+Dogfood: `scripts/speech-out-live-session.sh` (canned-reply + optional greying).
+Parked: `lab/scripts/speech_talker_session.py` (old pi-profile Talker loop).
+Live call: sibling voicecat.
 
 Per-connection daemon wiring (OBSERVED main.rs:557-628 `start_session`, 833-1126
 `handle_connection`): hello → registry insert (generation) → model worker session +

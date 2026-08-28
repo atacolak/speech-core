@@ -49,7 +49,7 @@ Low while unratified. Moderate after route identity, subscription IDs, and epoch
 ## Current implementation status
 
 - OBSERVED: prior ADR assumed one sticky exact shadow session until disconnect; that universal assumption is replaced here by multi-profile addressing with explicit focus.
-- OBSERVED: current Talker accepts optional `--pi-session` and otherwise starts a local talker profile; it does not yet implement multi-subscription routing (`scripts/speech_talker_session.py`).
+- OBSERVED: current Talker accepts optional `--pi-session` and otherwise starts a local talker profile; it does not yet implement multi-subscription routing (`lab/scripts/speech_talker_session.py`, parked).
 - INFERRED: Herdr is the live exposure surface for addressable profiles in the intended topology; non-Herdr targets are out of scope until separately authorized.
 - UNKNOWN: exact authorization matrix for which Talker instances may address which profiles.
 

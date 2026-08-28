@@ -386,6 +386,7 @@ for cand in \
   "$libexec_dir/align_spike/cupe_live_track.py" \
   "$script_dir/align_spike/cupe_live_track.py" \
   "$repo_root/scripts/align_spike/cupe_live_track.py" \
+  "$repo_root/lab/scripts/align_spike/cupe_live_track.py" \
   $HOME/workspace/speech-core/scripts/align_spike/cupe_live_track.py; do
   if [[ -f "$cand" ]]; then cupe_live_script="$cand"; break; fi
 done
@@ -408,6 +409,8 @@ if [[ -z "$dual_asr_dir" ]]; then
     dual_asr_dir="$helper_dir/barge-in-dual-asr"
   elif [[ -d "$script_dir/barge-in-dual-asr" ]]; then
     dual_asr_dir="$script_dir/barge-in-dual-asr"
+  elif [[ -d "$repo_root/lab/scripts/barge-in-dual-asr" ]]; then
+    dual_asr_dir="$repo_root/lab/scripts/barge-in-dual-asr"
   else
     dual_asr_dir="$libexec_dir/barge-in-dual-asr"
   fi
@@ -416,6 +419,9 @@ tee_play_script="$helper_dir/speech-out-tee-play.sh"
 finalize_cut_py="$helper_dir/assistant-self-asr-finalize-cut.py"
 if [[ ! -f "$finalize_cut_py" && -f "$libexec_dir/assistant-self-asr-finalize-cut.py" ]]; then
   finalize_cut_py="$libexec_dir/assistant-self-asr-finalize-cut.py"
+fi
+if [[ ! -f "$finalize_cut_py" && -f "$repo_root/lab/scripts/assistant-self-asr-finalize-cut.py" ]]; then
+  finalize_cut_py="$repo_root/lab/scripts/assistant-self-asr-finalize-cut.py"
 fi
 if [[ ! -x "$tee_play_script" && -f "$tee_play_script" ]]; then
   chmod +x "$tee_play_script" 2>/dev/null || true

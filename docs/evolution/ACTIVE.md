@@ -1,21 +1,22 @@
 # Active Speech Core evolution
 
 **status date:** 2026-07-26
-**selected direction:** build the low-latency interruptible Speech Core target described in this directory
+**live status:** **superseded as the operator map.** 2026-08-18 mouth is qwentts.cpp; 2026-08 call is voicecat + headed omp TUI. this file is the 2026-07 CosyVoice / Discord / BFA *target*, not installed truth.
 **authorization:** only city work items authorize implementation
 
 ## Current reality
 
-**2026-08-18 live mouth is qwentts.cpp Q8 CustomVoice**, not CosyVoice and not Supertonic. see [`../current-state.md`](../current-state.md). CosyVoice in this file is a *selected 2026-07 target*, not the installed pin.
+**2026-08-18 live mouth is qwentts.cpp Q8 CustomVoice**, not CosyVoice and not Supertonic. see [`../current-state.md`](../current-state.md). CosyVoice below is a *selected 2026-07 target*, not the installed pin.
 
-The live branch contains a mature speech-input path and a dogfood speech-output path:
+The live branch contains a mature speech-input path and leftover speech-output:
 
-- Nemotron streaming ASR, Silero VAD, smart-turn v3 endpointing, and immutable `transcript_committed`;
-- a separate speech-out daemon (`:8788`) whose inference is `qwentts-tts-server` (`:18091`);
-- voicecat as the call (SmallWebRTC / leftover Discord), still a `:8788` client;
+- Nemotron streaming ASR (**CPU**), Silero VAD, smart-turn v3 endpointing, and immutable `transcript_committed`;
+- a separate speech-out daemon (`:8788`) whose inference is `ata-speech-tts.service` / qwentts (`:18091`, **GPU**);
+- voicecat as the call (SmallWebRTC desk / leftover Discord), still a `:8788` client;
+- barge cut via warm wav2vec2 CTC worker (`ata-speech-align.service`), not BFA and not dual-Nemotron;
 - CosyVoice3 TRT `aa86b67` kept as rollback only.
 
-This directory is not the accepted final production architecture. It remains direction archive until the operator opens a speech-out spec change.
+This directory is not the accepted final production architecture. It remains direction archive until the operator opens a speech-out spec change. do not start work from the delivery sequence below.
 
 ## Accepted decisions
 

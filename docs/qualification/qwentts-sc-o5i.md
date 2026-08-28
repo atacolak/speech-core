@@ -6,8 +6,8 @@
 **status of this document:** live env/unit evidence after operator-requested cutover
 
 Machine twin: [`qwentts-sc-o5i-report.json`](./qwentts-sc-o5i-report.json)
-Isolated stack: [`qwen3-tts-qwentts-q8.md`](./qwen3-tts-qwentts-q8.md)
-Voice / instruct research: [`qwen3-tts-customvoice-research.md`](./qwen3-tts-customvoice-research.md)
+Isolated stack: [`../../lab/docs/qualification/qwen3-tts-qwentts-q8.md`](../../lab/docs/qualification/qwen3-tts-qwentts-q8.md)
+Voice / instruct research: [`../../lab/docs/qualification/qwen3-tts-customvoice-research.md`](../../lab/docs/qualification/qwen3-tts-customvoice-research.md)
 
 ---
 

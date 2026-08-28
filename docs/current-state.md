@@ -7,31 +7,34 @@ If this file disagrees with code, tests, traces, or installed configuration, tre
 
 ## one-line summary
 
-`speech-core` is a rust speech runtime: laptop mic audio streams to the server daemon, nemotron produces low-latency transcript text, silero vad marks acoustic pauses, smart turn v3 can semantically gate turn closure, and speech-out provides the separate local tts/output seam.
+`speech-core` is the spoken substrate: voicecat (or a diagnostic mic adapter) sends 16 kHz mono PCM in; nemotron (CPU) transcribes; silero + smart-turn close the turn; leftover qwentts (GPU) speaks. the live *call* is sibling voicecat + headed omp TUI, not `speech-out-live-session`.
 
 ## current live path
 
 ```text
-the laptop
-  speech-core-mic-adapter
-    captures cpal mic audio as 16khz mono pcm_s16le
-    sends websocket audio frames
-      ↓
-server
-  speech-core-daemon
-    validates frame/session metadata
-    writes jsonl event log
-    feeds nemotron streaming asr
-    feeds silero vad
-    buffers recent audio for smart turn v3
-    on vad speech_end, runs smart turn v3 once on recent turn audio
-    turn manager promotes accepted boundaries into turn_closed
-      ↓
-laptop
-  speech-core-watch / speech-core-live-session
-    prints transcript text
-    prints <EOU> when turn_closed arrives
+voicecat desk /ws-phone
+  16 kHz mono PCM
+    ↓
+ata-speech-core.service :8765
+  nemotron ASR (CPU, transcribe.cpp ggml-cpu)
+  silero vad
+  smart-turn v3
+  transcript_committed → turn_closed
+    ↓
+voicecat collab guest "desk"     headed omp TUI (brain)
+    ↓
+ata-speech-out.service :8788     leftover speak/append
+  ata-speech-tts.service :18091  qwentts.cpp CUDA
+    ↓
+voicecat browser_sink / phone_sink
+
+barge cut (async, not on the stop path)
+  voicecat retains leftover PCM
+  ata-speech-align.service       wav2vec2 CTC (CPU unix sock)
+  barge.jsonl → barge-cut sidecar for the TUI row
 ```
+
+laptop `speech-core-mic-adapter` + `speech-core-watch` still exist as a **diagnostic** loop. they are not the desk.
 
 ## current defaults
 
@@ -73,6 +76,18 @@ important translation:
 - if speech-like audio continues for 7500ms after the last committed transcript token without new tokens, the daemon emits `turn_human_hold` and immediately performs one degraded `source=human_hold` close after close-time model drain/alignment.
 - smart turn timeout/unavailable/error fails open to vad close.
 - parakeet realtime eou is disabled by default.
+
+## devices
+
+| job | pin | device | unit |
+|---|---|---|---|
+| user ASR | `nemotron-speech-streaming-en-0.6b-Q4_K_M.gguf` | CPU (`libggml-cpu`) | `ata-speech-core.service` |
+| VAD | `silero_vad_v4.onnx` | CPU | same |
+| turn close | `smart-turn-v3.2-cpu.onnx` | CPU, 1 thread | same |
+| barge cut | torchaudio `WAV2VEC2_ASR_BASE_960H` | CPU | `ata-speech-align.service` |
+| TTS | qwentts.cpp 0.6B CustomVoice Q8 | GPU (`GGML_BACKEND=CUDA0`) | `ata-speech-tts.service` |
+
+the 4070 is the mouth. do not load CosyVoice next to live qwentts. GPU nemotron is a future pin change, not current.
 
 ## what `<EOU>` means right now
 
@@ -132,22 +147,22 @@ this is less magical and less chatty. good.
 - smart turn preprocessing is implemented directly in Rust; parity against Python is smoke-tested through the real model, not numerically golden-tested against Transformers.
 - cross-host capture latency is preserved but not calibrated.
 - `docs/evolution/` still names CosyVoice as a *selected target*. that is direction archive. **live mouth is qwentts.** CosyVoice is rollback only.
-- speech-out **pcm out** streams. **text in** is one complete `speak` / one HTTP `input`. there is no append. first-clause flush is a call-side hop (voicecat SENTENCE), not an engine missing-feature on `:18091`.
-- WordVoice (CosyVoice3 word-level tags, [arXiv:2607.06461](https://arxiv.org/abs/2607.06461)) is **not** a streamer and **not** loaded. research: [`qualification/wordvoice-research.md`](qualification/wordvoice-research.md).
+- speech-out **pcm out** streams. qwentts HTTP text-in is one complete `input`. leftover **append** is the voicecat hop on `:8788` (`speak` then `append`). first-clause flush is also call-side (voicecat SENTENCE), not an engine missing-feature on `:18091`.
+- WordVoice (CosyVoice3 word-level tags, [arXiv:2607.06461](https://arxiv.org/abs/2607.06461)) is **not** a streamer and **not** loaded. research: [`lab/docs/qualification/wordvoice-research.md`](../lab/docs/qualification/wordvoice-research.md). parked with the rest of CosyVoice lab.
 
 ## manual testing commands
 
-These are the commands that actually exercise the seams right now.
+live call: sibling voicecat (`python/.venv/bin/sdc-pipecat-webrtc`). these commands are **substrate diagnostics**, not the desk.
 
 ### speech-in only
 
 ```bash
-speech-core-live-session
+speech-core-live-session --debug-tui
 ```
 
-Captures your mic, sends audio to the daemon, and prints the live transcript plus `<EOU>` when a turn closes. Use `--debug-tui` to see VAD bars, fallback timer, and smart-turn probe chain.
+laptop CPAL mic → daemon → watch TUI. not voicecat `/desk`.
 
-### speech-in + speech-out loop
+### speech-in + speech-out dogfood
 
 ```bash
 speech-out-live-session \
@@ -159,7 +174,7 @@ speech-out-live-session \
   --trace-vad
 ```
 
-This is the end-to-end harness. It captures your mic, speaks the response text after your turn closes, and shows the same debug TUI as `speech-core-live-session` with the spoken response appended. `--trace-vad` keeps the VAD energy bar visible.
+canned-reply harness with optional greying. parked dual-Nemotron / CUPE flags stay off. parked helpers live under `lab/scripts/`.
 
 ### golden tests
 
@@ -260,4 +275,4 @@ voicecat adapters are a `:8788` client. do not retune them from an `sc` bead.
 
 ## manual tui convention
 
-For manual substrate-contact testing, `speech-core-live-session --debug-tui` is the preferred diagnostic surface. `speech-out-live-session` defaults to the same debug TUI and appends the spoken response line after `turn_closed`, so the operator can see speech-in endpointing and speech-out generation in one place. The minimal transcript mode is for normal use, not tuning.
+For substrate-contact testing, `speech-core-live-session --debug-tui` is the diagnostic surface. the live conversation UI is the headed omp TUI via voicecat. `speech-out-live-session` greying is dogfood-only.

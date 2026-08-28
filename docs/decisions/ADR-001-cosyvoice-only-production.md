@@ -1,6 +1,7 @@
 # ADR-001 — Reversible voice-backend qualification hypothesis
 
 **status:** ratified — reversible CosyVoice qualification policy
+**live pin:** **superseded as the mouth.** 2026-08-18 production TTS is qwentts.cpp Q8 CustomVoice. this ADR remains the *qualification policy* (backend-neutral contract, reversible preference). it is not a claim that CosyVoice or Supertonic is live.
 **ratified by:** Founder, 2026-07-31
 **implementation:** not implied by this record
 
