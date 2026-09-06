@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """not on the voicecat path.
 
-Minimal Breeze config-A streaming smoke harness for sc-breeze-hybrid-81p.
+Breeze hybrid lab benchmark harness for sc-breeze-hybrid-81p.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import subprocess
 import os
 import traceback
 import sys
@@ -32,10 +33,11 @@ from breeze_tts_qual.protocol import (
     compose_e_winner,
     measured_plan,
     should_stop_adding_graphs,
+    tiny_rotation,
     would_exceed_hard_ceiling,
 )
 
-from breeze_tts_qual.utterances import SHORT
+from breeze_tts_qual.utterances import LONG, MEDIUM, SHORT
 
 _DEFAULT_QUAL_ROOT = (
     Path.home() / ".cache" / "speech-out" / "breeze-tts-qual-sc-breeze-hybrid-81p"
@@ -60,6 +62,8 @@ _E_LADDER_NAMES = (
     "E4",
     "E5",
 )
+_FULL_CONFIGS = "A,B,C0,C1,C2,C3,C4,D,E1,E2,E3,E4,E5"
+
 
 
 def _config_by_name() -> dict[str, EngineConfig]:
@@ -99,6 +103,106 @@ def _parse_config_names(raw: str) -> tuple[list[str], bool, bool, bool]:
     c_sweep = names == list(_C_LADDER_NAMES)
     e_sweep = names == list(_E_LADDER_NAMES)
     return names, False, c_sweep, e_sweep
+
+
+def _gpu_util_power() -> dict[str, float | None]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return {"gpu_util_pct": None, "gpu_power_w": None}
+    if result.returncode != 0:
+        return {"gpu_util_pct": None, "gpu_power_w": None}
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return {"gpu_util_pct": None, "gpu_power_w": None}
+    parts = [p.strip() for p in line[0].split(",")]
+    if len(parts) < 2:
+        return {"gpu_util_pct": None, "gpu_power_w": None}
+
+    def _parse(raw: str) -> float | None:
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    return {"gpu_util_pct": _parse(parts[0]), "gpu_power_w": _parse(parts[1])}
+
+
+def _d_already_killed(qual_root: Path) -> dict[str, Any] | None:
+    smoke_path = qual_root / "runs" / "smoke-D" / "metrics.json"
+    if not smoke_path.is_file():
+        return None
+    try:
+        payload = json.loads(smoke_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    row = (payload.get("configs") or {}).get("D")
+    if not isinstance(row, dict):
+        return None
+    if not (row.get("d_killed") or payload.get("d_killed")):
+        return None
+    skipped = dict(row)
+    skipped["name"] = "D"
+    skipped["not_run"] = True
+    skipped["d_killed"] = True
+    skipped["stop_reason"] = skipped.get("stop_reason") or "d_killed"
+    skipped["reused_from"] = "smoke-D"
+    skipped["n"] = 0
+    classes = skipped.get("classes")
+    if isinstance(classes, dict):
+        for cls in classes.values():
+            if isinstance(cls, dict) and cls.get("n_measured") == 30:
+                cls["n_measured"] = 0
+    return skipped
+
+
+
+def _class_texts(plan: dict[str, int]) -> dict[str, list[str]]:
+    return {
+        "tiny": tiny_rotation()[: int(plan["tiny"])],
+        "short": [SHORT[0]] * int(plan["short"]),
+        "medium": [MEDIUM[0]] * int(plan["medium"]),
+        "long": [LONG[0]] * int(plan["long"]),
+    }
+
+
+def _summarize_class(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ttfa = [
+        float(row["first_nonsilent_s"])
+        for row in rows
+        if row.get("first_nonsilent_s") is not None
+    ]
+    rtfs = [float(row["rtf"]) for row in rows if row.get("rtf") is not None]
+    gaps: list[float] = []
+    for row in rows:
+        gaps.extend(float(g) for g in row.get("gaps") or [])
+    summary: dict[str, Any] = {
+        "n_measured": len(rows),
+        "p50_ttfa_s": percentile(ttfa, 0.50) if ttfa else None,
+        "p95_ttfa_s": percentile(ttfa, 0.95) if ttfa else None,
+        "rtf": percentile(rtfs, 0.50) if rtfs else None,
+        "gap_p50_s": percentile(gaps, 0.50) if gaps else 0.0,
+        "gap_p95_s": percentile(gaps, 0.95) if gaps else 0.0,
+        "max_stall_s": max(gaps) if gaps else 0.0,
+    }
+    return summary
+
+
+
+
+def _persist_metrics(run_dir: Path, payload: dict[str, Any]) -> None:
+    path = run_dir / "metrics.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
 
 
 def _c0_p50_ttfa(qual_root: Path) -> float | None:
@@ -146,6 +250,7 @@ def _run_d_control(
     ref_text: str,
     n: int,
     warmup: int,
+    full: bool = False,
 ) -> tuple[dict[str, Any], int, bool]:
     try:
         row, code = _run_measured_config(
@@ -156,6 +261,7 @@ def _run_d_control(
             ref_text=ref_text,
             n=n,
             warmup=warmup,
+            full=full,
         )
     except Exception as exc:
         row = {
@@ -522,7 +628,14 @@ def _mark_c_not_run(row: dict[str, Any], *, reason: str) -> dict[str, Any]:
     marked["stop_reason"] = reason
     if reason == "unsafe_vram":
         marked["unsafe_vram"] = True
+    marked["n"] = 0
+    classes = marked.get("classes")
+    if isinstance(classes, dict):
+        for cls in classes.values():
+            if isinstance(cls, dict):
+                cls["n_measured"] = 0
     return marked
+
 
 
 def _c_stop_view(row: dict[str, Any]) -> dict[str, Any]:
@@ -544,12 +657,13 @@ def _run_c_sweep(
     ref_text: str,
     n: int,
     warmup: int,
+    full: bool = False,
 ) -> tuple[dict[str, Any], int]:
     configs: dict[str, Any] = {}
     exit_code = 0
     prev: dict[str, Any] | None = None
     stop_reason: str | None = None
-    reused_c0 = _reuse_c0_metrics(qual_root)
+    reused_c0 = None if full else _reuse_c0_metrics(qual_root)
 
     for name in _C_LADDER_NAMES:
         config = by_name[name]
@@ -572,6 +686,7 @@ def _run_c_sweep(
                     ref_text=ref_text,
                     n=n,
                     warmup=warmup,
+                    full=full,
                 )
             except Exception as exc:
                 row = {
@@ -622,6 +737,7 @@ def _run_c_sweep(
     return configs, exit_code
 
 
+
 def _run_e_sweep(
     *,
     by_name: dict[str, EngineConfig],
@@ -631,6 +747,7 @@ def _run_e_sweep(
     ref_text: str,
     n: int,
     warmup: int,
+    full: bool = False,
 ) -> tuple[dict[str, Any], int, bool]:
     configs: dict[str, Any] = {}
     exit_code = 0
@@ -652,6 +769,7 @@ def _run_e_sweep(
                 ref_text=ref_text,
                 n=n,
                 warmup=warmup,
+                full=full,
             )
         except Exception as exc:
             row = {
@@ -714,10 +832,18 @@ def _mark_unsafe(row: dict[str, Any], peak: dict[str, float] | None = None) -> d
     if peak:
         row.update(peak)
     row["unsafe_vram"] = True
+    row["not_run"] = True
     row["stop_reason"] = "unsafe_vram"
     row["p50_ttfa_s"] = None
     row["gap_p95_s"] = None
+    row["n"] = 0
+    classes = row.get("classes")
+    if isinstance(classes, dict):
+        for cls in classes.values():
+            if isinstance(cls, dict):
+                cls["n_measured"] = 0
     return row
+
 
 
 def _run_measured_config(
@@ -729,6 +855,7 @@ def _run_measured_config(
     ref_text: str,
     n: int,
     warmup: int,
+    full: bool = False,
 ) -> tuple[dict[str, Any], int]:
     short_text = SHORT[0]
     ckpt_dir = checkpoint_for_precision(qual_root, config.precision)
@@ -760,10 +887,13 @@ def _run_measured_config(
         if would_exceed_hard_ceiling(peak["peak_allocated_gib"]):
             return _mark_unsafe(row, peak), 0
 
-        for _ in range(max(warmup, 0)):
+        warmup_texts = [short_text]
+        if full:
+            warmup_texts = [tiny_rotation()[0], short_text]
+        for i in range(max(warmup, 0)):
             _drain_utterance(
                 engine,
-                text=short_text,
+                text=warmup_texts[i % len(warmup_texts)],
                 reference_audio=ref_audio,
                 reference_text=ref_text,
             )
@@ -772,10 +902,70 @@ def _run_measured_config(
             if would_exceed_hard_ceiling(peak["peak_allocated_gib"]):
                 return _mark_unsafe(row, peak), 0
 
+        if full:
+            plan = measured_plan()
+            wav_dir = run_dir / "wavs"
+            wav_dir.mkdir(parents=True, exist_ok=True)
+            classes: dict[str, Any] = {}
+            last: dict[str, Any] | None = None
+            short_summary: dict[str, Any] | None = None
+            all_gaps: list[float] = []
+            for class_name, texts in _class_texts(plan).items():
+                measured_rows: list[dict[str, Any]] = []
+                print(
+                    f"{config.name} class {class_name} n={len(texts)}",
+                    flush=True,
+                )
+                for idx, text in enumerate(texts):
+                    measured = _measure_utterance(
+                        engine,
+                        text=text,
+                        reference_audio=ref_audio,
+                        reference_text=ref_text,
+                    )
+                    peak = _peak_vram()
+                    row.update(peak)
+                    if would_exceed_hard_ceiling(peak["peak_allocated_gib"]):
+                        return _mark_unsafe(row, peak), 0
+                    last = measured
+                    all_gaps.extend(float(g) for g in measured.get("gaps") or [])
+                    measured_rows.append(measured)
+                    wav_name = f"{config.name}_{class_name}_{idx}.wav"
+                    _write_wav(
+                        wav_dir / wav_name,
+                        measured["pcm"],
+                        measured["sample_rate"],
+                    )
+                    if idx == 0 and class_name == "short":
+                        row["wav"] = f"wavs/{config.name}_short_0.wav"
+                        row["n_chunks"] = measured["n_chunks"]
+                        row["sample_rate"] = measured["sample_rate"]
+                        row["first_pcm_s"] = measured["first_pcm_s"]
+                        row["first_nonsilent_s"] = measured["first_nonsilent_s"]
+                        row["first_codec_frame_s"] = measured["first_codec_frame_s"]
+                        row["first_model_output_s"] = measured["first_model_output_s"]
+                summary = _summarize_class(measured_rows)
+                classes[class_name] = summary
+                if class_name == "short":
+                    short_summary = summary
+            row["classes"] = classes
+            row["n"] = int((short_summary or {}).get("n_measured") or 0)
+            row["p50_ttfa_s"] = (short_summary or {}).get("p50_ttfa_s")
+            row["p95_ttfa_s"] = (short_summary or {}).get("p95_ttfa_s")
+            row["rtf"] = (short_summary or {}).get("rtf")
+            row["gap_p50_s"] = (short_summary or {}).get("gap_p50_s")
+            row["gap_p95_s"] = (short_summary or {}).get("gap_p95_s")
+            row["max_stall_s"] = max(all_gaps) if all_gaps else 0.0
+            row.update(_gpu_util_power())
+            if last is not None and int(last["n_chunks"]) < 2:
+                print("streaming contract failed", file=sys.stderr)
+                return row, 2
+            return row, 0
+
         ttfa: list[float] = []
         rtfs: list[float] = []
-        all_gaps: list[float] = []
-        last: dict[str, Any] | None = None
+        all_gaps = []
+        last = None
         for i in range(n):
             measured = _measure_utterance(
                 engine,
@@ -810,12 +1000,13 @@ def _run_measured_config(
         row["rtf"] = percentile(rtfs, 0.50) if rtfs else (last or {}).get("rtf")
         row["gap_p50_s"] = percentile(all_gaps, 0.50) if all_gaps else 0.0
         row["gap_p95_s"] = percentile(all_gaps, 0.95) if all_gaps else 0.0
+        row["max_stall_s"] = max(all_gaps) if all_gaps else 0.0
         if last is not None and int(last["n_chunks"]) < 2:
             print("streaming contract failed", file=sys.stderr)
             return row, 2
         return row, 0
-    except RuntimeError as exc:
-        if _is_cuda_oom(exc):
+    except Exception as cop:
+        if _is_cuda_oom(cop):
             peak = _peak_vram()
             row.update(peak)
             row["error"] = "cuda_oom"
@@ -827,6 +1018,8 @@ def _run_measured_config(
         engine = None
         gc.collect()
         _empty_cuda()
+
+
 
 
 def _compose_b_payload(configs: dict[str, Any]) -> dict[str, Any]:
@@ -858,7 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         "--qual-root",
         default=os.environ.get("QUAL_ROOT", str(_DEFAULT_QUAL_ROOT)),
     )
-    parser.add_argument("--configs", default="A")
+    parser.add_argument("--configs", default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--n", type=int, default=None)
@@ -867,12 +1060,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref-text", required=True)
     args = parser.parse_args(argv)
 
-    names, b_sweep, c_sweep, e_sweep = _parse_config_names(args.configs)
-    d_run = names == ["D"]
-    if not args.smoke and not b_sweep and not c_sweep and not e_sweep and not d_run:
-        parser.error(
-            "only --smoke, --configs B, --configs C0,C1,C2,C3,C4, --configs D, or --configs E1,E2,E3,E4,E5 is implemented"
-        )
+    if args.full and not args.configs:
+        args.configs = _FULL_CONFIGS
+    elif not args.configs:
+        args.configs = "A"
+
+    raw_names = [part.strip() for part in args.configs.split(",") if part.strip()]
+    full_mixed = bool(args.full) and (
+        "B" in raw_names or (set(raw_names) & {"A", *_C_LADDER_NAMES, *_E_LADDER_NAMES, "D"})
+    )
+    if full_mixed and not args.smoke:
+        expanded: list[str] = []
+        for name in raw_names:
+            if name == "B":
+                expanded.extend(["A", *_B_ARM_NAMES])
+            else:
+                expanded.append(name)
+        seen: set[str] = set()
+        names = []
+        for name in expanded:
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        known = _config_by_name()
+        missing = [name for name in names if name not in known]
+        if missing:
+            raise SystemExit(f"unknown configs: {', '.join(missing)}")
+        b_sweep = False
+        c_sweep = False
+        e_sweep = False
+        d_run = False
+    else:
+        names, b_sweep, c_sweep, e_sweep = _parse_config_names(args.configs)
+        d_run = names == ["D"]
+        if not args.smoke and not b_sweep and not c_sweep and not e_sweep and not d_run:
+            parser.error(
+                "only --smoke, --full, --configs B, --configs C0,C1,C2,C3,C4, --configs D, or --configs E1,E2,E3,E4,E5 is implemented"
+            )
 
     qual_root = Path(args.qual_root)
     ref_audio = Path(args.ref_audio)
@@ -881,6 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
     by_name = _config_by_name()
     run_dir = qual_root / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    if args.full:
+        (run_dir / "wavs").mkdir(parents=True, exist_ok=True)
 
     plan = measured_plan()
     warmup = int(plan["warmup"])
@@ -893,14 +1120,104 @@ def main(argv: list[str] | None = None) -> int:
 
     payload: dict[str, Any] = {
         "run_id": args.run_id,
-        "smoke": bool(args.smoke) and not b_sweep and not e_sweep and not d_run,
+        "smoke": bool(args.smoke) and not b_sweep and not e_sweep and not d_run and not args.full,
+        "full": bool(args.full),
         "qual_root": str(qual_root).replace(str(Path.home()), "~"),
-        "n": n_short if (b_sweep or c_sweep or e_sweep or d_run) else None,
+        "n": n_short if (b_sweep or c_sweep or e_sweep or d_run or args.full) else None,
         "configs": {},
     }
     exit_code = 0
 
-    if e_sweep:
+    if full_mixed and not args.smoke:
+        want_b = any(name in {"A", *_B_ARM_NAMES} for name in names)
+        want_c = any(name in _C_LADDER_NAMES for name in names)
+        want_e = any(name in _E_LADDER_NAMES for name in names)
+        want_d = "D" in names
+        if want_b:
+            b_names = [name for name in ["A", *_B_ARM_NAMES] if name in names]
+            for name in b_names:
+                print(f"full-30 start {name}", flush=True)
+                row, code = _run_measured_config(
+                    config=by_name[name],
+                    qual_root=qual_root,
+                    run_dir=run_dir,
+                    ref_audio=ref_audio,
+                    ref_text=args.ref_text,
+                    n=n_short,
+                    warmup=warmup,
+                    full=True,
+                )
+                payload["configs"][name] = row
+                if code != 0 and exit_code == 0:
+                    exit_code = code
+                _persist_metrics(run_dir, payload)
+                print(f"full-30 done {name} not_run={bool(row.get('not_run'))}", flush=True)
+            for arm_name in _B_ARM_NAMES:
+                payload["configs"].setdefault(
+                    arm_name,
+                    _skipped_arm_row(by_name[arm_name], reason="not-run"),
+                )
+            payload["configs"]["B_winner"] = _compose_b_payload(payload["configs"])
+            _persist_metrics(run_dir, payload)
+        if want_c:
+            print("full-30 start C", flush=True)
+            rows, code = _run_c_sweep(
+                by_name=by_name,
+                qual_root=qual_root,
+                run_dir=run_dir,
+                ref_audio=ref_audio,
+                ref_text=args.ref_text,
+                n=n_short,
+                warmup=warmup,
+                full=True,
+            )
+            payload["configs"].update(rows)
+            if code != 0 and exit_code == 0:
+                exit_code = code
+            _persist_metrics(run_dir, payload)
+            print("full-30 done C", flush=True)
+        if want_e:
+            print("full-30 start E", flush=True)
+            rows, code, rejected = _run_e_sweep(
+                by_name=by_name,
+                qual_root=qual_root,
+                run_dir=run_dir,
+                ref_audio=ref_audio,
+                ref_text=args.ref_text,
+                n=n_short,
+                warmup=warmup,
+                full=True,
+            )
+            payload["configs"].update(rows)
+            payload["e_rejected_for_our_purposes"] = rejected
+            if code != 0 and exit_code == 0:
+                exit_code = code
+            _persist_metrics(run_dir, payload)
+            print("full-30 done E", flush=True)
+        if want_d:
+            print("full-30 start D", flush=True)
+            killed_row = _d_already_killed(qual_root)
+            if killed_row is not None:
+                payload["configs"]["D"] = killed_row
+                payload["d_killed"] = True
+            else:
+                row, code, killed = _run_d_control(
+                    config=by_name["D"],
+                    qual_root=qual_root,
+                    run_dir=run_dir,
+                    ref_audio=ref_audio,
+                    ref_text=args.ref_text,
+                    n=n_short,
+                    warmup=warmup,
+                    full=True,
+                )
+                payload["configs"]["D"] = row
+                payload["d_killed"] = killed
+                if code != 0 and exit_code == 0:
+                    exit_code = code
+            _persist_metrics(run_dir, payload)
+            print("full-30 done D", flush=True)
+    elif e_sweep:
         rows, code, rejected = _run_e_sweep(
             by_name=by_name,
             qual_root=qual_root,
@@ -909,6 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
             ref_text=args.ref_text,
             n=n_short,
             warmup=warmup,
+            full=bool(args.full),
         )
         payload["configs"] = rows
         payload["e_rejected_for_our_purposes"] = rejected
@@ -922,12 +1240,13 @@ def main(argv: list[str] | None = None) -> int:
             ref_text=args.ref_text,
             n=n_short,
             warmup=warmup,
+            full=bool(args.full),
         )
         payload["configs"] = rows
         exit_code = code
 
     elif b_sweep:
-        reused_a = _reuse_a_metrics(qual_root)
+        reused_a = None if args.full else _reuse_a_metrics(qual_root)
         for name in names:
             if name == "A" and reused_a is not None:
                 payload["configs"]["A"] = reused_a
@@ -940,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
                 ref_text=args.ref_text,
                 n=n_short,
                 warmup=warmup,
+                full=bool(args.full),
             )
             payload["configs"][name] = row
             if code != 0 and exit_code == 0:
@@ -951,18 +1271,24 @@ def main(argv: list[str] | None = None) -> int:
             )
         payload["configs"]["B_winner"] = _compose_b_payload(payload["configs"])
     elif d_run:
-        row, code, killed = _run_d_control(
-            config=by_name["D"],
-            qual_root=qual_root,
-            run_dir=run_dir,
-            ref_audio=ref_audio,
-            ref_text=args.ref_text,
-            n=n_short,
-            warmup=warmup,
-        )
-        payload["configs"]["D"] = row
-        payload["d_killed"] = killed
-        exit_code = code
+        killed_row = _d_already_killed(qual_root) if args.full else None
+        if killed_row is not None:
+            payload["configs"]["D"] = killed_row
+            payload["d_killed"] = True
+        else:
+            row, code, killed = _run_d_control(
+                config=by_name["D"],
+                qual_root=qual_root,
+                run_dir=run_dir,
+                ref_audio=ref_audio,
+                ref_text=args.ref_text,
+                n=n_short,
+                warmup=warmup,
+                full=bool(args.full),
+            )
+            payload["configs"]["D"] = row
+            payload["d_killed"] = killed
+            exit_code = code
     else:
         for name in names:
             row, code = _run_smoke_config(
@@ -978,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return exit_code
+
 
 
 
