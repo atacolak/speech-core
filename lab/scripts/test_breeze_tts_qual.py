@@ -188,5 +188,76 @@ class ConfigTableE(unittest.TestCase):
             )
 
 
+class Protocol(unittest.TestCase):
+    def test_stop_adding_graphs(self) -> None:
+        from breeze_tts_qual.protocol import (
+            should_stop_adding_graphs,
+            would_exceed_hard_ceiling,
+            UNSAFE_PEAK_GIB,
+        )
+
+        self.assertAlmostEqual(UNSAFE_PEAK_GIB, 9.0)
+        prev = {"p50_ttfa_s": 0.20, "gap_p95_s": 0.05, "startup_s": 10.0}
+        unsafe = dict(prev, p50_ttfa_s=0.18, peak_allocated_gib=9.1)
+        stop, reason = should_stop_adding_graphs(prev, unsafe)
+        self.assertTrue(stop)
+        self.assertEqual(reason, "unsafe_vram")
+        no_win = dict(prev, p50_ttfa_s=0.21, peak_allocated_gib=8.0)
+        stop, reason = should_stop_adding_graphs(prev, no_win)
+        self.assertTrue(stop)
+        self.assertEqual(reason, "latency_no_improve")
+        jitter = dict(prev, p50_ttfa_s=0.10, gap_p95_s=0.06, peak_allocated_gib=8.0)
+        stop, reason = should_stop_adding_graphs(prev, jitter)
+        self.assertTrue(stop)
+        self.assertEqual(reason, "jitter_worse")
+        bad = dict(prev, p50_ttfa_s=0.10, peak_allocated_gib=8.0, correctness_changed=True)
+        stop, reason = should_stop_adding_graphs(prev, bad)
+        self.assertTrue(stop)
+        self.assertEqual(reason, "correctness_changed")
+        init = dict(prev, p50_ttfa_s=0.10, peak_allocated_gib=8.0, init_unreasonable=True)
+        stop, reason = should_stop_adding_graphs(prev, init)
+        self.assertTrue(stop)
+        self.assertEqual(reason, "init_unreasonable")
+        ok = dict(prev, p50_ttfa_s=0.10, gap_p95_s=0.04, peak_allocated_gib=8.0)
+        stop, reason = should_stop_adding_graphs(prev, ok)
+        self.assertFalse(stop)
+        self.assertIsNone(reason)
+        at_ceiling = dict(prev, p50_ttfa_s=0.10, gap_p95_s=0.04, peak_allocated_gib=9.0)
+        stop, reason = should_stop_adding_graphs(prev, at_ceiling)
+        self.assertFalse(stop)
+        self.assertIsNone(reason)
+        self.assertTrue(would_exceed_hard_ceiling(9.1))
+        self.assertFalse(would_exceed_hard_ceiling(9.0))
+
+    def test_utterance_classes_and_run_counts(self) -> None:
+        from breeze_tts_qual.protocol import measured_plan
+        from breeze_tts_qual.utterances import DIRECTIONS, LONG, MEDIUM, SHORT, TINY
+
+        self.assertEqual(TINY, ("yeah.", "got it.", "one second."))
+        self.assertEqual(
+            SHORT,
+            ("I found the issue. The worker is holding the old session open.",),
+        )
+        self.assertGreaterEqual(len(MEDIUM[0].split()), 40)
+        self.assertLessEqual(len(MEDIUM[0].split()), 70)
+        self.assertGreaterEqual(len(LONG[0].split()), 150)
+        self.assertLessEqual(len(LONG[0].split()), 250)
+        self.assertEqual(
+            list(DIRECTIONS),
+            [
+                "calm and matter-of-fact",
+                "slightly amused",
+                "urgent but controlled",
+                "quiet / thoughtful",
+            ],
+        )
+        plan = measured_plan()
+        self.assertEqual(plan["tiny"], 30)
+        self.assertEqual(plan["short"], 30)
+        self.assertEqual(plan["medium"], 3)
+        self.assertEqual(plan["long"], 3)
+        self.assertEqual(plan["warmup"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
