@@ -449,5 +449,48 @@ class ComposeB(unittest.TestCase):
         self.assertLessEqual(ceiling["peak_allocated_gib"], 9.0)
 
 
+class SmokeC0Crash(unittest.TestCase):
+    def test_hybrid_crash_records_correctness_changed_without_bf16_fallback(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual import run_benchmark
+
+        c0 = next(cfg for cfg in CONFIGS if cfg.name == "C0")
+        self.assertEqual(c0.precision, "hybrid_int8")
+
+        class BoomBackend:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                raise RuntimeError("ConvRot kernel exploded")
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            try:
+                with patch.object(run_benchmark, "OfficialBackend", BoomBackend):
+                    row, code = run_benchmark._run_smoke_config(
+                        config=c0,
+                        qual_root=tmp_path,
+                        run_dir=tmp_path,
+                        ref_audio=ref,
+                        ref_text="hello",
+                    )
+            except Exception as exc:  # noqa: BLE001 — RED: crash must be recorded, not raised
+                self.fail(f"smoke must record crash, not raise: {exc}")
+
+        self.assertEqual(row["precision"], "hybrid_int8")
+        self.assertNotEqual(row["precision"], "bf16")
+        self.assertEqual(row["backend"], "OfficialBackend")
+        self.assertTrue(row["correctness_changed"])
+        self.assertIn("ConvRot kernel exploded", row.get("traceback") or "")
+        self.assertNotEqual(code, 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()

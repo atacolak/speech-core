@@ -10,6 +10,7 @@ import argparse
 import gc
 import json
 import os
+import traceback
 import sys
 import time
 import wave
@@ -307,7 +308,7 @@ def _run_smoke_config(
             print("streaming contract failed", file=sys.stderr)
             return row, 2
         return row, exit_code
-    except RuntimeError as exc:
+    except Exception as exc:
         if _is_cuda_oom(exc):
             peak = _peak_vram()
             row.update(peak)
@@ -315,7 +316,11 @@ def _run_smoke_config(
             row["stop_reason"] = "unsafe_vram"
             row["error"] = "cuda_oom"
             return row, 1
-        raise
+        row["correctness_changed"] = True
+        row["traceback"] = traceback.format_exc()
+        row["error"] = f"{type(exc).__name__}: {exc}"
+        row["stop_reason"] = "correctness_changed"
+        return row, 3
     finally:
         if engine is not None:
             engine.close()
