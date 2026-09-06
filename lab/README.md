@@ -12,6 +12,7 @@ live ear/mouth stays at repo root: daemons, `scripts/barge_in_align/`, qwentts p
 | `scripts/barge-in-dual-asr*` | dual-stream drain cut | same |
 | `scripts/speech_talker_session.py` | `pi --profile talker` dogfood | headed omp TUI is the brain now |
 | `scripts/cosyvoice_qual/` | CosyVoice GPU qualification | live mouth is qwentts |
+| `scripts/breeze_tts_qual/` | Breeze TTS 2 hybrid-int8 + CUDA-graph 4070 qual (sc-breeze-hybrid-81p) | not on the voicecat path; live mouth stays leftover qwentts |
 | `docs/assistant-self-asr-eval.md` | eval-only track notes | |
 | `docs/barge-in-dual-asr.md` | dual-ASR impl notes | |
 | `docs/qualification/cosyvoice*` / qwen3 research | rollback / bakeoff receipts | keep evidence, not the map |
