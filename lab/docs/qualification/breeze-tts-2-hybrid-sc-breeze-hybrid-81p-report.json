@@ -1,0 +1,236 @@
+{
+  "bead": "sc-breeze-hybrid-81p",
+  "recommendation": "SHELF",
+  "qual_root": "~/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p",
+  "rows": [
+    {
+      "configuration": "A",
+      "peak_vram_gib": 7.777720928192139,
+      "p50_ttfa_s": 0.3961049644541927,
+      "p95_ttfa_s": 0.4064582853668835,
+      "rtf": 2.0568514288243023,
+      "stream_jitter_p95_s": 0.17882308857282608,
+      "quality_notes": "baseline",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "B_depth",
+      "peak_vram_gib": 8.020729541778564,
+      "p50_ttfa_s": 0.1931203030264005,
+      "p95_ttfa_s": 0.19885306332539768,
+      "rtf": 0.7822083514739377,
+      "stream_jitter_p95_s": -0.03312325144303045,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "B_codec",
+      "peak_vram_gib": 8.75372314453125,
+      "p50_ttfa_s": 0.23293053751438855,
+      "p95_ttfa_s": 0.24369248476903882,
+      "rtf": 2.019072965065954,
+      "stream_jitter_p95_s": 0.08724307950353241,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "B_backbone_decode",
+      "peak_vram_gib": 8.045101642608643,
+      "p50_ttfa_s": 0.38351661499217155,
+      "p95_ttfa_s": 0.406012363828253,
+      "rtf": 1.8678112569680458,
+      "stream_jitter_p95_s": 0.1490928285440895,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "B_backbone_prefill",
+      "peak_vram_gib": 8.042840480804443,
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "unsafe_vram",
+      "not_run": true,
+      "stop_reason": "unsafe_vram"
+    },
+    {
+      "configuration": "B_winner",
+      "peak_vram_gib": 8.75372314453125,
+      "p50_ttfa_s": 0.3961049644541927,
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": 0.17882308857282608,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "C0",
+      "peak_vram_gib": 7.408604621887207,
+      "p50_ttfa_s": 0.8787404364822432,
+      "p95_ttfa_s": 0.9115021746288985,
+      "rtf": 4.427774772135308,
+      "stream_jitter_p95_s": 0.5618792932399082,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "C1",
+      "peak_vram_gib": 7.408734321594238,
+      "p50_ttfa_s": 0.6586942109726369,
+      "p95_ttfa_s": 0.6765891845901496,
+      "rtf": 3.0493518333737195,
+      "stream_jitter_p95_s": 0.32808205627137776,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "C2",
+      "peak_vram_gib": 7.424603462219238,
+      "p50_ttfa_s": 0.4217942430269904,
+      "p95_ttfa_s": 0.43280108802532774,
+      "rtf": 2.9992615402969682,
+      "stream_jitter_p95_s": 0.161239622986177,
+      "quality_notes": "comparable vs A",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "C3",
+      "peak_vram_gib": "",
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "correctness_changed",
+      "not_run": false,
+      "stop_reason": "correctness_changed"
+    },
+    {
+      "configuration": "C4",
+      "peak_vram_gib": "",
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "correctness_changed",
+      "not_run": true,
+      "stop_reason": "correctness_changed"
+    },
+    {
+      "configuration": "E1",
+      "peak_vram_gib": 8.020768642425537,
+      "p50_ttfa_s": 0.1881939439782873,
+      "p95_ttfa_s": 0.20284344189381226,
+      "rtf": 0.7598434879566245,
+      "stream_jitter_p95_s": -0.031491857751971206,
+      "quality_notes": "",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "E2",
+      "peak_vram_gib": 8.769330024719238,
+      "p50_ttfa_s": 0.1388841759627685,
+      "p95_ttfa_s": 0.14892522151744925,
+      "rtf": 0.7896480518155096,
+      "stream_jitter_p95_s": -0.013632349537219923,
+      "quality_notes": "comparable vs A",
+      "not_run": false,
+      "stop_reason": null
+    },
+    {
+      "configuration": "E3",
+      "peak_vram_gib": "",
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "jitter_worse",
+      "not_run": true,
+      "stop_reason": "jitter_worse"
+    },
+    {
+      "configuration": "E4",
+      "peak_vram_gib": "",
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "jitter_worse",
+      "not_run": true,
+      "stop_reason": "jitter_worse"
+    },
+    {
+      "configuration": "E5",
+      "peak_vram_gib": "",
+      "p50_ttfa_s": "",
+      "p95_ttfa_s": "",
+      "rtf": "",
+      "stream_jitter_p95_s": "",
+      "quality_notes": "jitter_worse",
+      "not_run": true,
+      "stop_reason": "jitter_worse"
+    },
+    {
+      "configuration": "D",
+      "peak_vram_gib": 7.176548957824707,
+      "p50_ttfa_s": 2.536713011025451,
+      "p95_ttfa_s": 2.5808502262206745,
+      "rtf": 14.638987727839947,
+      "stream_jitter_p95_s": 2.2317230500781458,
+      "quality_notes": "d_killed",
+      "not_run": true,
+      "stop_reason": "d_killed"
+    }
+  ],
+  "best_e_le_9gib": "E2",
+  "best_hybrid_le_9gib": "C2",
+  "e_rejected_for_our_purposes": false,
+  "stage_trace": {
+    "trace_unavailable": true,
+    "reason": "full-30 metrics.json does not persist collect_timing stage breakdown (text encoder, backbone prefill, first backbone decode, depth decode, codec, pcm emission).",
+    "coarse_clocks": {
+      "A": {
+        "first_model_output_s": 0.029463552474975587,
+        "first_codec_frame_s": 0.39611028996296227,
+        "first_pcm_s": 0.39611028996296227,
+        "first_nonsilent_s": 0.4019852899629623
+      },
+      "C2": {
+        "first_model_output_s": 0.20906076049804687,
+        "first_codec_frame_s": 0.41184685903135687,
+        "first_pcm_s": 0.41184685903135687,
+        "first_nonsilent_s": 0.42009685903135685
+      },
+      "E2": {
+        "first_model_output_s": 0.02903654479980469,
+        "first_codec_frame_s": 0.12590199790429324,
+        "first_pcm_s": 0.12590199790429324,
+        "first_nonsilent_s": 0.13415199790429325
+      },
+      "E1": {
+        "first_model_output_s": 0.026476543426513673,
+        "first_codec_frame_s": 0.17436883901245892,
+        "first_pcm_s": 0.17436883901245892,
+        "first_nonsilent_s": 0.18261883901245893
+      },
+      "B_depth": {
+        "first_model_output_s": 0.028041311264038086,
+        "first_codec_frame_s": 0.18268634798005223,
+        "first_pcm_s": 0.18268634798005223,
+        "first_nonsilent_s": 0.19093634798005224
+      }
+    }
+  },
+  "leftover_commentary": "Leftover qwentts first-usable is ~70 ms / ~2.4 GB (commentary only; not a pin-swap gate). A win vs leftover still parks the bead.",
+  "shelf_meaning": "SHELF means the best config is characterized and the bead is parked for a later resource-allocation decision. It is not permission to integrate, propose a pin swap, or spawn a follow-on wiring bead. Recommendation is against this experiment's own A, not leftover.",
+  "quality_ok": true
+}

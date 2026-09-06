@@ -38,6 +38,8 @@ from breeze_tts_qual.protocol import (
 )
 
 from breeze_tts_qual.utterances import DIRECTIONS, LONG, MEDIUM, SHORT
+from breeze_tts_qual.report import compact_from_metrics
+
 
 _DEFAULT_QUAL_ROOT = (
     Path.home() / ".cache" / "speech-out" / "breeze-tts-qual-sc-breeze-hybrid-81p"
@@ -1173,9 +1175,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--direction-only", action="store_true")
     parser.add_argument("--n", type=int, default=None)
     parser.add_argument("--run-id", default="smoke-A")
-    parser.add_argument("--ref-audio", required=True)
-    parser.add_argument("--ref-text", required=True)
+    parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--out-md",
+        default="lab/docs/qualification/breeze-tts-2-hybrid-sc-breeze-hybrid-81p.md",
+    )
+    parser.add_argument(
+        "--out-json",
+        default="lab/docs/qualification/breeze-tts-2-hybrid-sc-breeze-hybrid-81p-report.json",
+    )
+    parser.add_argument("--ref-audio", required=False)
+    parser.add_argument("--ref-text", required=False)
     args = parser.parse_args(argv)
+
+    if args.report_only:
+        qual_root = Path(args.qual_root)
+        metrics_path = qual_root / "runs" / args.run_id / "metrics.json"
+        if not metrics_path.is_file():
+            raise SystemExit(f"missing metrics for report-only: {metrics_path}")
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        md, payload = compact_from_metrics(metrics, qual_root=qual_root)
+        out_md = Path(args.out_md)
+        out_json = Path(args.out_json)
+        out_md.parent.mkdir(parents=True, exist_ok=True)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_md.write_text(md if md.endswith("\n") else md + "\n", encoding="utf-8")
+        out_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return 0
+
+    if not args.ref_audio or not args.ref_text:
+        parser.error("--ref-audio and --ref-text are required unless --report-only")
 
     if args.direction_only:
         qual_root = Path(args.qual_root)
