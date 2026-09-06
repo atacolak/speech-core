@@ -353,5 +353,36 @@ class Report(unittest.TestCase):
             render_report(rows=[], recommendation="MAYBE", bead="sc-breeze-hybrid-81p", qual_root="~")
 
 
+class ParkLeftover(unittest.TestCase):
+    def test_park_stops_only_ata_speech_tts(self) -> None:
+        from unittest.mock import patch
+        from breeze_tts_qual.park_leftover import UNIT, park, restore
+
+        self.assertEqual(UNIT, "ata-speech-tts.service")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            from types import SimpleNamespace
+            if argv[-2:] == ["is-active", UNIT]:
+                return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            park()
+            restore()
+        self.assertEqual(
+            calls,
+            [
+                ["systemctl", "--user", "is-active", UNIT],
+                ["systemctl", "--user", "stop", UNIT],
+                ["systemctl", "--user", "start", UNIT],
+            ],
+        )
+        joined = " ".join(" ".join(c) for c in calls)
+        self.assertNotIn("qwentts-tts-server.service", joined)
+        self.assertNotIn("edit", joined)
+
+
 if __name__ == "__main__":
     unittest.main()
