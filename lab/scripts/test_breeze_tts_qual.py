@@ -642,6 +642,249 @@ class CumulativeC(unittest.TestCase):
             self.assertEqual(row["stop_reason"], "latency_no_improve")
 
 
+class VoiceCatWarmup(unittest.TestCase):
+    def test_profile_uses_utterance_buckets_not_fast_json(self) -> None:
+        import json
+        from breeze_tts_qual.protocol import voicecat_warmup_profile_dict
+        from breeze_tts_qual.utterances import LONG, MEDIUM, SHORT, TINY
+
+        payload = voicecat_warmup_profile_dict()
+        blob = json.dumps(payload)
+        self.assertNotIn("fast.json", blob)
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(sorted(payload["service"]["cfg_scales"]), [1.0, 4.0])
+        self.assertEqual(payload["service"]["concurrency"], 1)
+        self.assertIn("yeah.", payload["warmup_request"]["text"])
+        self.assertNotIn(LONG[0], blob)
+        self.assertTrue(payload["stages"]["text_encoder"]["graphs"])
+        self.assertTrue(payload["stages"]["backbone_prefill"]["graphs"])
+        for graph in payload["stages"]["text_encoder"]["graphs"]:
+            self.assertEqual(graph["token_length"] % 32, 0)
+        for graph in payload["stages"]["backbone_prefill"]["graphs"]:
+            self.assertEqual(graph["sequence_length"] % 32, 0)
+        self.assertEqual(
+            set(g["branch_batch_size"] for g in payload["stages"]["backbone_decode"]["graphs"]),
+            {1, 2},
+        )
+
+    def test_e_warmup_parses_voicecat_profile_not_fast_json(self) -> None:
+        import sys
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual.engine import OfficialBackend
+
+        e1 = next(c for c in CONFIGS if c.name == "E1")
+        backend = OfficialBackend.__new__(OfficialBackend)
+        backend.config = e1
+        backend.qual_root = Path("/tmp/qual")
+        runtime = MagicMock()
+        runtime.codec_chunk_frames = 2
+        captured: dict = {}
+
+        warmup_mod = ModuleType("models.warmup_profile")
+
+        def parse_warmup_profile(payload, *, source=None):
+            captured["payload"] = payload
+            captured["source"] = source
+            return SimpleNamespace(name=payload["name"], source=source)
+
+        def load_warmup_profile(path):
+            captured["loaded"] = str(path)
+            raise AssertionError(f"E warmup must not load {path}")
+
+        warmup_mod.parse_warmup_profile = parse_warmup_profile
+        warmup_mod.load_warmup_profile = load_warmup_profile
+        models_mod = ModuleType("models")
+        models_mod.warmup_profile = warmup_mod
+
+        breeze_pkg = ModuleType("breeze_infer")
+        templates_mod = ModuleType("breeze_infer.templates")
+        templates_mod.prepare_inputs = lambda *args, **kwargs: None
+        breeze_pkg.templates = templates_mod
+
+        prev = {
+            name: sys.modules.get(name)
+            for name in (
+                "models",
+                "models.warmup_profile",
+                "breeze_infer",
+                "breeze_infer.templates",
+            )
+        }
+        sys.modules["models"] = models_mod
+        sys.modules["models.warmup_profile"] = warmup_mod
+        sys.modules["breeze_infer"] = breeze_pkg
+        sys.modules["breeze_infer.templates"] = templates_mod
+        try:
+            backend._maybe_warmup(runtime, breeze_src=MagicMock())
+        finally:
+            for name, module in prev.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+
+        self.assertNotIn("loaded", captured)
+        self.assertEqual(captured["source"], "voicecat")
+        self.assertEqual(captured["payload"]["name"], "voicecat-tiny-short-medium")
+        self.assertNotIn("fast.json", str(captured["payload"]))
+        runtime.warmup_from_profile.assert_called_once()
+
+    def test_attach_clone_reference_fills_ref_edit_fields(self) -> None:
+        import tempfile
+
+        from breeze_tts_qual.engine import attach_clone_reference
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            (fixtures / "ref.wav").write_bytes(b"RIFF")
+            (fixtures / "ref.txt").write_text("clone prompt\n", encoding="utf-8")
+            out = attach_clone_reference({"text": "yeah.", "instruction": "Speak clearly and naturally."}, root)
+        self.assertTrue(out["ref_audio_path"].endswith("ref.wav"))
+        self.assertEqual(out["ref_text"], "clone prompt")
+        self.assertEqual(out["text"], "yeah.")
+
+
+
+
+class CumulativeE(unittest.TestCase):
+    def test_e_ladder_marks_overflowing_stage_and_later_not_run(self) -> None:
+        import json
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        calls: list[str] = []
+
+        def fake_measured(*, config, **_kwargs):
+            calls.append(config.name)
+            if config.name == "E1":
+                return {
+                    "name": "E1",
+                    "precision": "bf16",
+                    "backend": "OfficialBackend",
+                    "fast": ["depth"],
+                    "unsafe_vram": False,
+                    "n": 5,
+                    "p50_ttfa_s": 0.22,
+                    "gap_p95_s": 0.04,
+                    "peak_allocated_gib": 8.2,
+                }, 0
+            if config.name == "E2":
+                return {
+                    "name": "E2",
+                    "precision": "bf16",
+                    "backend": "OfficialBackend",
+                    "fast": ["depth", "codec"],
+                    "unsafe_vram": True,
+                    "stop_reason": "unsafe_vram",
+                    "n": 0,
+                    "p50_ttfa_s": None,
+                    "gap_p95_s": None,
+                    "peak_allocated_gib": 9.3,
+                }, 0
+            self.fail(f"must not measure {config.name} after overflowing E2")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                code = run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "E1,E2,E3,E4,E5",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "e-incr",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "e-incr" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["E1", "E2"])
+        for name in ("E1", "E2", "E3", "E4", "E5"):
+            self.assertIn(name, payload["configs"], name)
+        self.assertFalse(payload["configs"]["E1"].get("not_run"))
+        for name in ("E2", "E3", "E4", "E5"):
+            row = payload["configs"][name]
+            self.assertTrue(row["not_run"], name)
+            self.assertEqual(row["stop_reason"], "unsafe_vram")
+        self.assertEqual(payload["configs"]["E_winner"]["name"], "E1")
+        self.assertFalse(payload["e_rejected_for_our_purposes"])
+
+    def test_e_rejected_when_no_in_envelope_row(self) -> None:
+        import json
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        def fake_measured(*, config, **_kwargs):
+            if config.name != "E1":
+                self.fail(f"must not measure {config.name} after overflowing E1")
+            return {
+                "name": "E1",
+                "precision": "bf16",
+                "backend": "OfficialBackend",
+                "fast": ["depth"],
+                "unsafe_vram": True,
+                "stop_reason": "unsafe_vram",
+                "n": 0,
+                "p50_ttfa_s": None,
+                "gap_p95_s": None,
+                "peak_allocated_gib": 9.4,
+            }, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "E1,E2,E3,E4,E5",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "e-incr",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "e-incr" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        for name in ("E1", "E2", "E3", "E4", "E5"):
+            row = payload["configs"][name]
+            self.assertTrue(row["not_run"], name)
+            self.assertEqual(row["stop_reason"], "unsafe_vram")
+        self.assertNotIn("E_winner", payload["configs"])
+        self.assertTrue(payload["e_rejected_for_our_purposes"])
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

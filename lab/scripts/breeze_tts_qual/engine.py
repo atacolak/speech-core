@@ -87,6 +87,14 @@ def _float_audio_to_s16le(audio: Any) -> bytes:
     return (clipped * 32767.0).astype("<i2").tobytes()
 
 
+def attach_clone_reference(request: dict[str, Any], qual_root: Path | str) -> dict[str, Any]:
+    root = Path(qual_root)
+    out = dict(request)
+    out["ref_audio_path"] = str(root / "fixtures" / "ref.wav")
+    out["ref_text"] = (root / "fixtures" / "ref.txt").read_text(encoding="utf-8").strip()
+    return out
+
+
 def _any_fast(config: EngineConfig) -> bool:
     return any(
         (
@@ -176,26 +184,46 @@ class OfficialBackend:
         if not _any_fast(self.config):
             return
         if self.config.name.startswith("E"):
-            profile_dict = None
-            try:
-                from .utterances import voicecat_warmup_profile_dict
-
-                profile_dict = voicecat_warmup_profile_dict()
-            except ImportError:
-                profile_dict = None
-            if not profile_dict:
-                return
             from models.warmup_profile import parse_warmup_profile
 
-            profile = parse_warmup_profile(profile_dict, source="voicecat")
-        else:
-            from dataclasses import replace
+            import breeze_infer.templates as templates
 
-            from models.warmup_profile import load_warmup_profile
+            from .protocol import voicecat_warmup_profile_dict
 
-            profile = load_warmup_profile(breeze_src / "configs" / "fast.json")
-            profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
+            profile = parse_warmup_profile(
+                voicecat_warmup_profile_dict(fast_codec=self.config.fast_codec),
+                source="voicecat",
+            )
+            orig_prepare = templates.prepare_inputs
+
+            def _prepare_with_clone(*args: Any, **kwargs: Any):
+                seq = list(args)
+                if len(seq) >= 4 and isinstance(seq[3], list):
+                    seq[3] = [
+                        attach_clone_reference(req, self.qual_root) for req in seq[3]
+                    ]
+                elif isinstance(kwargs.get("requests"), list):
+                    kwargs["requests"] = [
+                        attach_clone_reference(req, self.qual_root)
+                        for req in kwargs["requests"]
+                    ]
+                return orig_prepare(*seq, **kwargs)
+
+            templates.prepare_inputs = _prepare_with_clone
+            try:
+                runtime.warmup_from_profile(profile)
+            finally:
+                templates.prepare_inputs = orig_prepare
+            return
+        from dataclasses import replace
+
+        from models.warmup_profile import load_warmup_profile
+
+        profile = load_warmup_profile(breeze_src / "configs" / "fast.json")
+        profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
         runtime.warmup_from_profile(profile)
+
+
 
     def synthesize(self, **kwargs: Any) -> Iterator[PcmChunk]:
         from breeze_infer.runtime import set_all_seeds

@@ -7,6 +7,91 @@ from __future__ import annotations
 
 UNSAFE_PEAK_GIB = 9.0  # hard ceiling; in-envelope is peak <= 9.0; overflow is peak > 9.0
 
+_WARMUP_BUCKET = 32
+_CLONE_PROMPT = (
+    "And so, my fellow Americans, ask not what your country can do for you, "
+    "ask what you can do for your country."
+)
+_CLONE_AUDIO_S_MAX = 15.0
+_CODEC_HZ = 12.5
+_WARMUP_INSTRUCTION = "Speak clearly and naturally."
+
+
+def _round_up_32(n: int) -> int:
+    n = max(int(n), 1)
+    return ((n + _WARMUP_BUCKET - 1) // _WARMUP_BUCKET) * _WARMUP_BUCKET
+
+
+def _text_token_guess(text: str) -> int:
+    # Conservative stand-in: 2 tokens/word plus specials, rounded to 32.
+    return _round_up_32(len(text.split()) * 2 + 16)
+
+
+def voicecat_warmup_profile_dict(*, fast_codec: bool = False) -> dict:
+    """Minimal VoiceCat CUDA-graph warmup profile. Never loads stock fast.json."""
+    from .utterances import MEDIUM, SHORT, TINY
+
+    texts = [*TINY, SHORT[0], MEDIUM[0], _CLONE_PROMPT, _WARMUP_INSTRUCTION]
+    token_lengths = sorted({_text_token_guess(text) for text in texts})
+    clone_audio = _round_up_32(int(_CLONE_AUDIO_S_MAX * _CODEC_HZ))
+    prefill_lengths = sorted(
+        {clone_audio} | {_round_up_32(clone_audio + length) for length in token_lengths}
+    )
+    return {
+        "schema_version": 1,
+        "name": "voicecat-tiny-short-medium",
+        "service": {
+            "concurrency": 1,
+            "cfg_scales": [1.0, 4.0],
+            "freeze_after_warmup": True,
+        },
+        "stages": {
+            "text_encoder": {
+                "graphs": [
+                    {"batch_size": batch, "token_length": length}
+                    for batch in (1, 2)
+                    for length in token_lengths
+                ]
+            },
+            "backbone_prefill": {
+                "graphs": [
+                    {"branch_batch_size": batch, "sequence_length": length}
+                    for batch in (1, 2)
+                    for length in prefill_lengths
+                ]
+            },
+            "backbone_decode": {
+                "graphs": [
+                    {"branch_batch_size": 1},
+                    {"branch_batch_size": 2},
+                ]
+            },
+            "depth_decoder": {
+                "graphs": [
+                    {"batch_size": 1},
+                    {"batch_size": 2},
+                ]
+            },
+            "codec": {
+                "graphs": [
+                    {
+                        "num_lanes": 1,
+                        "chunk_frames": 1 if fast_codec else 2,
+                    }
+                ]
+            },
+        },
+        "warmup_request": {
+            "template": "ref_edit_tata",
+            "text": "yeah.",
+            "instruction": _WARMUP_INSTRUCTION,
+            "speaker": "S0",
+            "seed": 42,
+        },
+    }
+
+
+
 
 def would_exceed_hard_ceiling(peak_allocated_gib: float) -> bool:
     return float(peak_allocated_gib) > UNSAFE_PEAK_GIB
@@ -116,5 +201,32 @@ def compose_b_winner(arms: dict) -> dict:
             winner["fast"].append(flag)
         winner["peak_allocated_gib"] = max(winner["peak_allocated_gib"], peak)
     return winner
+
+
+_E_LADDER_NAMES: tuple[str, ...] = ("E1", "E2", "E3", "E4", "E5")
+
+
+def compose_e_winner(rows: dict) -> dict | None:
+    """Pick the executed in-envelope E row with lowest p50 TTFA."""
+    best: dict | None = None
+    best_ttfa: float | None = None
+    for name in _E_LADDER_NAMES:
+        row = rows.get(name)
+        if not isinstance(row, dict):
+            continue
+        if row.get("not_run") or row.get("unsafe_vram"):
+            continue
+        peak = row.get("peak_allocated_gib")
+        if peak is None or would_exceed_hard_ceiling(float(peak)):
+            continue
+        ttfa = row.get("p50_ttfa_s")
+        if ttfa is None:
+            continue
+        ttfa_f = float(ttfa)
+        if best is None or ttfa_f < best_ttfa:
+            best = dict(row)
+            best_ttfa = ttfa_f
+    return best
+
 
 
