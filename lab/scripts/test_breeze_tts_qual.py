@@ -384,5 +384,39 @@ class ParkLeftover(unittest.TestCase):
         self.assertNotIn("edit", joined)
 
 
+class OfficialMapping(unittest.TestCase):
+    def test_fast_flags_map(self) -> None:
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual.engine import fast_streaming_kwargs
+
+        a = next(c for c in CONFIGS if c.name == "A")
+        kw = fast_streaming_kwargs(a)
+        self.assertFalse(kw["fast_depth_decoder"])
+        self.assertFalse(kw["fast_codec"])
+        self.assertFalse(kw["fast_backbone_decode"])
+        self.assertFalse(kw["fast_backbone_prefill"])
+        self.assertFalse(kw.get("fast_text_encoder", False))
+        self.assertFalse(kw.get("fast_all", False) not in (None, False) and kw.get("fast_all"))
+        c2 = next(c for c in CONFIGS if c.name == "C2")
+        kw2 = fast_streaming_kwargs(c2)
+        self.assertTrue(kw2["fast_depth_decoder"])
+        self.assertTrue(kw2["fast_codec"])
+        self.assertFalse(kw2["fast_backbone_decode"])
+        self.assertFalse(kw2.get("fast_text_encoder", False))
+        e5 = next(c for c in CONFIGS if c.name == "E5")
+        kw5 = fast_streaming_kwargs(e5)
+        self.assertTrue(kw5["fast_text_encoder"])
+        e1 = next(c for c in CONFIGS if c.name == "E1")
+        self.assertFalse(fast_streaming_kwargs(e1).get("fast_text_encoder", False))
+
+    def test_checkpoint_for_precision(self) -> None:
+        from pathlib import Path
+        from breeze_tts_qual.engine import checkpoint_for_precision
+
+        root = Path("/tmp/qual")
+        self.assertIn("int8-hybrid", str(checkpoint_for_precision(root, "hybrid_int8")))
+        self.assertIn("int8-convrot", str(checkpoint_for_precision(root, "full_int8")))
+
+
 if __name__ == "__main__":
     unittest.main()
