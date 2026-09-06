@@ -418,5 +418,36 @@ class OfficialMapping(unittest.TestCase):
         self.assertIn("int8-convrot", str(checkpoint_for_precision(root, "full_int8")))
 
 
+
+class ComposeB(unittest.TestCase):
+    def test_compose_independent_winners(self) -> None:
+        from breeze_tts_qual.protocol import compose_b_winner
+
+        arms = {
+            "A": {"p50_ttfa_s": 0.30, "gap_p95_s": 0.05, "peak_allocated_gib": 7.7, "fast": []},
+            "B_depth": {"p50_ttfa_s": 0.22, "gap_p95_s": 0.04, "peak_allocated_gib": 8.0, "fast": ["depth"]},
+            "B_codec": {"p50_ttfa_s": 0.28, "gap_p95_s": 0.04, "peak_allocated_gib": 8.2, "fast": ["codec"]},
+            "B_backbone_decode": {"p50_ttfa_s": 0.31, "gap_p95_s": 0.05, "peak_allocated_gib": 8.5, "fast": ["backbone_decode"]},
+            "B_backbone_prefill": {"p50_ttfa_s": 0.29, "gap_p95_s": 0.06, "peak_allocated_gib": 8.1, "fast": ["backbone_prefill"]},
+        }
+        winner = compose_b_winner(arms)
+        # depth improved; codec improved; backbone_decode did not; prefill jitter worse vs current
+        self.assertIn("depth", winner["fast"])
+        self.assertIn("codec", winner["fast"])
+        self.assertNotIn("backbone_decode", winner["fast"])
+        self.assertNotIn("backbone_prefill", winner["fast"])
+        unsafe = {
+            "A": {"p50_ttfa_s": 0.30, "gap_p95_s": 0.05, "peak_allocated_gib": 7.7, "fast": []},
+            "B_depth": {"p50_ttfa_s": 0.10, "gap_p95_s": 0.04, "peak_allocated_gib": 9.1, "fast": ["depth"]},
+            "B_codec": {"p50_ttfa_s": 0.28, "gap_p95_s": 0.04, "peak_allocated_gib": 8.2, "fast": ["codec"]},
+            "B_backbone_decode": {"p50_ttfa_s": 0.31, "gap_p95_s": 0.05, "peak_allocated_gib": 8.5, "fast": ["backbone_decode"]},
+            "B_backbone_prefill": {"p50_ttfa_s": 0.29, "gap_p95_s": 0.06, "peak_allocated_gib": 8.1, "fast": ["backbone_prefill"]},
+        }
+        ceiling = compose_b_winner(unsafe)
+        self.assertNotIn("depth", ceiling["fast"])
+        self.assertIn("codec", ceiling["fast"])
+        self.assertLessEqual(ceiling["peak_allocated_gib"], 9.0)
+
+
 if __name__ == "__main__":
     unittest.main()
