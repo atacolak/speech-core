@@ -231,6 +231,13 @@
     }
   },
   "leftover_commentary": "Leftover qwentts first-usable is ~70 ms / ~2.4 GB (commentary only; not a pin-swap gate). A win vs leftover still parks the bead.",
+  "leftover_restored": true,
+  "leftover_restore": {
+    "unit": "~/.config/systemd/user/ata-speech-tts.service",
+    "listen": "127.0.0.1:18091",
+    "model": "~/.local/share/speech-out/qwen3-tts-0.6b-20260820/models/gguf/qwen-talker-0.6b-customvoice-Q8_0.gguf",
+    "codec": "~/.local/share/speech-out/qwen3-tts-0.6b-20260820/models/gguf/qwen-tokenizer-12hz-Q8_0.gguf"
+  },
   "shelf_meaning": "SHELF means the best config is characterized and the bead is parked for a later resource-allocation decision. It is not permission to integrate, propose a pin swap, or spawn a follow-on wiring bead. Recommendation is against this experiment's own A, not leftover.",
   "quality_ok": true
 }

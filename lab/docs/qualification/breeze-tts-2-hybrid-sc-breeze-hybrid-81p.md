@@ -38,6 +38,12 @@ E2 p50 TTFA 0.138884s / RTF 0.789648 / peak 8.76933 GiB vs C2 p50 TTFA 0.421794s
 
 Leftover qwentts first-usable is ~70 ms / ~2.4 GB (commentary only; not a pin-swap gate). A win vs leftover still parks the bead.
 
+leftover_restored: true
+unit: ~/.config/systemd/user/ata-speech-tts.service
+listen: 127.0.0.1:18091
+model: ~/.local/share/speech-out/qwen3-tts-0.6b-20260820/models/gguf/qwen-talker-0.6b-customvoice-Q8_0.gguf
+codec: ~/.local/share/speech-out/qwen3-tts-0.6b-20260820/models/gguf/qwen-tokenizer-12hz-Q8_0.gguf
+
 ## First-audio stage trace
 
 trace_unavailable: full-30 metrics.json does not persist collect_timing stage breakdown (text encoder, backbone prefill, first backbone decode, depth decode, codec, pcm emission).
