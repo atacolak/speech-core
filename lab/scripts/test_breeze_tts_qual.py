@@ -259,5 +259,53 @@ class Protocol(unittest.TestCase):
         self.assertEqual(plan["warmup"], 3)
 
 
+class Int8Convrot(unittest.TestCase):
+    def test_replace_named_linear(self) -> None:
+        import torch
+        from torch import nn
+        from breeze_tts_qual.int8_convrot import (
+            ConvRotInt8Linear,
+            QuantLayerInfo,
+            replace_quantized_linears,
+        )
+
+        class Toy(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.backbone = nn.Linear(16, 8, bias=True)
+                self.depth = nn.Linear(16, 8, bias=True)
+
+        model = Toy()
+        qmap = {
+            "backbone": QuantLayerInfo(prefix="backbone", group_size=16, in_features=16, out_features=8, has_bias=True)
+        }
+        replaced = replace_quantized_linears(model, qmap)
+        self.assertEqual(replaced, ["backbone"])
+        self.assertIsInstance(model.backbone, ConvRotInt8Linear)
+        self.assertIsInstance(model.depth, nn.Linear)
+
+    def test_missing_target_raises(self) -> None:
+        import torch
+        from torch import nn
+        from breeze_tts_qual.int8_convrot import QuantLayerInfo, replace_quantized_linears
+
+        class Toy(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.other = nn.Linear(16, 8)
+
+        with self.assertRaises(RuntimeError):
+            replace_quantized_linears(
+                Toy(),
+                {"backbone": QuantLayerInfo(prefix="backbone", group_size=16, in_features=16, out_features=8)},
+            )
+
+    def test_no_comfyui_import(self) -> None:
+        text = (ROOT / "int8_convrot.py").read_text(encoding="utf-8")
+        self.assertNotIn("import comfy\n", text)
+        self.assertNotIn("from comfy", text)
+        self.assertNotIn("nodes.py", text)
+
+
 if __name__ == "__main__":
     unittest.main()
