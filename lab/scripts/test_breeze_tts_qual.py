@@ -492,5 +492,156 @@ class SmokeC0Crash(unittest.TestCase):
 
 
 
+class CumulativeC(unittest.TestCase):
+    def test_c_ladder_marks_overflowing_stage_and_later_not_run(self) -> None:
+        import json
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual import run_benchmark
+
+        for cfg in CONFIGS:
+            if cfg.name.startswith("C"):
+                self.assertFalse(cfg.fast_text_encoder, f"{cfg.name} must not enable fast_text_encoder")
+
+        calls: list[str] = []
+
+        def fake_measured(*, config, **_kwargs):
+            calls.append(config.name)
+            if config.name == "C0":
+                return {
+                    "name": "C0",
+                    "precision": "hybrid_int8",
+                    "backend": "OfficialBackend",
+                    "fast": [],
+                    "unsafe_vram": False,
+                    "n": 5,
+                    "p50_ttfa_s": 0.80,
+                    "gap_p95_s": 0.10,
+                    "peak_allocated_gib": 7.2,
+                }, 0
+            if config.name == "C1":
+                return {
+                    "name": "C1",
+                    "precision": "hybrid_int8",
+                    "backend": "OfficialBackend",
+                    "fast": ["depth"],
+                    "unsafe_vram": True,
+                    "stop_reason": "unsafe_vram",
+                    "n": 0,
+                    "p50_ttfa_s": None,
+                    "gap_p95_s": None,
+                    "peak_allocated_gib": 9.2,
+                }, 0
+            self.fail(f"must not measure {config.name} after overflowing C1")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                code = run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "C0,C1,C2,C3,C4",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "c-incr",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            metrics_path = tmp_path / "runs" / "c-incr" / "metrics.json"
+            self.assertTrue(metrics_path.is_file())
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["C0", "C1"])
+        for name in ("C0", "C1", "C2", "C3", "C4"):
+            self.assertIn(name, payload["configs"], name)
+        self.assertFalse(payload["configs"]["C0"].get("not_run"))
+        for name in ("C1", "C2", "C3", "C4"):
+            row = payload["configs"][name]
+            self.assertTrue(row["not_run"], name)
+            self.assertEqual(row["stop_reason"], "unsafe_vram")
+
+    def test_c_ladder_stops_remaining_when_latency_does_not_improve(self) -> None:
+        import json
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        calls: list[str] = []
+
+        def fake_measured(*, config, **_kwargs):
+            calls.append(config.name)
+            if config.name == "C0":
+                return {
+                    "name": "C0",
+                    "precision": "hybrid_int8",
+                    "backend": "OfficialBackend",
+                    "fast": [],
+                    "unsafe_vram": False,
+                    "n": 5,
+                    "p50_ttfa_s": 0.80,
+                    "gap_p95_s": 0.10,
+                    "peak_allocated_gib": 7.2,
+                }, 0
+            if config.name == "C1":
+                return {
+                    "name": "C1",
+                    "precision": "hybrid_int8",
+                    "backend": "OfficialBackend",
+                    "fast": ["depth"],
+                    "unsafe_vram": False,
+                    "n": 5,
+                    "p50_ttfa_s": 0.81,
+                    "gap_p95_s": 0.09,
+                    "peak_allocated_gib": 7.4,
+                }, 0
+            self.fail(f"must not measure {config.name} after latency stop")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "C0,C1,C2,C3,C4",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "c-incr",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "c-incr" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(calls, ["C0", "C1"])
+        self.assertFalse(payload["configs"]["C1"].get("not_run"))
+        self.assertEqual(payload["configs"]["C1"]["p50_ttfa_s"], 0.81)
+        for name in ("C2", "C3", "C4"):
+            row = payload["configs"][name]
+            self.assertTrue(row["not_run"], name)
+            self.assertEqual(row["stop_reason"], "latency_no_improve")
+
+
+
 if __name__ == "__main__":
     unittest.main()

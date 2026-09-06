@@ -27,7 +27,12 @@ from breeze_tts_qual.engine import BreezeEngine, OfficialBackend, checkpoint_for
 from breeze_tts_qual.metrics import bytes_to_gib, first_nonsilent_s as first_nonsilent_clock
 from breeze_tts_qual.metrics import inter_chunk_gaps, percentile
 from breeze_tts_qual.metrics import rtf as rtf_clock
-from breeze_tts_qual.protocol import compose_b_winner, measured_plan, would_exceed_hard_ceiling
+from breeze_tts_qual.protocol import (
+    compose_b_winner,
+    measured_plan,
+    should_stop_adding_graphs,
+    would_exceed_hard_ceiling,
+)
 from breeze_tts_qual.utterances import SHORT
 
 _DEFAULT_QUAL_ROOT = (
@@ -38,6 +43,13 @@ _B_ARM_NAMES = (
     "B_codec",
     "B_backbone_decode",
     "B_backbone_prefill",
+)
+_C_LADDER_NAMES = (
+    "C0",
+    "C1",
+    "C2",
+    "C3",
+    "C4",
 )
 
 
@@ -58,18 +70,21 @@ def _fast_flag_names(config: EngineConfig) -> list[str]:
     return flags
 
 
-def _parse_config_names(raw: str) -> tuple[list[str], bool]:
+def _parse_config_names(raw: str) -> tuple[list[str], bool, bool]:
     names = [part.strip() for part in raw.split(",") if part.strip()]
     if not names:
         raise SystemExit("no configs given")
     b_sweep = names == ["B"]
     if b_sweep:
-        return ["A", *_B_ARM_NAMES], True
+        return ["A", *_B_ARM_NAMES], True, False
+    if names == ["C"]:
+        return list(_C_LADDER_NAMES), False, True
     known = _config_by_name()
     missing = [name for name in names if name not in known]
     if missing:
         raise SystemExit(f"unknown configs: {', '.join(missing)}")
-    return names, False
+    c_sweep = names == list(_C_LADDER_NAMES)
+    return names, False, c_sweep
 
 
 
@@ -369,6 +384,145 @@ def _reuse_a_metrics(qual_root: Path) -> dict[str, Any] | None:
     reused["reused_from"] = "smoke-A"
     return reused
 
+def _reuse_c0_metrics(qual_root: Path) -> dict[str, Any] | None:
+    smoke_path = qual_root / "runs" / "smoke-C0" / "metrics.json"
+    if not smoke_path.is_file():
+        return None
+    try:
+        payload = json.loads(smoke_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    row = (payload.get("configs") or {}).get("C0")
+    if not isinstance(row, dict):
+        return None
+    if row.get("unsafe_vram"):
+        return None
+    if row.get("p50_ttfa_s") is None or row.get("gap_p95_s") is None:
+        return None
+    peak = row.get("peak_allocated_gib")
+    if peak is None:
+        return None
+    if would_exceed_hard_ceiling(float(peak)):
+        return None
+    reused = dict(row)
+    reused["name"] = "C0"
+    reused["fast"] = list(row.get("fast") or [])
+    reused["reused_from"] = "smoke-C0"
+    return reused
+
+
+def _skipped_c_row(config: EngineConfig, *, reason: str) -> dict[str, Any]:
+    row = _skipped_arm_row(config, reason=reason)
+    row["not_run"] = True
+    return row
+
+
+def _mark_c_not_run(row: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    marked = dict(row)
+    marked["not_run"] = True
+    marked["stop_reason"] = reason
+    if reason == "unsafe_vram":
+        marked["unsafe_vram"] = True
+    return marked
+
+
+def _c_stop_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "p50_ttfa_s": row["p50_ttfa_s"],
+        "gap_p95_s": row["gap_p95_s"],
+        "peak_allocated_gib": float(row.get("peak_allocated_gib") or 0.0),
+        "init_unreasonable": bool(row.get("init_unreasonable")),
+        "correctness_changed": bool(row.get("correctness_changed")),
+    }
+
+
+def _run_c_sweep(
+    *,
+    by_name: dict[str, EngineConfig],
+    qual_root: Path,
+    run_dir: Path,
+    ref_audio: Path,
+    ref_text: str,
+    n: int,
+    warmup: int,
+) -> tuple[dict[str, Any], int]:
+    configs: dict[str, Any] = {}
+    exit_code = 0
+    prev: dict[str, Any] | None = None
+    stop_reason: str | None = None
+    reused_c0 = _reuse_c0_metrics(qual_root)
+
+    for name in _C_LADDER_NAMES:
+        config = by_name[name]
+        if config.fast_text_encoder:
+            raise SystemExit(f"{name} must not enable fast_text_encoder")
+        if stop_reason is not None:
+            configs[name] = _skipped_c_row(config, reason=stop_reason)
+            continue
+
+        if name == "C0" and reused_c0 is not None:
+            row = reused_c0
+            code = 0
+        else:
+            try:
+                row, code = _run_measured_config(
+                    config=config,
+                    qual_root=qual_root,
+                    run_dir=run_dir,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    n=n,
+                    warmup=warmup,
+                )
+            except Exception as exc:
+                row = {
+                    "name": config.name,
+                    "precision": config.precision,
+                    "backend": "OfficialBackend",
+                    "fast": _fast_flag_names(config),
+                    "unsafe_vram": False,
+                    "n": 0,
+                    "correctness_changed": True,
+                    "stop_reason": "correctness_changed",
+                    "traceback": traceback.format_exc(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                code = 3
+
+        if code != 0 and exit_code == 0:
+            exit_code = code
+
+        peak = row.get("peak_allocated_gib")
+        overflow = bool(row.get("unsafe_vram"))
+        if peak is not None and would_exceed_hard_ceiling(float(peak)):
+            overflow = True
+        if overflow:
+            configs[name] = _mark_c_not_run(row, reason="unsafe_vram")
+            stop_reason = "unsafe_vram"
+            continue
+
+        if row.get("p50_ttfa_s") is None or row.get("gap_p95_s") is None:
+            row = dict(row)
+            row["correctness_changed"] = True
+            row["stop_reason"] = "correctness_changed"
+            configs[name] = row
+            stop_reason = "correctness_changed"
+            continue
+
+        configs[name] = row
+        if prev is not None:
+            stop, reason = should_stop_adding_graphs(_c_stop_view(prev), _c_stop_view(row))
+            if stop:
+                stop_reason = reason
+        elif row.get("init_unreasonable"):
+            stop_reason = "init_unreasonable"
+        elif row.get("correctness_changed"):
+            stop_reason = "correctness_changed"
+        prev = row
+
+    return configs, exit_code
+
+
 
 def _mark_unsafe(row: dict[str, Any], peak: dict[str, float] | None = None) -> dict[str, Any]:
     if peak:
@@ -527,9 +681,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref-text", required=True)
     args = parser.parse_args(argv)
 
-    names, b_sweep = _parse_config_names(args.configs)
-    if not args.smoke and not b_sweep:
-        parser.error("only --smoke or --configs B is implemented")
+    names, b_sweep, c_sweep = _parse_config_names(args.configs)
+    if not args.smoke and not b_sweep and not c_sweep:
+        parser.error("only --smoke, --configs B, or --configs C0,C1,C2,C3,C4 is implemented")
 
     qual_root = Path(args.qual_root)
     ref_audio = Path(args.ref_audio)
@@ -552,12 +706,24 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": args.run_id,
         "smoke": bool(args.smoke) and not b_sweep,
         "qual_root": str(qual_root).replace(str(Path.home()), "~"),
-        "n": n_short if b_sweep else None,
+        "n": n_short if (b_sweep or c_sweep) else None,
         "configs": {},
     }
     exit_code = 0
 
-    if b_sweep:
+    if c_sweep:
+        rows, code = _run_c_sweep(
+            by_name=by_name,
+            qual_root=qual_root,
+            run_dir=run_dir,
+            ref_audio=ref_audio,
+            ref_text=args.ref_text,
+            n=n_short,
+            warmup=warmup,
+        )
+        payload["configs"] = rows
+        exit_code = code
+    elif b_sweep:
         reused_a = _reuse_a_metrics(qual_root)
         for name in names:
             if name == "A" and reused_a is not None:
@@ -593,7 +759,6 @@ def main(argv: list[str] | None = None) -> int:
             payload["configs"][name] = row
             if code != 0 and exit_code == 0:
                 exit_code = code
-
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return exit_code
