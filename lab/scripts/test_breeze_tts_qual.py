@@ -883,6 +883,234 @@ class CumulativeE(unittest.TestCase):
         self.assertNotIn("E_winner", payload["configs"])
         self.assertTrue(payload["e_rejected_for_our_purposes"])
 
+class CheapD(unittest.TestCase):
+    def test_cli_measures_full_int8_d_and_kills_when_not_faster_than_c0(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        calls: list[str] = []
+
+        def fake_measured(*, config, **_kwargs):
+            calls.append(config.name)
+            self.assertEqual(config.precision, "full_int8")
+            self.assertFalse(config.fast_depth_decoder)
+            self.assertFalse(config.fast_codec)
+            self.assertFalse(config.fast_backbone_decode)
+            self.assertFalse(config.fast_backbone_prefill)
+            self.assertFalse(config.fast_text_encoder)
+            return {
+                "name": "D",
+                "precision": "full_int8",
+                "backend": "OfficialBackend",
+                "fast": [],
+                "unsafe_vram": False,
+                "n": 5,
+                "p50_ttfa_s": 0.90,
+                "gap_p95_s": 0.10,
+                "peak_allocated_gib": 7.2,
+            }, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            c_incr = tmp_path / "runs" / "c-incr"
+            c_incr.mkdir(parents=True)
+            (c_incr / "metrics.json").write_text(
+                json.dumps({"configs": {"C0": {"p50_ttfa_s": 0.878}}}),
+                encoding="utf-8",
+            )
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                code = run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "D",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "smoke-D",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            metrics_path = tmp_path / "runs" / "smoke-D" / "metrics.json"
+            self.assertTrue(metrics_path.is_file())
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["D"])
+        row = payload["configs"]["D"]
+        self.assertEqual(row["precision"], "full_int8")
+        self.assertFalse(row.get("fast_depth_decoder"))
+        self.assertEqual(row.get("fast") or [], [])
+        self.assertTrue(row["d_killed"])
+        self.assertTrue(payload["d_killed"])
+        self.assertNotIn("D1", payload["configs"])
+        self.assertFalse(row.get("not_run"))
+
+    def test_d_not_killed_when_faster_than_c0(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        def fake_measured(*, config, **_kwargs):
+            return {
+                "name": "D",
+                "precision": "full_int8",
+                "backend": "OfficialBackend",
+                "fast": [],
+                "unsafe_vram": False,
+                "n": 5,
+                "p50_ttfa_s": 0.80,
+                "gap_p95_s": 0.10,
+                "peak_allocated_gib": 7.2,
+            }, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            c_incr = tmp_path / "runs" / "c-incr"
+            c_incr.mkdir(parents=True)
+            (c_incr / "metrics.json").write_text(
+                json.dumps({"configs": {"C0": {"p50_ttfa_s": 0.878}}}),
+                encoding="utf-8",
+            )
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "D",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "smoke-D",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "smoke-D" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(payload["configs"]["D"]["d_killed"])
+        self.assertFalse(payload["d_killed"])
+
+    def test_d_killed_when_unsafe_vram(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        def fake_measured(*, config, **_kwargs):
+            return {
+                "name": "D",
+                "precision": "full_int8",
+                "backend": "OfficialBackend",
+                "fast": [],
+                "unsafe_vram": True,
+                "stop_reason": "unsafe_vram",
+                "n": 0,
+                "p50_ttfa_s": None,
+                "gap_p95_s": None,
+                "peak_allocated_gib": 9.4,
+            }, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            c_incr = tmp_path / "runs" / "c-incr"
+            c_incr.mkdir(parents=True)
+            (c_incr / "metrics.json").write_text(
+                json.dumps({"configs": {"C0": {"p50_ttfa_s": 0.878}}}),
+                encoding="utf-8",
+            )
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "D",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "smoke-D",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "smoke-D" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        row = payload["configs"]["D"]
+        self.assertTrue(row["unsafe_vram"])
+        self.assertTrue(row["not_run"])
+        self.assertTrue(row["d_killed"])
+        self.assertTrue(payload["d_killed"])
+
+    def test_d_crash_records_correctness_changed_without_bf16_fallback(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual import run_benchmark
+
+        d_cfg = next(cfg for cfg in CONFIGS if cfg.name == "D")
+        self.assertEqual(d_cfg.precision, "full_int8")
+
+        def boom(*, config, **_kwargs):
+            raise RuntimeError("ConvRot kernel exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "_run_measured_config", boom):
+                code = run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--configs",
+                        "D",
+                        "--n",
+                        "5",
+                        "--run-id",
+                        "smoke-D",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "smoke-D" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        row = payload["configs"]["D"]
+        self.assertEqual(row["precision"], "full_int8")
+        self.assertNotEqual(row["precision"], "bf16")
+        self.assertNotEqual(row["precision"], "hybrid_int8")
+        self.assertTrue(row["correctness_changed"])
+        self.assertIn("ConvRot kernel exploded", row.get("traceback") or "")
+        self.assertNotEqual(code, 0)
+
+
 
 
 

@@ -101,6 +101,90 @@ def _parse_config_names(raw: str) -> tuple[list[str], bool, bool, bool]:
     return names, False, c_sweep, e_sweep
 
 
+def _c0_p50_ttfa(qual_root: Path) -> float | None:
+    c_incr = qual_root / "runs" / "c-incr" / "metrics.json"
+    if c_incr.is_file():
+        try:
+            payload = json.loads(c_incr.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            row = (payload.get("configs") or {}).get("C0")
+            if isinstance(row, dict) and row.get("p50_ttfa_s") is not None:
+                return float(row["p50_ttfa_s"])
+    smoke = qual_root / "runs" / "smoke-C0" / "metrics.json"
+    if smoke.is_file():
+        try:
+            payload = json.loads(smoke.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            row = (payload.get("configs") or {}).get("C0")
+            if isinstance(row, dict):
+                if row.get("p50_ttfa_s") is not None:
+                    return float(row["p50_ttfa_s"])
+                if row.get("first_nonsilent_s") is not None:
+                    return float(row["first_nonsilent_s"])
+    return None
+
+
+def _d_should_kill(row: dict[str, Any], c0_p50: float | None) -> bool:
+    if row.get("not_run") or row.get("unsafe_vram"):
+        return True
+    p50 = row.get("p50_ttfa_s")
+    if p50 is None or c0_p50 is None:
+        return True
+    return float(p50) >= float(c0_p50)
+
+
+def _run_d_control(
+    *,
+    config: EngineConfig,
+    qual_root: Path,
+    run_dir: Path,
+    ref_audio: Path,
+    ref_text: str,
+    n: int,
+    warmup: int,
+) -> tuple[dict[str, Any], int, bool]:
+    try:
+        row, code = _run_measured_config(
+            config=config,
+            qual_root=qual_root,
+            run_dir=run_dir,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            n=n,
+            warmup=warmup,
+        )
+    except Exception as exc:
+        row = {
+            "name": config.name,
+            "precision": config.precision,
+            "backend": "OfficialBackend",
+            "fast": _fast_flag_names(config),
+            "unsafe_vram": False,
+            "n": 0,
+            "correctness_changed": True,
+            "stop_reason": "correctness_changed",
+            "traceback": traceback.format_exc(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        code = 3
+    peak = row.get("peak_allocated_gib")
+    overflow = bool(row.get("unsafe_vram"))
+    if peak is not None and would_exceed_hard_ceiling(float(peak)):
+        overflow = True
+    if overflow:
+        row = _mark_c_not_run(row, reason="unsafe_vram")
+    c0_p50 = _c0_p50_ttfa(qual_root)
+    killed = _d_should_kill(row, c0_p50)
+    row["d_killed"] = killed
+    row["c0_p50_ttfa_s"] = c0_p50
+    return row, code, killed
+
+
+
 
 
 def _peak_vram() -> dict[str, float]:
@@ -784,9 +868,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     names, b_sweep, c_sweep, e_sweep = _parse_config_names(args.configs)
-    if not args.smoke and not b_sweep and not c_sweep and not e_sweep:
+    d_run = names == ["D"]
+    if not args.smoke and not b_sweep and not c_sweep and not e_sweep and not d_run:
         parser.error(
-            "only --smoke, --configs B, --configs C0,C1,C2,C3,C4, or --configs E1,E2,E3,E4,E5 is implemented"
+            "only --smoke, --configs B, --configs C0,C1,C2,C3,C4, --configs D, or --configs E1,E2,E3,E4,E5 is implemented"
         )
 
     qual_root = Path(args.qual_root)
@@ -808,9 +893,9 @@ def main(argv: list[str] | None = None) -> int:
 
     payload: dict[str, Any] = {
         "run_id": args.run_id,
-        "smoke": bool(args.smoke) and not b_sweep and not e_sweep,
+        "smoke": bool(args.smoke) and not b_sweep and not e_sweep and not d_run,
         "qual_root": str(qual_root).replace(str(Path.home()), "~"),
-        "n": n_short if (b_sweep or c_sweep or e_sweep) else None,
+        "n": n_short if (b_sweep or c_sweep or e_sweep or d_run) else None,
         "configs": {},
     }
     exit_code = 0
@@ -865,6 +950,19 @@ def main(argv: list[str] | None = None) -> int:
                 _skipped_arm_row(by_name[arm_name], reason="not-run"),
             )
         payload["configs"]["B_winner"] = _compose_b_payload(payload["configs"])
+    elif d_run:
+        row, code, killed = _run_d_control(
+            config=by_name["D"],
+            qual_root=qual_root,
+            run_dir=run_dir,
+            ref_audio=ref_audio,
+            ref_text=args.ref_text,
+            n=n_short,
+            warmup=warmup,
+        )
+        payload["configs"]["D"] = row
+        payload["d_killed"] = killed
+        exit_code = code
     else:
         for name in names:
             row, code = _run_smoke_config(
