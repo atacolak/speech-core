@@ -234,6 +234,7 @@ class OfficialBackend:
         reference_text = kwargs["reference_text"]
         instruction = kwargs.get("instruction", "Speak clearly and naturally.")
         seed = int(kwargs.get("seed", 42))
+        cfg_scale = float(kwargs.get("cfg_scale", 1.0))
 
         request = {
             "id": "qual-request",
@@ -251,7 +252,7 @@ class OfficialBackend:
             self.model,
             [request],
             get_template("ref_edit_tata"),
-            guidance_scale=1.0,
+            guidance_scale=cfg_scale,
             guidance_scale_ref=None,
             guidance_scale_ins=None,
         )
@@ -304,6 +305,7 @@ class BreezeEngine:
         reference_text: str,
         instruction: str = "Speak clearly and naturally.",
         seed: int = 42,
+        cfg_scale: float = 1.0,
     ) -> Iterator[PcmChunk]:
         yield from self.backend.synthesize(
             text=text,
@@ -311,6 +313,7 @@ class BreezeEngine:
             reference_text=reference_text,
             instruction=instruction,
             seed=seed,
+            cfg_scale=cfg_scale,
         )
 
     def close(self) -> None:

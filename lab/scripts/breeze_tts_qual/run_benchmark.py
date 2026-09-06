@@ -37,7 +37,7 @@ from breeze_tts_qual.protocol import (
     would_exceed_hard_ceiling,
 )
 
-from breeze_tts_qual.utterances import LONG, MEDIUM, SHORT
+from breeze_tts_qual.utterances import DIRECTIONS, LONG, MEDIUM, SHORT
 
 _DEFAULT_QUAL_ROOT = (
     Path.home() / ".cache" / "speech-out" / "breeze-tts-qual-sc-breeze-hybrid-81p"
@@ -360,6 +360,9 @@ def _measure_utterance(
     text: str,
     reference_audio: Path,
     reference_text: str,
+    instruction: str = "Speak clearly and naturally.",
+    seed: int = 42,
+    cfg_scale: float = 1.0,
 ) -> dict[str, Any]:
     chunks = []
     t0 = time.perf_counter()
@@ -367,6 +370,9 @@ def _measure_utterance(
         text=text,
         reference_audio=reference_audio,
         reference_text=reference_text,
+        instruction=instruction,
+        seed=seed,
+        cfg_scale=cfg_scale,
     ):
         chunks.append(chunk)
     wall_s = time.perf_counter() - t0
@@ -1043,6 +1049,116 @@ def _compose_b_payload(configs: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _direction_slug(phrase: str) -> str:
+    lowered = phrase.lower()
+    for token in ("calm", "amused", "urgent", "quiet"):
+        if token in lowered:
+            return token
+    raise ValueError(f"unrecognized direction phrase: {phrase!r}")
+
+
+def _executed_in_envelope(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("not_run") or row.get("unsafe_vram"):
+        return False
+    peak = row.get("peak_allocated_gib")
+    if peak is None or would_exceed_hard_ceiling(float(peak)):
+        return False
+    if row.get("p50_ttfa_s") is None:
+        return False
+    return True
+
+
+def _hybrid_candidate_name(configs: dict[str, Any]) -> str:
+    last = None
+    for name in _C_LADDER_NAMES:
+        if _executed_in_envelope(configs.get(name)):
+            last = name
+    return last or "C0"
+
+
+def _e_candidate_name(configs: dict[str, Any]) -> str | None:
+    last = None
+    for name in _E_LADDER_NAMES:
+        if _executed_in_envelope(configs.get(name)):
+            last = name
+    if last is not None:
+        return last
+    winner = configs.get("E_winner")
+    if isinstance(winner, dict) and _executed_in_envelope(winner):
+        return str(winner.get("name") or "E_winner")
+    return None
+
+
+def _direction_config_names(configs: dict[str, Any]) -> list[str]:
+    names = ["A", _hybrid_candidate_name(configs)]
+    e_name = _e_candidate_name(configs)
+    if e_name is not None:
+        names.append(e_name)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def _run_direction_pass(
+    *,
+    by_name: dict[str, EngineConfig],
+    configs: dict[str, Any],
+    qual_root: Path,
+    run_dir: Path,
+    ref_audio: Path,
+    ref_text: str,
+) -> dict[str, Any]:
+    wav_dir = run_dir / "wavs"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+    dumps: dict[str, Any] = {}
+    for name in _direction_config_names(configs):
+        config = by_name[name]
+        ckpt_dir = checkpoint_for_precision(qual_root, config.precision)
+        engine: BreezeEngine | None = None
+        try:
+            print(f"direction start {name}", flush=True)
+            backend = OfficialBackend(
+                config,
+                device="cuda:0",
+                qual_root=qual_root,
+                ckpt_dir=ckpt_dir,
+            )
+            if type(backend).__name__ != "OfficialBackend":
+                raise SystemExit("direction pass requires OfficialBackend")
+            engine = BreezeEngine(config, ckpt_dir=ckpt_dir, backend=backend)
+            dumps[name] = {}
+            for phrase in DIRECTIONS:
+                slug = _direction_slug(phrase)
+                measured = _measure_utterance(
+                    engine,
+                    text=SHORT[0],
+                    reference_audio=ref_audio,
+                    reference_text=ref_text,
+                    instruction=phrase,
+                    seed=42,
+                    cfg_scale=4.0,
+                )
+                wav_name = f"{name}_dir_{slug}.wav"
+                _write_wav(wav_dir / wav_name, measured["pcm"], measured["sample_rate"])
+                dumps[name][slug] = f"wavs/{wav_name}"
+                print(f"direction wrote {wav_name}", flush=True)
+            print(f"direction done {name}", flush=True)
+        finally:
+            if engine is not None:
+                engine.close()
+            engine = None
+            gc.collect()
+            _empty_cuda()
+    return dumps
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Breeze TTS 2 hybrid lab benchmark (not on the voicecat path)."
@@ -1054,11 +1170,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--configs", default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--full", action="store_true")
+    parser.add_argument("--direction-only", action="store_true")
     parser.add_argument("--n", type=int, default=None)
     parser.add_argument("--run-id", default="smoke-A")
     parser.add_argument("--ref-audio", required=True)
     parser.add_argument("--ref-text", required=True)
     args = parser.parse_args(argv)
+
+    if args.direction_only:
+        qual_root = Path(args.qual_root)
+        ref_audio = Path(args.ref_audio)
+        if not ref_audio.is_file():
+            raise SystemExit(f"missing ref audio: {ref_audio}")
+        run_dir = qual_root / "runs" / args.run_id
+        metrics_path = run_dir / "metrics.json"
+        if not metrics_path.is_file():
+            raise SystemExit(f"missing metrics for direction-only: {metrics_path}")
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        configs = payload.get("configs") or {}
+        dumps = _run_direction_pass(
+            by_name=_config_by_name(),
+            configs=configs,
+            qual_root=qual_root,
+            run_dir=run_dir,
+            ref_audio=ref_audio,
+            ref_text=args.ref_text,
+        )
+        payload["direction_wavs"] = dumps
+        payload.setdefault("direction_notes", {})
+        _persist_metrics(run_dir, payload)
+        return 0
 
     if args.full and not args.configs:
         args.configs = _FULL_CONFIGS
