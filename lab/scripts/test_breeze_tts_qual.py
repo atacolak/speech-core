@@ -112,5 +112,35 @@ class Metrics(unittest.TestCase):
         self.assertAlmostEqual(gaps[0], 0.06, places=9)
         self.assertAlmostEqual(gaps[1], 0.16, places=9)
 
+
+class EngineContract(unittest.TestCase):
+    def test_synthesize_yields_incremental_pcm(self) -> None:
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual.engine import BreezeEngine, PcmChunk, FakeBackend
+        from breeze_tts_qual.metrics import first_nonsilent_s
+
+        cfg = next(c for c in CONFIGS if c.name == "A")
+        engine = BreezeEngine(cfg, ckpt_dir=".", backend=FakeBackend())
+        chunks = list(
+            engine.synthesize(
+                text="yeah.",
+                reference_audio="ref.wav",
+                reference_text="ref",
+            )
+        )
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertTrue(all(isinstance(c, PcmChunk) for c in chunks))
+        self.assertTrue(chunks[-1].is_final)
+        self.assertFalse(chunks[0].is_final)
+        self.assertGreater(chunks[0].n_samples, 0)
+        first_bytes = next(c.t_rel_s for c in chunks if c.n_samples > 0)
+        t_ns, _ = first_nonsilent_s(
+            [(c.t_rel_s, c.pcm) for c in chunks],
+            sample_rate=chunks[0].sample_rate,
+        )
+        self.assertIsNotNone(t_ns)
+        self.assertGreaterEqual(t_ns, first_bytes)
+        engine.close()
+
 if __name__ == "__main__":
     unittest.main()
