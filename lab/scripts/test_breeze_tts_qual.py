@@ -64,6 +64,8 @@ class ConfigTable(unittest.TestCase):
         self.assertEqual(by["D"].precision, "full_int8")
         for cfg in CONFIGS:
             self.assertIsInstance(cfg, EngineConfig)
+            if cfg.name.startswith("E"):
+                continue
             self.assertFalse(
                 getattr(cfg, "fast_text_encoder", False),
                 f"{cfg.name} must not enable text-encoder graphs",
@@ -141,6 +143,50 @@ class EngineContract(unittest.TestCase):
         self.assertIsNotNone(t_ns)
         self.assertGreaterEqual(t_ns, first_bytes)
         engine.close()
+
+
+class ConfigTableE(unittest.TestCase):
+    def test_e_ladder_exists(self) -> None:
+        from breeze_tts_qual.configs import CONFIGS, EngineConfig
+
+        names = {c.name for c in CONFIGS}
+        self.assertGreaterEqual(names, {"E1", "E2", "E3", "E4", "E5"})
+        by = {c.name: c for c in CONFIGS}
+        for name in ("E1", "E2", "E3", "E4", "E5"):
+            self.assertEqual(by[name].precision, "bf16")
+            self.assertIsInstance(by[name], EngineConfig)
+
+        self.assertTrue(by["E1"].fast_depth_decoder)
+        self.assertFalse(by["E1"].fast_codec)
+        self.assertFalse(by["E1"].fast_backbone_decode)
+        self.assertFalse(by["E1"].fast_backbone_prefill)
+        self.assertFalse(by["E1"].fast_text_encoder)
+
+        self.assertTrue(by["E2"].fast_depth_decoder)
+        self.assertTrue(by["E2"].fast_codec)
+        self.assertFalse(by["E2"].fast_backbone_decode)
+        self.assertFalse(by["E2"].fast_text_encoder)
+
+        self.assertTrue(by["E3"].fast_backbone_decode)
+        self.assertFalse(by["E3"].fast_backbone_prefill)
+
+        self.assertTrue(by["E4"].fast_backbone_prefill)
+        self.assertFalse(by["E4"].fast_text_encoder)
+
+        self.assertTrue(by["E5"].fast_depth_decoder)
+        self.assertTrue(by["E5"].fast_codec)
+        self.assertTrue(by["E5"].fast_backbone_decode)
+        self.assertTrue(by["E5"].fast_backbone_prefill)
+        self.assertTrue(by["E5"].fast_text_encoder)
+
+        for cfg in CONFIGS:
+            if cfg.name.startswith("E"):
+                continue
+            self.assertFalse(
+                cfg.fast_text_encoder,
+                f"{cfg.name} must not enable text-encoder graphs",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

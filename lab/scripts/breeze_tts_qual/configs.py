@@ -24,6 +24,7 @@ def _cfg(
     codec: bool = False,
     backbone_decode: bool = False,
     backbone_prefill: bool = False,
+    text_encoder: bool = False,
 ) -> EngineConfig:
     return EngineConfig(
         name=name,
@@ -32,7 +33,7 @@ def _cfg(
         fast_codec=codec,
         fast_backbone_decode=backbone_decode,
         fast_backbone_prefill=backbone_prefill,
-        fast_text_encoder=False,
+        fast_text_encoder=text_encoder,
     )
 
 
@@ -48,4 +49,9 @@ CONFIGS: tuple[EngineConfig, ...] = (
     _cfg("C3", "hybrid_int8", depth=True, codec=True, backbone_decode=True),
     _cfg("C4", "hybrid_int8", depth=True, codec=True, backbone_decode=True, backbone_prefill=True),
     _cfg("D", "full_int8"),
+    _cfg("E1", "bf16", depth=True),
+    _cfg("E2", "bf16", depth=True, codec=True),
+    _cfg("E3", "bf16", depth=True, codec=True, backbone_decode=True),
+    _cfg("E4", "bf16", depth=True, codec=True, backbone_decode=True, backbone_prefill=True),
+    _cfg("E5", "bf16", depth=True, codec=True, backbone_decode=True, backbone_prefill=True, text_encoder=True),
 )
