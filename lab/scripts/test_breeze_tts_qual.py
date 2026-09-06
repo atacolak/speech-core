@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import json
 import struct
 import unittest
 from pathlib import Path
@@ -305,6 +306,51 @@ class Int8Convrot(unittest.TestCase):
         self.assertNotIn("import comfy\n", text)
         self.assertNotIn("from comfy", text)
         self.assertNotIn("nodes.py", text)
+
+
+class Report(unittest.TestCase):
+    def test_compact_table_and_recommendation(self) -> None:
+        from breeze_tts_qual.report import RECOMMENDATIONS, render_report, sanitize_path
+
+        self.assertEqual(
+            set(RECOMMENDATIONS),
+            {"SHELF", "PROMISING — NEEDS ONE MORE EXPERIMENT", "REJECT"},
+        )
+        rows = [
+            {
+                "configuration": "A",
+                "peak_vram_gib": 7.7,
+                "p50_ttfa_s": 0.30,
+                "p95_ttfa_s": 0.40,
+                "rtf": 0.8,
+                "stream_jitter_p95_s": 0.02,
+                "quality_notes": "baseline",
+            }
+        ]
+        md, payload = render_report(
+            rows=rows,
+            recommendation="REJECT",
+            bead="sc-breeze-hybrid-81p",
+            qual_root="/home/sf/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p",
+        )
+        self.assertIn("configuration", md)
+        self.assertIn("peak VRAM", md)
+        self.assertIn("p50 TTFA", md)
+        self.assertIn("p95 TTFA", md)
+        self.assertIn("RTF", md)
+        self.assertIn("stream jitter", md)
+        self.assertIn("quality notes", md)
+        self.assertIn("REJECT", md)
+        self.assertEqual(payload["recommendation"], "REJECT")
+        self.assertNotIn("/home/sf", md)
+        self.assertNotIn("/home/sf", json.dumps(payload))
+        self.assertTrue(sanitize_path("/home/sf/.cache/x").startswith("~") or "$HOME" in sanitize_path("/home/sf/.cache/x"))
+
+    def test_invalid_recommendation_rejected(self) -> None:
+        from breeze_tts_qual.report import render_report
+
+        with self.assertRaises(ValueError):
+            render_report(rows=[], recommendation="MAYBE", bead="sc-breeze-hybrid-81p", qual_root="~")
 
 
 if __name__ == "__main__":
