@@ -13,11 +13,23 @@ live ear/mouth stays at repo root: daemons, `scripts/barge_in_align/`, qwentts p
 | `scripts/speech_talker_session.py` | `pi --profile talker` dogfood | headed omp TUI is the brain now |
 | `scripts/cosyvoice_qual/` | CosyVoice GPU qualification | live mouth is qwentts |
 | `scripts/breeze_tts_qual/` | Breeze TTS 2 hybrid-int8 + CUDA-graph 4070 qual (sc-breeze-hybrid-81p) | not on the voicecat path; live mouth stays leftover qwentts |
+| `scripts/breeze_tts_qual/playground.py` | Gradio lab playground over BreezeEngine (default E2) | lab-only; exclusive VRAM vs leftover qwentts; not a pin swap; not on the voicecat path |
 | `docs/assistant-self-asr-eval.md` | eval-only track notes | |
 | `docs/barge-in-dual-asr.md` | dual-ASR impl notes | |
 | `docs/qualification/cosyvoice*` / qwen3 research | rollback / bakeoff receipts | keep evidence, not the map |
 | `laptop-audio/` | host AEC / denoise tools | outside the daemons |
 | `tests/test-*-self-asr*` / `test-barge-in-dual-asr.sh` | harness tests for the above | |
+
+
+Lab playground (not production; live mouth stays leftover qwentts):
+
+```bash
+export QUAL_ROOT="${QUAL_ROOT:-$HOME/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p}"
+export PYTHONPATH="lab/scripts:${QUAL_ROOT}/src/breeze-tts"
+"$QUAL_ROOT/venv/bin/python" lab/scripts/breeze_tts_qual/playground.py --host 127.0.0.1 --port 7860
+```
+
+`--dry-run` constructs the UI without parking leftover or loading the 3B.
 
 `speech-out-live-session.sh` still looks here if you flip `SPEECH_OUT_ASSISTANT_SELF_ASR=1` or `SPEECH_OUT_CUPE_LIVE=1`. those flags stay **off**.
 
