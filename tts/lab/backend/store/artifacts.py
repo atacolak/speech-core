@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,17 +52,27 @@ class ArtifactStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._conn = connect(self.root)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
 
     def import_audio(self, path: Path | str) -> Artifact:
         src = Path(path)
         if not src.is_file():
             raise FileNotFoundError(src)
         digest = sha256_file(src)
-        existing = self._conn.execute(
+        existing = self.execute(
             "SELECT * FROM artifacts WHERE sha256 = ?", (digest,)
         ).fetchone()
         if existing is not None:
@@ -81,7 +92,7 @@ class ArtifactStore:
             sample_rate = int(sr)
             length = duration_s(sr, samples)
         created = _now()
-        self._conn.execute(
+        self.execute(
             """
             INSERT INTO artifacts (id, sha256, path, suffix, bytes, sample_rate, duration_s, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -98,11 +109,11 @@ class ArtifactStore:
                 created,
             ),
         )
-        self._conn.commit()
+        self.commit()
         return self.get(digest)
 
     def get(self, artifact_id: str) -> Artifact:
-        row = self._conn.execute(
+        row = self.execute(
             "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
         ).fetchone()
         if row is None:
@@ -117,7 +128,7 @@ class ArtifactStore:
 
     def pin(self, artifact_id: str, *, reason: str) -> None:
         self.get(artifact_id)
-        self._conn.execute(
+        self.execute(
             """
             INSERT INTO pins (artifact_id, reason, created_at)
             VALUES (?, ?, ?)
@@ -125,14 +136,14 @@ class ArtifactStore:
             """,
             (artifact_id, reason, _now()),
         )
-        self._conn.commit()
+        self.commit()
 
     def unpin(self, artifact_id: str, *, reason: str) -> None:
-        self._conn.execute(
+        self.execute(
             "DELETE FROM pins WHERE artifact_id = ? AND reason = ?",
             (artifact_id, reason),
         )
-        self._conn.commit()
+        self.commit()
 
     def remember_cache(
         self,
@@ -143,7 +154,7 @@ class ArtifactStore:
         config: dict[str, Any],
     ) -> None:
         self.get(artifact_id)
-        self._conn.execute(
+        self.execute(
             """
             INSERT INTO cache_entries (cache_key, artifact_id, processor, config_json, created_at)
             VALUES (?, ?, ?, ?, ?)
@@ -154,10 +165,10 @@ class ArtifactStore:
             """,
             (cache_key, artifact_id, processor, json.dumps(config, sort_keys=True), _now()),
         )
-        self._conn.commit()
+        self.commit()
 
     def cleanup_cache(self) -> list[str]:
-        rows = self._conn.execute(
+        rows = self.execute(
             """
             SELECT cache_entries.cache_key, cache_entries.artifact_id, artifacts.path
             FROM cache_entries
@@ -169,16 +180,16 @@ class ArtifactStore:
         for row in rows:
             artifact_id = str(row["artifact_id"])
             blob = self.root / str(row["path"])
-            self._conn.execute(
+            self.execute(
                 "DELETE FROM cache_entries WHERE cache_key = ?", (row["cache_key"],)
             )
-            still_cached = self._conn.execute(
+            still_cached = self.execute(
                 "SELECT 1 FROM cache_entries WHERE artifact_id = ?", (artifact_id,)
             ).fetchone()
             if still_cached is None:
-                self._conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
+                self.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
                 if blob.is_file():
                     blob.unlink()
                 removed.append(artifact_id)
-        self._conn.commit()
+        self.commit()
         return removed
