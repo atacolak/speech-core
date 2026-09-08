@@ -48,6 +48,8 @@ export PYTHONPATH=".:lab/scripts:${QUAL_ROOT}/src/breeze-tts"
 
 `--dry-run` builds the UI without parking leftover or loading the 3B.
 
+Lab web instrument: `pnpm --dir tts/lab/web dev` (Vite proxies `/api` to `127.0.0.1:8765`).
+
 Transcribe uses `transcribe.cpp` / Parakeet TDT 0.6B v2 on CPU. MP3 uploads
 are decoded with ffmpeg. Downloads are actual RIFF/WAV files.
 
