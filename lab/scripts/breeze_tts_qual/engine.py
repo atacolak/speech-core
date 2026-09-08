@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,11 @@ class FakeBackend:
 
 
 
-_DEFAULT_QUAL_ROOT = Path.home() / ".cache" / "speech-out" / "breeze-tts-qual-sc-breeze-hybrid-81p"
+_DEFAULT_QUAL_ROOT = (
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    / "speech-out"
+    / "breeze-tts-2-e2"
+)
 _INT8_PRECISIONS = ("hybrid_int8", "full_int8")
 
 
@@ -85,6 +90,61 @@ def _float_audio_to_s16le(audio: Any) -> bytes:
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     clipped = np.clip(samples, -1.0, 1.0)
     return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+@contextmanager
+def _force_eager_compile():
+    """Run dual-cfg generate without Dynamo.
+
+    E2 warmup compiles depth-decoder layers and codec SnakeBeta with
+    ``fullgraph=True``. Dual-cfg then calls eager ``model.generate()`` on
+    those same modules with growing sequence lengths, which recompiles
+    until Dynamo raises ``recompile_limit reached with fullgraph=True``.
+    Ordinary E2 streaming is unchanged: this stance is scoped to dual-cfg.
+    """
+    import torch
+
+    with torch.compiler.set_stance("force_eager"):
+        yield
+
+
+@contextmanager
+def _eager_generate_dtype_guard(model: Any):
+    """Cast Linear inputs to each layer's weight dtype.
+
+    E2 CUDA-graph warmup leaves lm_head / codebooks_head in fp32 while the
+    backbone stays bf16. Fast streaming casts at the graph boundary; eager
+    dual-cfg generate does not, and raises
+    ``expected scalar type BFloat16 but found Float`` (or the reverse).
+    """
+    import torch
+    from torch import nn
+
+    def _linear_pre_hook(module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        weight = getattr(module, "weight", None)
+        if weight is None or not torch.is_tensor(weight) or not weight.is_floating_point():
+            return None
+        dtype = weight.dtype
+
+        def _cast(value: Any) -> Any:
+            if torch.is_tensor(value) and value.is_floating_point() and value.dtype != dtype:
+                return value.to(dtype)
+            return value
+
+        new_args = tuple(_cast(arg) for arg in args)
+        new_kwargs = {key: _cast(val) for key, val in kwargs.items()}
+        return new_args, new_kwargs
+
+    handles = [
+        module.register_forward_pre_hook(_linear_pre_hook, with_kwargs=True)
+        for module in model.modules()
+        if isinstance(module, nn.Linear)
+    ]
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def attach_clone_reference(request: dict[str, Any], qual_root: Path | str) -> dict[str, Any]:
@@ -226,7 +286,7 @@ class OfficialBackend:
 
 
     def synthesize(self, **kwargs: Any) -> Iterator[PcmChunk]:
-        from breeze_infer.runtime import set_all_seeds
+        from breeze_infer.runtime import set_all_seeds, update_generation_config_for_breeze
         from breeze_infer.templates import get_template, prepare_inputs
 
         text = kwargs["text"]
@@ -235,6 +295,9 @@ class OfficialBackend:
         instruction = kwargs.get("instruction", "Speak clearly and naturally.")
         seed = int(kwargs.get("seed", 42))
         cfg_scale = float(kwargs.get("cfg_scale", 1.0))
+        cfg_scale_ref = kwargs.get("cfg_scale_ref")
+        cfg_scale_ins = kwargs.get("cfg_scale_ins")
+        generation_config = kwargs.get("generation_config")
 
         request = {
             "id": "qual-request",
@@ -246,6 +309,9 @@ class OfficialBackend:
         }
         set_all_seeds(seed)
         t0 = time.perf_counter()
+        if generation_config:
+            update_generation_config_for_breeze(self.model, generation_config)
+        dual = cfg_scale_ref is not None and cfg_scale_ins is not None
         inputs = prepare_inputs(
             self.tokenizer,
             self.audio_tokenizer,
@@ -253,9 +319,12 @@ class OfficialBackend:
             [request],
             get_template("ref_edit_tata"),
             guidance_scale=cfg_scale,
-            guidance_scale_ref=None,
-            guidance_scale_ins=None,
+            guidance_scale_ref=float(cfg_scale_ref) if dual else None,
+            guidance_scale_ins=float(cfg_scale_ins) if dual else None,
         )
+        if dual:
+            yield from self._iter_dual_cfg(inputs, t0=t0)
+            return
         chunks = self.runtime.iter_audio_chunks(
             inputs, request_id="qual-request", seed=seed
         )
@@ -270,6 +339,65 @@ class OfficialBackend:
                 t_rel_s=time.perf_counter() - t0,
                 timing=dict(chunk.timing or {}),
             )
+
+    def _iter_dual_cfg(self, inputs: dict[str, Any], *, t0: float) -> Iterator[PcmChunk]:
+        """Experimental/offline dual-cfg. Do not send this through FastStreamingRuntime.
+
+        FastBreezeStreamingRuntime.reject_dual_cfg: graphs support no_cfg/single_cfg only.
+        Correctness uses model.generate on the same loaded weights.
+        """
+        from models.fast_streaming import reject_dual_cfg
+
+        try:
+            reject_dual_cfg(inputs)
+            raised = False
+        except ValueError:
+            raised = True
+
+        if not raised:
+            raise RuntimeError("expected fast path to reject dual cfg")
+
+        generate_kwargs = {
+            "input_ids": inputs.get("input_ids"),
+            "attention_mask": inputs.get("attention_mask"),
+            "text_ids_mask": inputs.get("text_ids_mask"),
+            "text_ids_len": inputs.get("text_ids_len"),
+            "input_values": inputs.get("input_values"),
+            "cfg_scale_ref": inputs.get("cfg_scale_ref"),
+            "cfg_scale_ins": inputs.get("cfg_scale_ins"),
+            "cfg_uncond_prompt_ids": inputs.get("cfg_uncond_prompt_ids"),
+            "cfg_uncond_prompt_attention_mask": inputs.get("cfg_uncond_prompt_attention_mask"),
+            "cfg_uncond_text_ids_mask": inputs.get("cfg_uncond_text_ids_mask"),
+            "cfg_uncond_text_ids_len": inputs.get("cfg_uncond_text_ids_len"),
+            "cfg_ref_prompt_ids": inputs.get("cfg_ref_prompt_ids"),
+            "cfg_ref_prompt_attention_mask": inputs.get("cfg_ref_prompt_attention_mask"),
+            "cfg_ref_text_ids_mask": inputs.get("cfg_ref_text_ids_mask"),
+            "cfg_ref_text_ids_len": inputs.get("cfg_ref_text_ids_len"),
+            "cfg_ins_prompt_ids": inputs.get("cfg_ins_prompt_ids"),
+            "cfg_ins_prompt_attention_mask": inputs.get("cfg_ins_prompt_attention_mask"),
+            "cfg_ins_text_ids_mask": inputs.get("cfg_ins_text_ids_mask"),
+            "cfg_ins_text_ids_len": inputs.get("cfg_ins_text_ids_len"),
+            "output_audio": True,
+            "audio_tokenizer": self.audio_tokenizer,
+            "disable_compile": True,
+        }
+        with _force_eager_compile(), _eager_generate_dtype_guard(self.model):
+            result = self.model.generate(**generate_kwargs)
+        audio = result.audio[0] if hasattr(result, "audio") else result
+        import numpy as np
+
+        arr = np.asarray(
+            audio.detach().float().cpu() if hasattr(audio, "detach") else audio
+        )
+        pcm = _float_audio_to_s16le(arr)
+        yield PcmChunk(
+            pcm=pcm,
+            sample_rate=self.sample_rate,
+            n_samples=len(pcm) // 2,
+            is_final=True,
+            t_rel_s=time.perf_counter() - t0,
+            timing={"path": "eager_dual_cfg", "fast_rejected": True, "force_eager": True},
+        )
 
     def close(self) -> None:
         runtime = getattr(self, "runtime", None)
@@ -306,6 +434,9 @@ class BreezeEngine:
         instruction: str = "Speak clearly and naturally.",
         seed: int = 42,
         cfg_scale: float = 1.0,
+        cfg_scale_ref: float | None = None,
+        cfg_scale_ins: float | None = None,
+        generation_config: Any | None = None,
     ) -> Iterator[PcmChunk]:
         yield from self.backend.synthesize(
             text=text,
@@ -314,6 +445,9 @@ class BreezeEngine:
             instruction=instruction,
             seed=seed,
             cfg_scale=cfg_scale,
+            cfg_scale_ref=cfg_scale_ref,
+            cfg_scale_ins=cfg_scale_ins,
+            generation_config=generation_config,
         )
 
     def close(self) -> None:

@@ -1,0 +1,37 @@
+[
+  {
+    "id": "k8s-one-process",
+    "text": "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
+    "steer": "fast, dry, technically confident, faintly amused. treat the first two sentences as obvious facts. pause briefly before \"congratulations\", then deliver the final sentence with deadpan satisfaction."
+  },
+  {
+    "id": "you-are-confused",
+    "text": "the computer is not confused. YOU are confused. the computer is doing exactly the stupid thing you told it to do, with incredible consistency.",
+    "steer": "calm corrective delivery with restrained amusement. sharply emphasize \"you\", then become increasingly matter-of-fact. slow down slightly on \"with incredible consistency\" as the punchline lands."
+  },
+  {
+    "id": "abstraction-loan",
+    "text": "every abstraction is a loan you take out against understanding, and most engineers are running a leveraged position.",
+    "steer": "quiet, thoughtful, intellectually severe. medium-slow pace. begin almost philosophical, then let a trace of dark amusement appear on \"leveraged position\". understated, not theatrical."
+  },
+  {
+    "id": "raised-by-committee",
+    "text": "if your agent needs twelve services and a message bus to edit a file, the agent is not autonomous. it's being raised by committee.",
+    "steer": "fast conversational delivery, incredulous but controlled. slightly accelerate through \"twelve services and a message bus\". pause after \"autonomous\", then make the final sentence completely deadpan."
+  },
+  {
+    "id": "love-benchmarks",
+    "text": "i love benchmarks. benchmarks are where we all agree to lie in a standardized format.",
+    "steer": "begin genuinely warm and amused on \"i love benchmarks.\" after the pause, become dry and casually cynical. emphasize \"standardized format\" very lightly."
+  },
+  {
+    "id": "yaml-until-fear",
+    "text": "you can understand the stack, or you can keep adding yaml until the fear goes away.",
+    "steer": "low-energy, almost sympathetic at first. pause after \"stack\". gradually become more amused through the second clause, with a tiny downward pitch movement on \"fear goes away\"."
+  },
+  {
+    "id": "three-daemons",
+    "text": "(laugh) oh, this is incredible. we replaced a function call with three daemons and now everybody is surprised that debugging got harder.",
+    "steer": "start with genuine spontaneous amusement. recover quickly into fast technical speech. let disbelief rise through \"three daemons\", then finish dryly and almost exhausted."
+  }
+]

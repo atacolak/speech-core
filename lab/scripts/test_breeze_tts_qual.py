@@ -352,6 +352,230 @@ class Report(unittest.TestCase):
         with self.assertRaises(ValueError):
             render_report(rows=[], recommendation="MAYBE", bead="sc-breeze-hybrid-81p", qual_root="~")
 
+    def test_choose_recommendation_shelf_hybrid_and_e(self) -> None:
+        from breeze_tts_qual.report import choose_recommendation
+
+        rows = [
+            {"configuration": "A", "p50_ttfa_s": 0.40, "rtf": 0.8, "peak_vram_gib": 7.7},
+            {"configuration": "C1", "p50_ttfa_s": 0.20, "rtf": 0.6, "peak_vram_gib": 8.5},
+            {"configuration": "B_winner", "p50_ttfa_s": 0.22, "rtf": 0.7, "peak_vram_gib": 9.0},
+        ]
+        self.assertEqual(choose_recommendation(rows, quality_ok=True), "SHELF")
+        rows_e = [
+            {"configuration": "A", "p50_ttfa_s": 0.40, "rtf": 0.8, "peak_vram_gib": 7.7},
+            {"configuration": "C1", "p50_ttfa_s": 0.18, "rtf": 0.6, "peak_vram_gib": 9.1},
+            {"configuration": "E1", "p50_ttfa_s": 0.19, "rtf": 0.65, "peak_vram_gib": 8.8},
+        ]
+        self.assertEqual(choose_recommendation(rows_e, quality_ok=True), "SHELF")
+        rows_over = [
+            {"configuration": "A", "p50_ttfa_s": 0.40, "rtf": 0.8, "peak_vram_gib": 7.7},
+            {"configuration": "C1", "p50_ttfa_s": 0.18, "rtf": 0.6, "peak_vram_gib": 9.1},
+        ]
+        self.assertNotEqual(choose_recommendation(rows_over, quality_ok=True), "SHELF")
+
+    def test_choose_recommendation_promising_and_reject(self) -> None:
+        from breeze_tts_qual.report import choose_recommendation
+
+        promising = [
+            {"configuration": "A", "p50_ttfa_s": 0.40, "rtf": 0.8, "peak_vram_gib": 7.7},
+            {"configuration": "C1", "p50_ttfa_s": 0.30, "rtf": 0.6, "peak_vram_gib": 8.5},
+        ]
+        self.assertEqual(
+            choose_recommendation(promising, quality_ok=True),
+            "PROMISING — NEEDS ONE MORE EXPERIMENT",
+        )
+        self.assertEqual(choose_recommendation(promising, quality_ok=False), "REJECT")
+
+    def test_report_only_writes_compact_artifacts(self) -> None:
+        import tempfile
+        from breeze_tts_qual import run_benchmark
+
+        metrics = {
+            "run_id": "full-30",
+            "qual_root": "/home/sf/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p",
+            "e_rejected_for_our_purposes": False,
+            "direction_notes": {
+                "C2": {"calm": "comparable", "amused": "comparable", "urgent": "comparable", "quiet": "comparable"},
+                "E2": {"calm": "comparable", "amused": "comparable", "urgent": "comparable", "quiet": "comparable"},
+            },
+            "configs": {
+                "A": {
+                    "name": "A",
+                    "p50_ttfa_s": 0.396,
+                    "p95_ttfa_s": 0.406,
+                    "rtf": 2.05,
+                    "gap_p95_s": 0.178,
+                    "peak_allocated_gib": 7.78,
+                },
+                "B_depth": {
+                    "name": "B_depth",
+                    "p50_ttfa_s": 0.193,
+                    "p95_ttfa_s": 0.199,
+                    "rtf": 0.78,
+                    "gap_p95_s": -0.033,
+                    "peak_allocated_gib": 8.02,
+                },
+                "B_codec": {
+                    "name": "B_codec",
+                    "p50_ttfa_s": 0.233,
+                    "p95_ttfa_s": 0.244,
+                    "rtf": 2.02,
+                    "gap_p95_s": 0.087,
+                    "peak_allocated_gib": 8.75,
+                },
+                "B_backbone_decode": {
+                    "name": "B_backbone_decode",
+                    "p50_ttfa_s": 0.384,
+                    "p95_ttfa_s": 0.406,
+                    "rtf": 1.87,
+                    "gap_p95_s": 0.149,
+                    "peak_allocated_gib": 8.05,
+                },
+                "B_backbone_prefill": {
+                    "name": "B_backbone_prefill",
+                    "not_run": True,
+                    "stop_reason": "unsafe_vram",
+                    "p50_ttfa_s": None,
+                    "peak_allocated_gib": 8.04,
+                },
+                "B_winner": {
+                    "name": "B_winner",
+                    "p50_ttfa_s": 0.396,
+                    "gap_p95_s": 0.178,
+                    "peak_allocated_gib": 8.75,
+                },
+                "C0": {
+                    "name": "C0",
+                    "p50_ttfa_s": 0.879,
+                    "p95_ttfa_s": 0.912,
+                    "rtf": 4.43,
+                    "gap_p95_s": 0.562,
+                    "peak_allocated_gib": 7.41,
+                },
+                "C1": {
+                    "name": "C1",
+                    "p50_ttfa_s": 0.659,
+                    "p95_ttfa_s": 0.677,
+                    "rtf": 3.05,
+                    "gap_p95_s": 0.328,
+                    "peak_allocated_gib": 7.41,
+                },
+                "C2": {
+                    "name": "C2",
+                    "p50_ttfa_s": 0.422,
+                    "p95_ttfa_s": 0.433,
+                    "rtf": 2.99,
+                    "gap_p95_s": 0.161,
+                    "peak_allocated_gib": 7.42,
+                },
+                "C3": {
+                    "name": "C3",
+                    "stop_reason": "correctness_changed",
+                    "traceback": "/home/sf/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p/src/breeze-tts/boom",
+                    "n": 0,
+                },
+                "C4": {
+                    "name": "C4",
+                    "not_run": True,
+                    "stop_reason": "correctness_changed",
+                    "p50_ttfa_s": None,
+                },
+                "E1": {
+                    "name": "E1",
+                    "p50_ttfa_s": 0.188,
+                    "p95_ttfa_s": 0.203,
+                    "rtf": 0.76,
+                    "gap_p95_s": -0.031,
+                    "peak_allocated_gib": 8.02,
+                },
+                "E2": {
+                    "name": "E2",
+                    "p50_ttfa_s": 0.139,
+                    "p95_ttfa_s": 0.149,
+                    "rtf": 0.79,
+                    "gap_p95_s": -0.014,
+                    "peak_allocated_gib": 8.77,
+                },
+                "E3": {"name": "E3", "not_run": True, "stop_reason": "jitter_worse", "p50_ttfa_s": None},
+                "E4": {"name": "E4", "not_run": True, "stop_reason": "jitter_worse", "p50_ttfa_s": None},
+                "E5": {"name": "E5", "not_run": True, "stop_reason": "jitter_worse", "p50_ttfa_s": None},
+                "D": {
+                    "name": "D",
+                    "not_run": True,
+                    "stop_reason": "d_killed",
+                    "p50_ttfa_s": 2.54,
+                    "rtf": 14.6,
+                    "peak_allocated_gib": 7.18,
+                },
+                "E_winner": {
+                    "name": "E2",
+                    "p50_ttfa_s": 0.139,
+                    "p95_ttfa_s": 0.149,
+                    "rtf": 0.79,
+                    "gap_p95_s": -0.014,
+                    "peak_allocated_gib": 8.77,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / "runs" / "full-30"
+            run_dir.mkdir(parents=True)
+            (run_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+            out_md = tmp_path / "out.md"
+            out_json = tmp_path / "out.json"
+            code = run_benchmark.main(
+                [
+                    "--report-only",
+                    "--qual-root",
+                    str(tmp_path),
+                    "--run-id",
+                    "full-30",
+                    "--out-md",
+                    str(out_md),
+                    "--out-json",
+                    str(out_json),
+                ]
+            )
+            self.assertEqual(code, 0)
+            md = out_md.read_text(encoding="utf-8")
+            payload = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertNotIn("/home/sf", md)
+        self.assertNotIn("/home/sf", json.dumps(payload))
+        self.assertIn("SHELF", md)
+        self.assertEqual(payload["recommendation"], "SHELF")
+        for name in (
+            "A",
+            "B_depth",
+            "B_codec",
+            "B_backbone_decode",
+            "B_backbone_prefill",
+            "B_winner",
+            "C0",
+            "C1",
+            "C2",
+            "C3",
+            "C4",
+            "E1",
+            "E2",
+            "E3",
+            "E4",
+            "E5",
+            "D",
+        ):
+            self.assertIn(name, md)
+        self.assertEqual(payload["best_e_le_9gib"], "E2")
+        self.assertEqual(payload["best_hybrid_le_9gib"], "C2")
+        self.assertFalse(payload["e_rejected_for_our_purposes"])
+        self.assertIn("not permission to integrate", md)
+        self.assertIn("~70 ms", md)
+        self.assertIn("2.4 GB", md)
+        self.assertTrue(
+            payload.get("stage_trace", {}).get("trace_unavailable")
+            or "trace_unavailable" in md
+        )
+
+
 
 class ParkLeftover(unittest.TestCase):
     def test_park_stops_only_ata_speech_tts(self) -> None:
@@ -1111,7 +1335,260 @@ class CheapD(unittest.TestCase):
         self.assertNotEqual(code, 0)
 
 
+class FullProtocol(unittest.TestCase):
+    def test_full_measured_config_records_thirty_tiny_and_short(self) -> None:
+        import tempfile
+        from unittest.mock import patch
 
+        from breeze_tts_qual.configs import CONFIGS
+        from breeze_tts_qual.engine import FakeBackend
+        from breeze_tts_qual import run_benchmark
+
+        class OfficialBackend(FakeBackend):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+        cfg = next(c for c in CONFIGS if c.name == "A")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / "runs" / "full-30"
+            run_dir.mkdir(parents=True)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            with patch.object(run_benchmark, "OfficialBackend", OfficialBackend):
+                row, code = run_benchmark._run_measured_config(
+                    config=cfg,
+                    qual_root=tmp_path,
+                    run_dir=run_dir,
+                    ref_audio=ref,
+                    ref_text="hello",
+                    n=5,
+                    warmup=3,
+                    full=True,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(row["classes"]["tiny"]["n_measured"], 30)
+            self.assertEqual(row["classes"]["short"]["n_measured"], 30)
+            self.assertEqual(row["classes"]["medium"]["n_measured"], 3)
+            self.assertEqual(row["classes"]["long"]["n_measured"], 3)
+            self.assertIn("peak_allocated_mb", row)
+            self.assertIn("peak_reserved_mb", row)
+            self.assertIn("gap_p50_s", row)
+            self.assertIn("gap_p95_s", row)
+            self.assertIn("max_stall_s", row)
+            wavs = run_dir / "wavs"
+            self.assertTrue((wavs / "A_tiny_0.wav").is_file())
+            self.assertTrue((wavs / "A_short_0.wav").is_file())
+            self.assertTrue((wavs / "A_medium_0.wav").is_file())
+            self.assertTrue((wavs / "A_long_0.wav").is_file())
+
+    def test_full_cli_expands_b_skips_killed_d_and_stopped_stages(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from breeze_tts_qual import run_benchmark
+
+        calls: list[str] = []
+
+        def fake_measured(*, config, **kwargs):
+            self.assertTrue(kwargs.get("full"))
+            calls.append(config.name)
+            peak = 7.2
+            p50 = 0.80
+            gap = 0.10
+            if config.name == "B_backbone_prefill":
+                return {
+                    "name": config.name,
+                    "precision": config.precision,
+                    "backend": "OfficialBackend",
+                    "fast": ["backbone_prefill"],
+                    "unsafe_vram": True,
+                    "not_run": True,
+                    "stop_reason": "unsafe_vram",
+                    "n": 0,
+                    "p50_ttfa_s": None,
+                    "gap_p95_s": None,
+                    "peak_allocated_gib": 8.0,
+                    "peak_allocated_mb": 8000.0,
+                    "peak_reserved_mb": 10000.0,
+                    "error": "cuda_oom",
+                }, 0
+            if config.name == "C3":
+                return {
+                    "name": "C3",
+                    "precision": "hybrid_int8",
+                    "backend": "OfficialBackend",
+                    "fast": ["depth", "codec", "backbone_decode"],
+                    "unsafe_vram": False,
+                    "n": 0,
+                    "correctness_changed": True,
+                    "stop_reason": "correctness_changed",
+                    "p50_ttfa_s": None,
+                    "gap_p95_s": None,
+                }, 3
+            if config.name.startswith("C"):
+                p50 = {"C0": 0.80, "C1": 0.70, "C2": 0.50}[config.name]
+                gap = {"C0": 0.10, "C1": 0.09, "C2": 0.08}[config.name]
+            if config.name.startswith("E"):
+                p50 = {"E1": 0.20, "E2": 0.13}[config.name]
+                gap = {"E1": 0.04, "E2": 0.05}[config.name]
+            classes = {
+                "tiny": {"n_measured": 30, "gap_p50_s": 0.01, "gap_p95_s": 0.02, "max_stall_s": 0.03},
+                "short": {"n_measured": 30, "gap_p50_s": 0.01, "gap_p95_s": 0.02, "max_stall_s": 0.03},
+                "medium": {"n_measured": 3},
+                "long": {"n_measured": 3},
+            }
+            return {
+                "name": config.name,
+                "precision": config.precision,
+                "backend": "OfficialBackend",
+                "fast": list(getattr(config, "name") and []),
+                "unsafe_vram": False,
+                "n": 30,
+                "p50_ttfa_s": p50,
+                "gap_p95_s": gap,
+                "gap_p50_s": 0.01,
+                "max_stall_s": 0.03,
+                "peak_allocated_gib": peak,
+                "peak_allocated_mb": 7200.0,
+                "peak_reserved_mb": 7800.0,
+                "classes": classes,
+            }, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ref = tmp_path / "ref.wav"
+            ref.write_bytes(b"RIFF")
+            c_incr = tmp_path / "runs" / "c-incr"
+            c_incr.mkdir(parents=True)
+            (c_incr / "metrics.json").write_text(
+                json.dumps({"configs": {"C0": {"p50_ttfa_s": 0.878}}}),
+                encoding="utf-8",
+            )
+            smoke_d = tmp_path / "runs" / "smoke-D"
+            smoke_d.mkdir(parents=True)
+            (smoke_d / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "d_killed": True,
+                        "configs": {
+                            "D": {
+                                "name": "D",
+                                "p50_ttfa_s": 2.54,
+                                "d_killed": True,
+                                "c0_p50_ttfa_s": 0.878,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(run_benchmark, "_run_measured_config", fake_measured):
+                code = run_benchmark.main(
+                    [
+                        "--qual-root",
+                        str(tmp_path),
+                        "--full",
+                        "--run-id",
+                        "full-30",
+                        "--ref-audio",
+                        str(ref),
+                        "--ref-text",
+                        "hello",
+                    ]
+                )
+            payload = json.loads(
+                (tmp_path / "runs" / "full-30" / "metrics.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn("A", calls)
+        self.assertIn("B_depth", calls)
+        self.assertIn("B_codec", calls)
+        self.assertIn("B_backbone_decode", calls)
+        self.assertIn("B_backbone_prefill", calls)
+        self.assertIn("C0", calls)
+        self.assertIn("C3", calls)
+        self.assertNotIn("C4", calls)
+        self.assertIn("E1", calls)
+        self.assertIn("E2", calls)
+        self.assertNotIn("E3", calls)
+        self.assertNotIn("E4", calls)
+        self.assertNotIn("E5", calls)
+        self.assertNotIn("D", calls)
+        self.assertTrue(payload["configs"]["D"]["not_run"])
+        self.assertTrue(payload["configs"]["D"]["d_killed"])
+        self.assertNotEqual(
+            payload["configs"]["D"].get("classes", {}).get("short", {}).get("n_measured"),
+            30,
+        )
+        self.assertTrue(payload["configs"]["C4"]["not_run"])
+        self.assertNotEqual(
+            payload["configs"]["C4"].get("classes", {}).get("short", {}).get("n_measured"),
+            30,
+        )
+        self.assertTrue(payload["configs"]["E3"]["not_run"])
+        self.assertEqual(payload["configs"]["A"]["classes"]["short"]["n_measured"], 30)
+        self.assertIn("B_winner", payload["configs"])
+        self.assertIn("E_winner", payload["configs"])
+
+
+
+
+
+
+class DualCfgEagerDtype(unittest.TestCase):
+    def test_guard_casts_float_into_bf16_linear(self) -> None:
+        try:
+            import torch
+            from torch import nn
+        except ImportError:
+            self.skipTest("torch missing")
+
+        from breeze_tts_qual.engine import _eager_generate_dtype_guard
+
+        layer = nn.Linear(4, 4, bias=False)
+        layer.weight.data = layer.weight.data.to(torch.bfloat16)
+        model = nn.Sequential(layer)
+        float_in = torch.ones(2, 4, dtype=torch.float32)
+        with self.assertRaises(RuntimeError):
+            model(float_in)
+        with _eager_generate_dtype_guard(model):
+            out = model(float_in)
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_guard_casts_bf16_into_fp32_linear(self) -> None:
+        try:
+            import torch
+            from torch import nn
+        except ImportError:
+            self.skipTest("torch missing")
+
+        from breeze_tts_qual.engine import _eager_generate_dtype_guard
+
+        layer = nn.Linear(4, 4, bias=False)
+        layer.weight.data = layer.weight.data.float()
+        model = nn.Sequential(layer)
+        bf16_in = torch.ones(2, 4, dtype=torch.bfloat16)
+        with self.assertRaises(RuntimeError):
+            model(bf16_in)
+        with _eager_generate_dtype_guard(model):
+            out = model(bf16_in)
+        self.assertEqual(out.dtype, torch.float32)
+
+    def test_force_eager_runs_compiled_fullgraph_without_recompile_limit(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch missing")
+
+        from breeze_tts_qual.engine import _force_eager_compile
+
+        compiled = torch.compile(lambda x: x + 1, fullgraph=True)
+        with _force_eager_compile():
+            for length in range(1, 12):
+                out = compiled(torch.ones(length))
+                self.assertEqual(tuple(out.shape), (length,))
 
 
 if __name__ == "__main__":
