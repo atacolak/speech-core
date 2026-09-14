@@ -1,6 +1,8 @@
-"""not on the voicecat path.
+"""Park parked-qwen rollback unit for exclusive VRAM benches.
 
-Stop/start leftover ata-speech-tts.service for exclusive VRAM benches.
+ata-speech-tts.service is qwentts.cpp rollback, not the live synthesizer.
+Live GPU occupant is breeze-tts-2 E2. restore() starts qwen — do not
+call it while E2 is loaded. Mouth daemon must not Wants= this unit.
 """
 
 from __future__ import annotations

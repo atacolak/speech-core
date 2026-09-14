@@ -4,4 +4,10 @@ html,
 body,
 #root {
   height: 100%;
+  background: #27272a;
+  color: #fafafa;
+}
+
+audio {
+  accent-color: #a1a1aa;
 }

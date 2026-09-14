@@ -33,6 +33,7 @@ def load_selected_engine(
     *,
     qual: Path | None = None,
     engine_factory: Any | None = None,
+    on_progress: Any | None = None,
 ) -> BreezeEngine:
     root = Path(qual) if qual is not None else qual_root()
     if engine_factory is not None:
@@ -43,6 +44,7 @@ def load_selected_engine(
         device="cuda:0",
         qual_root=root,
         ckpt_dir=ckpt_dir,
+        on_progress=on_progress,
     )
     return BreezeEngine(E2_CONFIG, ckpt_dir=ckpt_dir, backend=backend)
 

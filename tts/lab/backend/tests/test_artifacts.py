@@ -13,7 +13,6 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO))
 
-from tts.lab.backend.models import Interval
 from tts.lab.backend.store.artifacts import ArtifactStore
 from tts.wav import write_wav
 
@@ -48,39 +47,6 @@ class ArtifactIdentity(unittest.TestCase):
         self.assertEqual(objects[0].stat().st_size, a.stat().st_size)
 
 
-class StreamfmCacheKey(unittest.TestCase):
-    def test_key_changes_when_intervals_or_config_change(self) -> None:
-        from tts.lab.backend.store.cache import streamfm_cache_key
-
-        source = "abc" * 20
-        keep = [Interval(start_s=0.0, end_s=10.0)]
-        base = streamfm_cache_key(
-            source_sha256=source,
-            keep_intervals=keep,
-            processor_config={"task": "se-predgen", "solver": "lrk4", "checkpoint": "ckpt-a"},
-        )
-        changed_interval = streamfm_cache_key(
-            source_sha256=source,
-            keep_intervals=[Interval(start_s=0.0, end_s=9.0)],
-            processor_config={"task": "se-predgen", "solver": "lrk4", "checkpoint": "ckpt-a"},
-        )
-        changed_config = streamfm_cache_key(
-            source_sha256=source,
-            keep_intervals=keep,
-            processor_config={"task": "se-predgen", "solver": "rk4", "checkpoint": "ckpt-a"},
-        )
-        self.assertNotEqual(base, changed_interval)
-        self.assertNotEqual(base, changed_config)
-        self.assertEqual(
-            base,
-            streamfm_cache_key(
-                source_sha256=source,
-                keep_intervals=keep,
-                processor_config={"checkpoint": "ckpt-a", "solver": "lrk4", "task": "se-predgen"},
-            ),
-        )
-
-
 class PinAndCacheCleanup(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -95,10 +61,10 @@ class PinAndCacheCleanup(unittest.TestCase):
         cached = self.store.import_audio(_tone(self.root / "cache.wav", freq=880.0))
         self.store.pin(durable.id, reason="voice:ata")
         self.store.remember_cache(
-            cache_key="streamfm-demo",
+            cache_key="resemble-demo",
             artifact_id=cached.id,
-            processor="streamfm",
-            config={"task": "se-predgen"},
+            processor="resemble",
+            config={"checkpoint": "resemble-denoise"},
         )
         removed = self.store.cleanup_cache()
         self.assertIn(cached.id, removed)

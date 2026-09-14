@@ -108,41 +108,104 @@ def _force_eager_compile():
         yield
 
 
+def _cast_floating(value: Any, dtype: Any) -> Any:
+    import torch
+
+    if torch.is_tensor(value) and value.is_floating_point() and value.dtype != dtype:
+        return value.to(dtype)
+    if isinstance(value, (tuple, list)):
+        return type(value)(_cast_floating(item, dtype) for item in value)
+    if isinstance(value, dict):
+        return {key: _cast_floating(item, dtype) for key, item in value.items()}
+    return value
+
+
 @contextmanager
-def _eager_generate_dtype_guard(model: Any):
-    """Cast Linear inputs to each layer's weight dtype.
+def _eager_generate_dtype_guard(*models: Any):
+    """Align matmul operands to each layer's weight dtype.
 
     E2 CUDA-graph warmup leaves lm_head / codebooks_head in fp32 while the
     backbone stays bf16. Fast streaming casts at the graph boundary; eager
-    dual-cfg generate does not, and raises
-    ``expected scalar type BFloat16 but found Float`` (or the reverse).
+    dual-cfg generate does not. Compiled depth-decoder / codec can also call
+    ``F.linear`` / ``addmm`` without ``nn.Module`` hooks, which raises
+    ``expected mat1 and mat2 to have the same dtype, but got: c10::BFloat16 != float``.
     """
     import torch
+    import torch.nn.functional as F
     from torch import nn
 
-    def _linear_pre_hook(module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]):
+    def _pre_hook(module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]):
         weight = getattr(module, "weight", None)
         if weight is None or not torch.is_tensor(weight) or not weight.is_floating_point():
             return None
         dtype = weight.dtype
+        return tuple(_cast_floating(arg, dtype) for arg in args), {
+            key: _cast_floating(val, dtype) for key, val in kwargs.items()
+        }
 
-        def _cast(value: Any) -> Any:
-            if torch.is_tensor(value) and value.is_floating_point() and value.dtype != dtype:
-                return value.to(dtype)
-            return value
+    types: tuple[type, ...] = (
+        nn.Linear,
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.ConvTranspose1d,
+        nn.LayerNorm,
+        nn.Embedding,
+    )
+    try:
+        from transformers.pytorch_utils import Conv1D
 
-        new_args = tuple(_cast(arg) for arg in args)
-        new_kwargs = {key: _cast(val) for key, val in kwargs.items()}
-        return new_args, new_kwargs
+        types = (*types, Conv1D)
+    except Exception:
+        pass
 
-    handles = [
-        module.register_forward_pre_hook(_linear_pre_hook, with_kwargs=True)
-        for module in model.modules()
-        if isinstance(module, nn.Linear)
-    ]
+    handles = []
+    for model in models:
+        if model is None or not hasattr(model, "modules"):
+            continue
+        for module in model.modules():
+            if isinstance(module, types):
+                handles.append(module.register_forward_pre_hook(_pre_hook, with_kwargs=True))
+
+    orig_linear = F.linear
+    orig_addmm = torch.addmm
+
+    def _linear(input, weight, bias=None):  # noqa: A002 - match torch signature
+        if (
+            torch.is_tensor(input)
+            and torch.is_tensor(weight)
+            and input.is_floating_point()
+            and weight.is_floating_point()
+            and input.dtype != weight.dtype
+        ):
+            input = input.to(weight.dtype)
+        return orig_linear(input, weight, bias)
+
+    def _addmm(input, mat1, mat2, *args, **kwargs):  # noqa: A002
+        if (
+            torch.is_tensor(mat1)
+            and torch.is_tensor(mat2)
+            and mat1.is_floating_point()
+            and mat2.is_floating_point()
+            and mat1.dtype != mat2.dtype
+        ):
+            mat1 = mat1.to(mat2.dtype)
+        if (
+            torch.is_tensor(input)
+            and torch.is_tensor(mat2)
+            and input.is_floating_point()
+            and mat2.is_floating_point()
+            and input.dtype != mat2.dtype
+        ):
+            input = input.to(mat2.dtype)
+        return orig_addmm(input, mat1, mat2, *args, **kwargs)
+
+    F.linear = _linear  # type: ignore[method-assign]
+    torch.addmm = _addmm  # type: ignore[assignment]
     try:
         yield
     finally:
+        F.linear = orig_linear  # type: ignore[method-assign]
+        torch.addmm = orig_addmm  # type: ignore[assignment]
         for handle in handles:
             handle.remove()
 
@@ -177,9 +240,11 @@ class OfficialBackend:
         device: str = "cuda:0",
         qual_root: Path | str | None = None,
         ckpt_dir: Path | str | None = None,
+        on_progress: Any | None = None,
     ) -> None:
         self.config = config
         self.device = device
+        report = on_progress or (lambda _phase: None)
         self.qual_root = Path(qual_root) if qual_root is not None else _default_qual_root()
         breeze_src = self.qual_root / "src" / "breeze-tts"
         src = str(breeze_src)
@@ -194,6 +259,7 @@ class OfficialBackend:
         from breeze_infer.runtime import load_runtime, update_generation_config_for_breeze
         from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 
+        report("loading weights")
         tokenizer, model, audio_tokenizer = load_runtime(
             load_dir,
             device=device,
@@ -209,9 +275,11 @@ class OfficialBackend:
         update_generation_config_for_breeze(model)
 
         stream_config = FastStreamingConfig(**fast_streaming_kwargs(config))
+        report("building stream runtime")
         runtime = FastBreezeStreamingRuntime(
             model, audio_tokenizer, stream_config, tokenizer=tokenizer
         )
+        report("warmup CUDA graphs")
         self._maybe_warmup(runtime, breeze_src)
         self.tokenizer = tokenizer
         self.model = model
@@ -381,7 +449,9 @@ class OfficialBackend:
             "audio_tokenizer": self.audio_tokenizer,
             "disable_compile": True,
         }
-        with _force_eager_compile(), _eager_generate_dtype_guard(self.model):
+        with _force_eager_compile(), _eager_generate_dtype_guard(
+            self.model, self.audio_tokenizer
+        ):
             result = self.model.generate(**generate_kwargs)
         audio = result.audio[0] if hasattr(result, "audio") else result
         import numpy as np

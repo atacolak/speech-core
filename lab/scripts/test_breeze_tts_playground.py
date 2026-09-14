@@ -4,13 +4,40 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent / "breeze_tts_qual"
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(ROOT.parent))
 sys.path.insert(0, str(ROOT))
+
+
+def _labels(demo) -> dict:
+    return {
+        getattr(c, "label", None): c
+        for c in demo.blocks.values()
+        if getattr(c, "label", None)
+    }
+
+
+def _buttons(demo) -> list[str]:
+    return [
+        str(getattr(b, "value", ""))
+        for b in demo.blocks.values()
+        if type(b).__name__ == "Button"
+    ]
+
+
+def _tab_labels(demo) -> list[str]:
+    out = []
+    for component in demo.blocks.values():
+        if type(component).__name__ in {"Tab", "TabItem"}:
+            out.append(str(getattr(component, "label", "") or ""))
+    return out
 
 
 class PlaygroundCli(unittest.TestCase):
@@ -38,33 +65,32 @@ class PlaygroundCli(unittest.TestCase):
         backend.assert_not_called()
         engine.assert_not_called()
 
-    def test_blocks_default_preset_is_e2_shelf_winner(self) -> None:
+    def test_blocks_are_e2_only_no_legacy_preset_radio(self) -> None:
         from breeze_tts_qual.playground import build_interface
+        from tts.paths import SELECTED_RUNTIME
 
         demo = build_interface(Path.home())
-        radios = [
-            c
+        radios = [c for c in demo.blocks.values() if type(c).__name__ == "Radio"]
+        radio_values = []
+        for radio in radios:
+            for choice in radio.choices:
+                if isinstance(choice, (tuple, list)) and len(choice) >= 2:
+                    radio_values.append(str(choice[1]))
+                else:
+                    radio_values.append(str(choice))
+        for name in ("A", "B_depth", "C2", "C3", "E1", "E3"):
+            self.assertNotIn(name, radio_values)
+        markdown = " ".join(
+            str(getattr(c, "value", ""))
             for c in demo.blocks.values()
-            if type(c).__name__ == "Radio"
-        ]
-        self.assertTrue(radios, "expected a preset Radio")
-        radio = radios[0]
-        values = []
-        for choice in radio.choices:
-            if isinstance(choice, (tuple, list)) and len(choice) >= 2:
-                values.append(choice[1])
-            else:
-                values.append(choice)
-        self.assertIn("E2", values)
-        self.assertEqual(radio.value, "E2")
-        labels = " ".join(str(choice[0] if isinstance(choice, (tuple, list)) else choice) for choice in radio.choices)
-        self.assertIn("SHELF", labels)
+            if type(c).__name__ == "Markdown"
+        )
+        self.assertIn(SELECTED_RUNTIME, markdown)
+        self.assertIn("selected", markdown.lower())
 
-    def test_blocks_expose_text_instruction_cfg_seed_clone(self) -> None:
-        import tempfile
-
+    def test_blocks_expose_text_steer_cfg_seed_clone(self) -> None:
         from breeze_tts_qual.playground import build_interface
-        from breeze_tts_qual.utterances import DIRECTIONS, SHORT
+        from tts.planner import load_steer_fixtures
 
         with tempfile.TemporaryDirectory() as tmp:
             qual_root = Path(tmp)
@@ -75,23 +101,16 @@ class PlaygroundCli(unittest.TestCase):
             ref_wav.write_bytes(b"RIFF")
             ref_txt.write_text("clone speaker text\n", encoding="utf-8")
             demo = build_interface(qual_root)
-            by_label = {
-                getattr(c, "label", None): c
-                for c in demo.blocks.values()
-                if getattr(c, "label", None)
-            }
+            by_label = _labels(demo)
             self.assertIn("Text", by_label)
-            self.assertEqual(by_label["Text"].value, SHORT[0])
-            self.assertIn("How it speaks", by_label)
+            fixtures_steers = load_steer_fixtures()
+            self.assertEqual(by_label["Text"].value, fixtures_steers[0]["text"])
+            self.assertIn("Steer (natural-language direction)", by_label)
             self.assertEqual(
-                by_label["How it speaks"].value, "Speak clearly and naturally."
+                by_label["Steer (natural-language direction)"].value,
+                fixtures_steers[0]["steer"],
             )
-            chips = str(getattr(by_label["How it speaks"], "info", "") or "") + " ".join(
-                str(getattr(c, "value", "")) + str(getattr(c, "label", ""))
-                for c in demo.blocks.values()
-            )
-            for direction in DIRECTIONS:
-                self.assertIn(direction, chips)
+            self.assertNotIn("How it speaks", by_label)
             self.assertIn("cfg_scale", by_label)
             slider = by_label["cfg_scale"]
             self.assertEqual(slider.value, 1.0)
@@ -100,73 +119,54 @@ class PlaygroundCli(unittest.TestCase):
             self.assertEqual(slider.step, 0.5)
             info = str(slider.info or "")
             self.assertIn("1.0", info)
-            self.assertIn("4.0", info)
             self.assertIn("seed", by_label)
             self.assertEqual(by_label["seed"].value, 42)
-            self.assertIn("Clone audio", by_label)
-            self.assertIn("Clone transcript", by_label)
-            clone_val = by_label["Clone audio"].value
+            self.assertIn("Original reference", by_label)
+            self.assertIn("Effective transcript", by_label)
+            clone_val = by_label["Original reference"].value
             if isinstance(clone_val, dict):
-                self.assertEqual(clone_val.get("orig_name"), "ref.wav")
                 self.assertTrue(str(clone_val.get("path", "")).endswith("ref.wav"))
             else:
                 self.assertEqual(Path(clone_val).name, "ref.wav")
-            self.assertEqual(
-                by_label["Clone transcript"].value, "clone speaker text"
-            )
+            self.assertEqual(by_label["Effective transcript"].value, "clone speaker text")
+            self.assertIn("reference conditioning", by_label)
+            self.assertIn("instruction conditioning", by_label)
+            self.assertIn("stream.fm cleanup", by_label)
+            self.assertNotIn("Conversational context", by_label)
+            self.assertNotIn("Delivery history", by_label)
+            buttons = _buttons(demo)
+            self.assertTrue(any(v == "Generate steer" for v in buttons), buttons)
+            self.assertFalse(any("history" in v.lower() for v in buttons), buttons)
+            self.assertFalse(any("New conversation" in v for v in buttons), buttons)
+            tabs = _tab_labels(demo)
+            for name in ("Synthesize", "Reference lab", "Experiments", "Library"):
+                self.assertTrue(any(name == tab for tab in tabs), tabs)
 
-    def test_blocks_have_generate_status_and_killed_advanced(self) -> None:
+    def test_blocks_have_generate_status_and_experimental_accordions(self) -> None:
         from breeze_tts_qual.playground import build_interface
 
         demo = build_interface(Path.home())
-        by_label = {
-            getattr(c, "label", None): c
-            for c in demo.blocks.values()
-            if getattr(c, "label", None)
-        }
+        by_label = _labels(demo)
         kinds = {type(c).__name__ for c in demo.blocks.values()}
         self.assertIn("Audio", kinds)
-        buttons = [
-            c for c in demo.blocks.values() if type(c).__name__ == "Button"
-        ]
-        button_values = [str(getattr(b, "value", "")) for b in buttons]
-        self.assertTrue(any("Generate" in v for v in button_values), button_values)
+        buttons = _buttons(demo)
+        self.assertTrue(any(v == "Generate" for v in buttons), buttons)
+        self.assertTrue(any(v == "Use selection" for v in buttons), buttons)
+        self.assertTrue(any(v == "Exclude selection" for v in buttons), buttons)
         self.assertIn("Status", by_label)
-        accs = [
-            c for c in demo.blocks.values() if type(c).__name__ == "Accordion"
-        ]
-        titles = " ".join(str(getattr(a, "label", "")) for a in accs)
-        self.assertTrue(accs, "expected Advanced accordion")
-        self.assertTrue("killed" in titles.lower() or "unsafe" in titles.lower(), titles)
-        checkboxes = [
-            c for c in demo.blocks.values() if type(c).__name__ == "Checkbox"
-        ]
-        self.assertTrue(checkboxes, "expected confirm checkbox for killed presets")
-        self.assertFalse(bool(checkboxes[0].value))
-        radios = [
-            c for c in demo.blocks.values() if type(c).__name__ == "Radio"
-        ]
-        self.assertGreaterEqual(len(radios), 2)
-        killed_values = []
-        for choice in radios[1].choices:
-            if isinstance(choice, (tuple, list)) and len(choice) >= 2:
-                killed_values.append(choice[1])
-            else:
-                killed_values.append(choice)
-        for name in ("C3", "C4", "D", "E3", "E4", "E5", "B_backbone_prefill"):
-            self.assertIn(name, killed_values)
-        main_values = []
-        for choice in radios[0].choices:
-            if isinstance(choice, (tuple, list)) and len(choice) >= 2:
-                main_values.append(choice[1])
-            else:
-                main_values.append(choice)
-        for name in ("C3", "C4", "D", "E3"):
-            self.assertNotIn(name, main_values)
+        self.assertIn("Inspect provenance", {getattr(a, "label", None) for a in demo.blocks.values()})
+        accs = [c for c in demo.blocks.values() if type(c).__name__ == "Accordion"]
+        titles = " ".join(str(getattr(a, "label", "")) for a in accs).lower()
+        self.assertIn("dual-cfg", titles)
+        self.assertIn("inspect provenance", titles)
+        self.assertNotIn("killed", titles)
+        self.assertNotIn("unsafe", titles)
+        self.assertNotIn("conversation", titles)
+
 
 class PlaygroundSessionTests(unittest.TestCase):
     def test_start_parks_before_load_and_close_restores(self) -> None:
-        from breeze_tts_qual.playground import PlaygroundSession
+        from tts.playground.app import PlaygroundSession
 
         order: list[str] = []
 
@@ -181,20 +181,23 @@ class PlaygroundSessionTests(unittest.TestCase):
             order.append(f"factory:{config.name}")
             return FakeEngine()
 
-        with (
-            patch(
-                "breeze_tts_qual.playground.park_leftover.park",
-                side_effect=lambda: order.append("park"),
-            ) as park,
-            patch(
-                "breeze_tts_qual.playground.park_leftover.restore",
-                side_effect=lambda: order.append("restore"),
-            ) as restore,
-        ):
-            session = PlaygroundSession(Path("."), engine_factory=factory)
-            session.start()
-            self.assertEqual(session.loaded_preset, "E2")
-            session.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch(
+                    "tts.playground.app.park_leftover.park",
+                    side_effect=lambda: order.append("park"),
+                ) as park,
+                patch(
+                    "tts.playground.app.park_leftover.restore",
+                    side_effect=lambda: order.append("restore"),
+                ) as restore,
+            ):
+                session = PlaygroundSession(
+                    Path("."), engine_factory=factory, lab=Path(tmp)
+                )
+                session.start()
+                self.assertEqual(session.loaded_preset, "E2")
+                session.close()
 
         self.assertEqual(order[0], "park")
         self.assertIn("factory:E2", order)
@@ -205,68 +208,47 @@ class PlaygroundSessionTests(unittest.TestCase):
         restore.assert_called_once()
 
     def test_close_restores_even_if_load_failed(self) -> None:
-        from breeze_tts_qual.playground import PlaygroundSession
+        from tts.playground.app import PlaygroundSession
 
         def factory(config, **kwargs):
             raise RuntimeError("no 3B")
 
-        with (
-            patch("breeze_tts_qual.playground.park_leftover.park") as park,
-            patch("breeze_tts_qual.playground.park_leftover.restore") as restore,
-        ):
-            session = PlaygroundSession(Path("."), engine_factory=factory)
-            with self.assertRaisesRegex(RuntimeError, "no 3B"):
-                session.start()
-            session.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("tts.playground.app.park_leftover.park") as park,
+                patch("tts.playground.app.park_leftover.restore") as restore,
+            ):
+                session = PlaygroundSession(
+                    Path("."), engine_factory=factory, lab=Path(tmp)
+                )
+                with self.assertRaisesRegex(RuntimeError, "no 3B"):
+                    session.start()
+                session.close()
         park.assert_called_once()
         restore.assert_called_once()
         self.assertIsNone(session.engine)
 
-    def test_ensure_preset_reloads_only_on_change(self) -> None:
-        from breeze_tts_qual.playground import PlaygroundSession
+    def test_start_rejects_legacy_presets(self) -> None:
+        from tts.playground.app import PlaygroundSession
 
-        loads: list[str] = []
-
-        class FakeEngine:
-            def close(self) -> None:
-                loads.append("close")
-
-        def factory(config, **kwargs):
-            loads.append(config.name)
-            return FakeEngine()
-
-        with (
-            patch("breeze_tts_qual.playground.park_leftover.park"),
-            patch("breeze_tts_qual.playground.park_leftover.restore"),
-        ):
-            session = PlaygroundSession(Path("."), engine_factory=factory)
-            session.start("E2")
-            first = session.engine
-            session.ensure_preset("E2")
-            self.assertIs(session.engine, first)
-            session.ensure_preset("A")
-            self.assertEqual(session.loaded_preset, "A")
-            self.assertIsNot(session.engine, first)
-            session.close()
-        self.assertEqual(loads, ["E2", "close", "A", "close"])
-
-    def test_resolve_preset_requires_confirm_for_killed(self) -> None:
-        from breeze_tts_qual.playground import PlaygroundSession
-
-        session = PlaygroundSession(Path("."), engine_factory=lambda *a, **k: None)
-        self.assertEqual(session.resolve_preset("E2", None, False), "E2")
-        with self.assertRaisesRegex(ValueError, "confirm"):
-            session.resolve_preset("E2", "C3", False)
-        self.assertEqual(session.resolve_preset("E2", "C3", True), "C3")
-        self.assertEqual(session.resolve_preset("A", None, True), "A")
+        with tempfile.TemporaryDirectory() as tmp:
+            session = PlaygroundSession(
+                Path("."), engine_factory=lambda *a, **k: None, lab=Path(tmp)
+            )
+            with self.assertRaisesRegex(ValueError, "E2"):
+                session.start("A")
+            self.assertFalse(hasattr(session, "ensure_preset"))
+            self.assertFalse(hasattr(session, "resolve_preset"))
 
     def test_generate_is_sequential_and_forwards_controls(self) -> None:
         from breeze_tts_qual.engine import PcmChunk
-        from breeze_tts_qual.playground import PlaygroundSession
+        from tts.playground.app import PlaygroundSession
+        from tts.wav import is_riff_wav, write_wav
+        import numpy as np
 
         calls: list[dict] = []
         silent = (b"\x00\x00") * 200
-        audible = (b"\xe8\x03") * 200  # 1000 as s16le
+        audible = (b"\xe8\x03") * 200
 
         class FakeEngine:
             sample_rate = 24000
@@ -282,49 +264,85 @@ class PlaygroundSessionTests(unittest.TestCase):
         def factory(config, **kwargs):
             return FakeEngine()
 
-        with (
-            patch("breeze_tts_qual.playground.park_leftover.park"),
-            patch("breeze_tts_qual.playground.park_leftover.restore"),
-        ):
-            session = PlaygroundSession(Path("."), engine_factory=factory)
-            session.start("E2")
-            audio, status = session.generate(
-                text="hello there",
-                instruction="slightly amused",
-                cfg_scale=4.0,
-                seed=7,
-                clone_audio="/tmp/ref.wav",
-                clone_text="clone speaker",
-                safe_preset="E2",
-                killed_preset=None,
-                confirm_killed=False,
-            )
-            session.close()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["text"], "hello there")
-        self.assertEqual(calls[0]["instruction"], "slightly amused")
-        self.assertEqual(calls[0]["cfg_scale"], 4.0)
-        self.assertEqual(calls[0]["seed"], 7)
-        self.assertEqual(str(calls[0]["reference_audio"]), "/tmp/ref.wav")
-        self.assertEqual(calls[0]["reference_text"], "clone speaker")
-        self.assertIsInstance(audio, tuple)
-        self.assertEqual(audio[0], 24000)
-        self.assertIn("E2", status)
-        self.assertIn("first_pcm", status)
-        self.assertIn("first_nonsilent", status)
-        self.assertTrue(hasattr(session, "_lock"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "ref.wav"
+            write_wav(ref, 16000, np.zeros(1600, dtype=np.float32))
+            with (
+                patch("tts.playground.app.park_leftover.park"),
+                patch("tts.playground.app.park_leftover.restore"),
+            ):
+                session = PlaygroundSession(
+                    Path("."), engine_factory=factory, lab=Path(tmp)
+                )
+                session.start("E2")
+                audio, status, run = session.generate(
+                    text="hello there",
+                    instruction="slightly amused",
+                    cfg_scale=4.0,
+                    seed=7,
+                    clone_audio=str(ref),
+                    clone_text="clone speaker",
+                    start_s=0,
+                    end_s=0,
+                )
+                session.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["text"], "hello there")
+            self.assertEqual(calls[0]["instruction"], "slightly amused")
+            self.assertEqual(calls[0]["cfg_scale"], 4.0)
+            self.assertEqual(calls[0]["seed"], 7)
+            self.assertEqual(calls[0]["reference_text"], "clone speaker")
+            self.assertIsInstance(audio, tuple)
+            self.assertEqual(audio[0], 24000)
+            self.assertIn("E2", status)
+            self.assertNotIn("empty crop", status)
+            self.assertIn("first_pcm", status)
+            self.assertIn("first_nonsilent", status)
+            self.assertIn("run_id", run)
+            self.assertNotIn("conversation_id", run)
+            self.assertNotIn("conversation_id", run.get("packet") or {})
+            self.assertEqual((run.get("reference") or {}).get("variant"), "original")
+            self.assertTrue(hasattr(session, "_lock"))
+            self.assertFalse(hasattr(session, "conversation_id"))
+            self.assertTrue(is_riff_wav(Path(run["output_audio"]["path"])))
 
     def test_launch_kwargs_bind_localhost_without_share(self) -> None:
         from breeze_tts_qual.playground import launch_kwargs
+        from tts.paths import lab_root, qual_root
 
         kwargs = launch_kwargs(host="127.0.0.1", port=7860)
         self.assertEqual(kwargs["server_name"], "127.0.0.1")
         self.assertEqual(kwargs["server_port"], 7860)
         self.assertFalse(kwargs.get("share", False))
-        self.assertNotIn(True, [kwargs.get("share")])
+        self.assertNotIn("980px", kwargs.get("css") or "")
+        allowed = kwargs.get("allowed_paths") or []
+        self.assertIn(str(lab_root()), allowed)
+        self.assertIn(str(lab_root() / "cache"), allowed)
+        self.assertIn(str(qual_root()), allowed)
+
+    def test_blocks_fill_width(self) -> None:
+        from tts.playground.app import PLAYGROUND_CSS, build_interface
+
+        demo = build_interface(Path.home())
+        self.assertTrue(getattr(demo, "fill_width", False))
+        self.assertNotIn("980px", PLAYGROUND_CSS)
+
+    def test_gradio_audio_returns_numpy_not_cache_path(self) -> None:
+        from tts.playground.app import _gradio_audio
+        from tts.wav import write_wav
+        import numpy as np
+
+        self.assertIsNone(_gradio_audio(None))
+        self.assertIsNone(_gradio_audio(""))
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / "ref.wav"
+            write_wav(wav, 16000, np.zeros(1600, dtype=np.float32))
+            sr, samples = _gradio_audio(str(wav))
+            self.assertEqual(sr, 16000)
+            self.assertEqual(int(getattr(samples, "size", len(samples))), 1600)
 
     def test_serve_restores_leftover_after_launch_exits(self) -> None:
-        from breeze_tts_qual.playground import main
+        from tts.playground.app import main
 
         order: list[str] = []
 
@@ -346,19 +364,19 @@ class PlaygroundSessionTests(unittest.TestCase):
 
         with (
             patch(
-                "breeze_tts_qual.playground.park_leftover.park",
+                "tts.playground.app.park_leftover.park",
                 side_effect=lambda: order.append("park"),
             ),
             patch(
-                "breeze_tts_qual.playground.park_leftover.restore",
+                "tts.playground.app.park_leftover.restore",
                 side_effect=lambda: order.append("restore"),
             ),
             patch(
-                "breeze_tts_qual.playground._default_engine_factory",
+                "tts.playground.app._default_engine_factory",
                 side_effect=factory,
             ),
             patch(
-                "breeze_tts_qual.playground.build_interface",
+                "tts.playground.app.build_interface",
                 return_value=demo,
             ),
         ):
@@ -375,16 +393,53 @@ class PlaygroundSessionTests(unittest.TestCase):
         self.assertFalse(demo.assert_kwargs.get("share", False))
 
 
+class PlaygroundTranscribeUi(unittest.TestCase):
+    def test_blocks_expose_transcribe_into_clone_transcript(self) -> None:
+        from breeze_tts_qual.playground import build_interface
 
+        demo = build_interface(Path.home())
+        by_label = _labels(demo)
+        self.assertIn("Effective transcript", by_label)
+        self.assertIn("Source transcript", by_label)
+        self.assertNotIn(
+            "Transcript (Parakeet TDT 0.6B v2 via transcribe.cpp)", by_label
+        )
+        buttons = _buttons(demo)
+        self.assertTrue(any(v == "Transcribe" for v in buttons), buttons)
+        info = str(getattr(by_label["Effective transcript"], "info", "") or "")
+        self.assertIn("Transcribe", info)
 
+    def test_session_transcribe_uses_clone_and_stays_cpu(self) -> None:
+        from tts.playground.app import PlaygroundSession
 
+        calls: list[object] = []
 
+        def fake_transcribe(audio, **kwargs):
+            calls.append(audio)
+            return {
+                "text": "hello from parakeet",
+                "wall_s": 0.42,
+                "cli": "/tmp/transcribe-cli",
+                "model": "/tmp/parakeet-tdt-0.6b-v2-Q8_0.gguf",
+                "backend": "cpu",
+            }
 
-
-
-
-
-
+        with tempfile.TemporaryDirectory() as tmp:
+            session = PlaygroundSession(
+                Path("."), engine_factory=lambda *a, **k: None, lab=Path(tmp)
+            )
+            clone = "/tmp/clone.wav"
+            with patch(
+                "tts.playground.app.transcribe_audio",
+                side_effect=fake_transcribe,
+            ):
+                text, status = session.transcribe(clone)
+        self.assertEqual(text, "hello from parakeet")
+        self.assertIn("cpu", status)
+        self.assertIn("clone", status)
+        self.assertNotIn("output", status)
+        self.assertIn("parakeet-tdt-0.6b-v2", status)
+        self.assertEqual(calls, [clone])
 
 
 if __name__ == "__main__":

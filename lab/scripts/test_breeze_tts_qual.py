@@ -1576,6 +1576,32 @@ class DualCfgEagerDtype(unittest.TestCase):
             out = model(bf16_in)
         self.assertEqual(out.dtype, torch.float32)
 
+    def test_guard_casts_direct_linear_and_addmm(self) -> None:
+        try:
+            import torch
+            from torch import nn
+        except ImportError:
+            self.skipTest("torch missing")
+
+        from breeze_tts_qual.engine import _eager_generate_dtype_guard
+
+        weight = torch.ones(4, 4, dtype=torch.float32)
+        bf16_in = torch.ones(2, 4, dtype=torch.bfloat16)
+        with self.assertRaises(RuntimeError):
+            torch.nn.functional.linear(bf16_in, weight)
+        with _eager_generate_dtype_guard(nn.Identity()):
+            out = torch.nn.functional.linear(bf16_in, weight)
+        self.assertEqual(out.dtype, torch.float32)
+
+        bias = torch.zeros(4, dtype=torch.float32)
+        mat1 = torch.ones(2, 4, dtype=torch.bfloat16)
+        mat2 = torch.ones(4, 4, dtype=torch.float32)
+        with self.assertRaises(RuntimeError):
+            torch.addmm(bias, mat1, mat2)
+        with _eager_generate_dtype_guard(nn.Identity()):
+            added = torch.addmm(bias, mat1, mat2)
+        self.assertEqual(added.dtype, torch.float32)
+
     def test_force_eager_runs_compiled_fullgraph_without_recompile_limit(self) -> None:
         try:
             import torch

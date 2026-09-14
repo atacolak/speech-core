@@ -19,6 +19,12 @@ from tts.packets import PronunciationOverride, UtterancePacket
 from tts.wav import duration_s, is_riff_wav, write_wav
 
 
+class GenerationCancelled(Exception):
+    """Abandoned hop/lab stream asked the worker to stop generating."""
+
+    code = "cancelled"
+
+
 @dataclass
 class SynthesisRequest:
     text: str
@@ -61,6 +67,8 @@ def synthesize_e2(
     request: SynthesisRequest,
     *,
     engine: Any | None = None,
+    on_chunk: Any | None = None,
+    cancel_event: Any | None = None,
 ) -> SynthesisResult:
     """Run selected E2 synthesis and write a real RIFF/WAVE file.
 
@@ -85,15 +93,21 @@ def synthesize_e2(
         engine = load_selected_engine()
     t0 = time.perf_counter()
     try:
-        chunks = list(
-            synthesize(
-                engine,
-                packet=packet,
-                reference_audio=request.reference_audio,
-                reference_text=request.reference_text,
-                settings=settings,
-            )
-        )
+        chunks: list[Any] = []
+        for chunk in synthesize(
+            engine,
+            packet=packet,
+            reference_audio=request.reference_audio,
+            reference_text=request.reference_text,
+            settings=settings,
+        ):
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled("synthesize cancelled")
+            chunks.append(chunk)
+            if on_chunk is not None:
+                on_chunk(chunk)
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled("synthesize cancelled")
     finally:
         if owns_engine:
             closer = getattr(engine, "close", None)

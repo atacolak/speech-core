@@ -2,7 +2,7 @@
 # not on the voicecat path.
 set -euo pipefail
 CODE_COMMIT="43e2ea1595297c4059477e2e4a300653761c759b"
-QUAL_ROOT="${QUAL_ROOT:-$HOME/.cache/speech-out/breeze-tts-qual-sc-breeze-hybrid-81p}"
+QUAL_ROOT="${QUAL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/speech-out/breeze-tts-2-e2}"
 SRC="$QUAL_ROOT/src/breeze-tts"
 VENV="$QUAL_ROOT/venv"
 MODELS="$QUAL_ROOT/models"

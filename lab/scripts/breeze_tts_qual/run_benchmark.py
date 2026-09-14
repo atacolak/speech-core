@@ -42,7 +42,9 @@ from breeze_tts_qual.report import compact_from_metrics
 
 
 _DEFAULT_QUAL_ROOT = (
-    Path.home() / ".cache" / "speech-out" / "breeze-tts-qual-sc-breeze-hybrid-81p"
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    / "speech-out"
+    / "breeze-tts-2-e2"
 )
 _B_ARM_NAMES = (
     "B_depth",

@@ -107,12 +107,29 @@ class VoiceProfile(_Strict):
 class ReferenceVariant(_Strict):
     id: str
     voice_profile_id: str
-    kind: Literal["original", "streamfm", "other"]
+    kind: Literal["original", "resemble", "auk", "other"]
     audio_artifact_id: str
     processor_config: dict[str, Any] | None = None
     processor_cache_key: str | None = None
     duration_s: float
     pinned: bool = False
+    # AuK candidate lineage. Null on original/resemble rows: they are not
+    # generated from a parent candidate.
+    parent_variant_id: str | None = None
+    auk_task: str | None = None
+    instruction: str | None = None
+    model_variant: str | None = None
+    auk_precision: str | None = None  # bf16 (preferred pin) | int8 (explicit fallback)
+    encoder_precision: str | None = None  # w4a8
+    seed: int | None = None
+    settings: dict[str, Any] | None = None  # nfe / cfg / sway when non-default
+    approved: bool = False
+    # Read-side only: source bytes or keep no longer match the provenance above.
+    stale: bool = False
+
+
+# A media source is a file the operator owns or a youtube video ingested for it.
+MediaSourceKind = Literal["file", "youtube"]
 
 
 class SynthesisRequest(_Strict):

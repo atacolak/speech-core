@@ -7,6 +7,7 @@ import { defineConfig } from 'vitest/config'
 const root = fileURLToPath(new URL('.', import.meta.url))
 
 export default defineConfig({
+  base: './',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

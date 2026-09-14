@@ -17,8 +17,11 @@ TTS_ROOT = Path(__file__).resolve().parent
 _DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
 DEFAULT_QUAL_ROOT = _DATA_HOME / "speech-out" / "breeze-tts-2-e2"
 DEFAULT_LAB_ROOT = _DATA_HOME / "speech-out" / "tts-lab"
+DEFAULT_AUK_PIN_ROOT = _DATA_HOME / "speech-out" / "auk-base"
 
 SELECTED_RUNTIME = "E2"
+DISPLAY_NAME = "Breeze TTS2"
+ENGINE_ID = "breeze-tts2"
 BREEZE_IMPLEMENTATION = "breeze-tts-2-e2"
 BREEZE_PIN_COMMIT = "43e2ea1595297c4059477e2e4a300653761c759b"
 
@@ -29,6 +32,15 @@ def qual_root() -> Path:
 
 def lab_root() -> Path:
     return Path(os.environ.get("TTS_LAB_ROOT", str(DEFAULT_LAB_ROOT))).expanduser()
+
+
+def auk_pin_root() -> Path:
+    """AuK weights, venv and assets. Never inside the repo: they are not source."""
+    return Path(os.environ.get("AUK_PIN_ROOT", str(DEFAULT_AUK_PIN_ROOT))).expanduser()
+
+
+def auk_venv_python() -> Path:
+    return auk_pin_root() / "venv" / "bin" / "python"
 
 
 def ensure_lab_dirs(root: Path | None = None) -> Path:

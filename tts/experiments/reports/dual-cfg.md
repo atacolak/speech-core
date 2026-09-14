@@ -29,9 +29,9 @@ on the already-loaded weights. Ordinary E2 generation still uses
 `runtime.iter_audio_chunks`.
 
 E2 graph warmup leaves `lm_head` / `codebooks_head` in fp32 while the
-backbone stays bf16. Eager generate therefore wraps Linears with a
-dtype guard (`_eager_generate_dtype_guard`) so dual-cfg scales such as
-1/2 or 1/4 do not raise `expected scalar type BFloat16 but found Float`.
+backbone stays bf16. Eager generate therefore wraps Linears / convs and
+patches `F.linear` / `addmm` (`_eager_generate_dtype_guard`) so dual-cfg
+does not raise `expected mat1 and mat2 to have the same dtype`.
 
 The same warmup `torch.compile`s depth-decoder layers and codec
 SnakeBeta with `fullgraph=True`. Dual-cfg must not execute those

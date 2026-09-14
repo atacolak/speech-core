@@ -7,7 +7,7 @@ If this file disagrees with code, tests, traces, or installed configuration, tre
 
 ## one-line summary
 
-`speech-core` is the spoken substrate: voicecat (or a diagnostic mic adapter) sends 16 kHz mono PCM in; nemotron (CPU) transcribes; silero + smart-turn close the turn; leftover qwentts (GPU) speaks. the live *call* is sibling voicecat + headed omp TUI, not `speech-out-live-session`.
+`speech-core` is the spoken substrate: voicecat (or a diagnostic mic adapter) sends 16 kHz mono PCM in; nemotron (CPU) transcribes; silero + smart-turn close the turn; leftover mouth daemon (`:8788`) hops to breeze-tts-2 E2 (GPU). the live *call* is sibling voicecat + headed omp TUI, not `speech-out-live-session`.
 
 ## current live path
 
@@ -23,8 +23,10 @@ ata-speech-core.service :8765
     ↓
 voicecat collab guest "desk"     headed omp TUI (brain)
     ↓
-ata-speech-out.service :8788     leftover speak/append
-  ata-speech-tts.service :18091  qwentts.cpp CUDA
+ata-speech-out.service :8788     leftover mouth daemon (speak/append/cancel)
+  hop POST :7861/internal/leftover/v1/audio/speech
+    breeze-tts-2 E2 worker (GPU)
+  ata-speech-tts.service :18091  parked qwentts.cpp (rollback only)
     ↓
 voicecat browser_sink / phone_sink
 
@@ -85,9 +87,10 @@ important translation:
 | VAD | `silero_vad_v4.onnx` | CPU | same |
 | turn close | `smart-turn-v3.2-cpu.onnx` | CPU, 1 thread | same |
 | barge cut | torchaudio `WAV2VEC2_ASR_BASE_960H` | CPU | `ata-speech-align.service` |
-| TTS | qwentts.cpp 0.6B CustomVoice Q8 | GPU (`GGML_BACKEND=CUDA0`) | `ata-speech-tts.service` |
+| TTS | breeze-tts-2 E2 | GPU | `lab-web-7861` / `tts.lab.backend.runtime.worker` |
+| parked TTS rollback | qwentts.cpp 0.6B CustomVoice Q8 | GPU if started | `ata-speech-tts.service` (disabled; not Wants= from the mouth daemon) |
 
-the 4070 is the mouth. do not load CosyVoice next to live qwentts. GPU nemotron is a future pin change, not current.
+the GPU holds one synthesizer. live occupant is breeze-tts-2 E2 (~8720 MiB). do not start parked qwentts or CosyVoice beside it. GPU nemotron is a future pin change, not current.
 
 ## what `<EOU>` means right now
 
@@ -146,8 +149,8 @@ this is less magical and less chatty. good.
 - smart turn v3 needs broader live laptop validation across actual conversational pauses.
 - smart turn preprocessing is implemented directly in Rust; parity against Python is smoke-tested through the real model, not numerically golden-tested against Transformers.
 - cross-host capture latency is preserved but not calibrated.
-- `docs/evolution/` still names CosyVoice as a *selected target*. that is direction archive. **live mouth is qwentts.** CosyVoice is rollback only.
-- speech-out **pcm out** streams. qwentts HTTP text-in is one complete `input`. leftover **append** is the voicecat hop on `:8788` (`speak` then `append`). first-clause flush is also call-side (voicecat SENTENCE), not an engine missing-feature on `:18091`.
+- `docs/evolution/` still names CosyVoice as a *selected target*. that is direction archive. **live synthesizer is breeze-tts-2 E2** via leftover mouth hop `:8788`. parked qwentts.cpp and CosyVoice3 TRT are rollback only.
+- leftover **pcm out** streams from the breeze hop. leftover **append** is the voicecat hop on `:8788` (`speak` then `append`). first-clause flush is call-side (voicecat SENTENCE). parked qwen `:18091` is not the live path.
 - WordVoice (CosyVoice3 word-level tags, [arXiv:2607.06461](https://arxiv.org/abs/2607.06461)) is **not** a streamer and **not** loaded. research: [`lab/docs/qualification/wordvoice-research.md`](../lab/docs/qualification/wordvoice-research.md). parked with the rest of CosyVoice lab.
 
 ## manual testing commands
@@ -229,25 +232,28 @@ SPEECH_CORE_SMART_TURN_MODEL_PATH=~/workspace/external/smart-turn-v3/smart-turn-
 ```
 
 
-## speech-out live pin (2026-08-18)
+## speech-out live pin (2026-09-11)
 
-**live mouth is qwentts.cpp Q8 CustomVoice.** CosyVoice is **not** the production pin. it is rollback + historical qual only.
+**live synthesizer is breeze-tts-2 E2.** leftover `:8788` is the mouth daemon. qwentts.cpp and CosyVoice3 TRT are rollback only. frozen env names (`SPEECH_OUT_PROGRESSIVE_BACKEND=cosyvoice`, `SPEECH_OUT_COSYVOICE_*`, `SPEECH_OUT_QWENTTS_URL`, handshake `progressive-cosyvoice`) still describe the leftover hop, not the model on the GPU.
 
 ```text
-voicecat CosyVoiceTTSService  (name is a lie; SENTENCE-aggregates the whole reply)
+voicecat SpeechOutTTSService
   ws://127.0.0.1:8788/ws/speech-out
-    ata-speech-out.service   (aa86b67 *binary*, handshake still says progressive-cosyvoice)
-      qwentts_progressive_worker.py
-        POST http://127.0.0.1:18091/v1/audio/speech
-          ata-speech-tts.service   (tts-server, 24 kHz s16 pcm stream)
+    ata-speech-out.service   (speech-out-append-v1; handshake still says progressive-cosyvoice)
+      qwentts_progressive_worker.py   (leftover hop client; vestigial name)
+        POST SPEECH_OUT_QWENTTS_URL
+          http://10.77.67.147:7861/internal/leftover/v1/audio/speech
+            breeze-tts-2 E2 worker (GPU, ~8720 MiB)
+  ata-speech-tts.service :18091  parked qwentts.cpp (disabled; not Wants= from the mouth)
 ```
 
 | unit | role |
 | --- | --- |
-| `ata-speech-out.service` | ws `:8788`, speak/cancel/pcm frames |
-| `ata-speech-tts.service` | inference `:18091` |
-| voice | `default`/`m1`/`informal` → **ryan**, instruct = informal lock |
-| VRAM | **~2438 MiB** (unit pid after leftover adopt) |
+| `ata-speech-out.service` | leftover mouth daemon, ws `:8788`, speak/append/cancel/pcm frames |
+| `lab-web-7861` | breeze-tts-2 E2, hop `:7861/internal/leftover/v1/audio/speech` |
+| `ata-speech-tts.service` | parked qwentts.cpp rollback on `:18091`; must not start beside E2 |
+| talker voice | lab sqlite `active_voice_id`; leftover hop uses that profile |
+| VRAM | **~8720 MiB** breeze worker; parked qwen ~2240 MiB if started |
 
 clocks (do **not** subtract domains):
 
@@ -258,13 +264,17 @@ clocks (do **not** subtract domains):
 
 evidence: [`docs/qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md), [`docs/qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md).
 
-**one-shot vs stream:** pcm **out** already streams (`response_format=pcm`, `--codec-chunk-dur 0.08`). text **in** is one complete `input` string. empty / `append` / missing `input` → HTTP 400. daemon `ClientMessage` is `Speak` with `text: String` — no `append` / `text_delta`. `stream:true` on the HTTP body is ignored.
+**unit ceiling (leftover daemon, not the hop):** `speech-out-append-v1` fails a unit at **720000 samples** (1500 frames × 20 ms PCM = 30.000 s) with `speech_out_failed` / `error:max_samples_per_utterance exceeded`. that string reaches the wire (`ErrorFrame(speech_out_terminal:failed:max_samples_per_utterance exceeded)`). not silent. ceiling is **per unit**, not per utterance — four shorter units can outlast 30s. hop `POST /internal/leftover/v1/audio/speech` has no HTTP duration cap. desk (`SpeechOutWholeResponseTTSService`, voicecat `b66bb19`) splits at ~420 chars / ~22s on sentence boundaries so a long reply is not clipped mid-word. do not raise this on the hop.
 
-the hundreds-of-ms win is: **flush the first speakable clause as soon as the agent emits it**, then more `speak`s. that hop is voicecat (`TextAggregationMode.SENTENCE` waits for the whole reply). do not invent CosyVoice token-bistream (`sc-01p` closed). do not pretend qwentts can chew tokens while pcm is already leaving.
+**engine ceiling (hop 200, truncated PCM):** leftover hop is not lossless on a long single POST. E2 `FastStreamingConfig` defaults `max_new_tokens=750`, `max_seq_len=1024` (graphs warmed there; official breeze API is 1500/2048). generation stops at EOS, at 750 new tokens, or when `prefill_len + step >= 1023`, then the hop still returns **200**. two-regime (one POST each, raw pcm seconds, overseer #48294): 315→10.880s, 789→27.600, **1105→36.640 peak**, 1421→31.200, 1737→25.760, 2053→20.320, 2527→12.160. below the peak, ~36.6s is `max_new_tokens=750` at ~20.5 tok/s (48.9 ms/token). above it `max_seq_len` binds and duration falls: 1 audio token lost per 0.352 input chars (~2.84 chars/prefill token), `prefill ~= 0.352*chars - 115`. predicted transition `0.352*c - 115 + 750 <= 1023` is `c <= 1102`; measured peak 1105. stay under **~1100 chars** for full fidelity; above it you lose ~49 ms of audio per extra 2.8 characters, silently, with a 200. do not raise 750/1024 without a new E2 warmup. desk 420-char units are ~148 prefill tokens, under both caps.
 
-rollback: `SPEECH_OUT_COSYVOICE_WORKER_SCRIPT=$SPEECH_OUT_COSYVOICE_WORKER_SCRIPT_ROLLBACK`, stop `ata-speech-tts.service`, restart the daemon. ~6 GB CosyVoice3 TRT. do **not** load both engines on this 12 GB card.
+**one-shot vs stream:** leftover hop pcm **out** streams (`response_format=pcm`). hop text **in** is one complete `input` string per POST — no append flag. `:8788` leftover v1 **does** accept `speak` / `append` / `finish` / `hold_open`; each of those is a fresh hop POST / Breeze synth. empty hop `input` → HTTP 400. `stream:true` on the hop body is ignored. non-streamed desk replies coalesce into one speak so Breeze keeps paragraph breath (~360 ms/boundary). streamed first clause stays speak, then one append.
 
-isolated CosyVoice3 RL lab (clone / instruct / tags / export, **not** live): `~/workspace/cosyvoice_playground`. launch `./run.sh --port 7861`. do **not** load it beside live qwentts on this 12 GB card.
+the hundreds-of-ms win is: **flush the first speakable clause as soon as the agent emits it**. do not invent CosyVoice token-bistream (`sc-01p` closed). do not pad hop zeros at append boundaries — that fakes a pause and misses intonation.
+
+rollback: `SPEECH_OUT_COSYVOICE_WORKER_SCRIPT=$SPEECH_OUT_COSYVOICE_WORKER_SCRIPT_ROLLBACK`, stop `ata-speech-tts.service`, restart the daemon. ~6 GB CosyVoice3 TRT. do **not** load two synthesizers on this 12 GB card.
+
+isolated CosyVoice3 RL lab (clone / instruct / tags / export, **not** live): `~/workspace/cosyvoice_playground`. launch `./run.sh --port 7861`. do **not** load it beside live breeze-tts-2 E2 on this 12 GB card.
 
 historical CosyVoice2 Unet (~225 ms finished-sentence) is an isolated container, not this pin.
 

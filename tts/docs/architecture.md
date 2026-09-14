@@ -1,6 +1,6 @@
 # TTS laboratory architecture
 
-not on the voicecat path. Lab-only. Live mouth stays leftover qwentts.
+not on the voicecat path. Lab-only. Live mouth stays the leftover hop.
 
 This is a boundary document, not a framework manifesto. The objects below
 exist so an utterance can be reconstructed later: why it sounded the way
@@ -87,7 +87,7 @@ repeatedly MP3-encode clone references.
 The clone reference is an ordered edit list on immutable source audio:
 
     source audio + [exclude | trim_start | trim_end]* -> effective reference
-                  -> optional stream.fm
+                  -> optional preprocess (not installed)
                   -> effective synthesis reference
 
 Never overwrite the original. Multiple excluded ranges are first-class.
@@ -98,14 +98,15 @@ remove speech, mark the transcript stale and retranscribe or edit it.
 
 Durable lab store: `~/.local/share/speech-out/tts-lab`.
 
-- **cache** (`tts-lab/cache`, plus `tmp`) — automatic, derived, rebuildable (stream.fm, effective wavs). Safe to delete.
+- **cache** (`tts-lab/cache`, plus `tmp`) — automatic, derived, rebuildable (preprocess cache, effective wavs). Safe to delete.
 - **save/promote** — durable library / voice profile identity (`voices/`, `library.json`, `generations/`, `runs/`)
 - **download/export** — explicit standalone file for the operator
 
 The selected Breeze E2 pin lives at `~/.local/share/speech-out/breeze-tts-2-e2`, not under `~/.cache`.
 
-stream.fm writes only into the lab cache. It must not drop files next to
-the source or in Downloads merely because the operator auditioned a pass.
+The preprocess cache writes only into the lab cache. It must not drop files
+next to the source or in Downloads merely because the operator auditioned a
+pass.
 
 ## Production boundary
 
