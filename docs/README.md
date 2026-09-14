@@ -10,8 +10,8 @@
 | What is Speech Core allowed to be? | [`../CHARTER.md`](../CHARTER.md) |
 | What is implemented now? | [`current-state.md`](current-state.md) plus repository inspection |
 | Where are current component boundaries? | [`seams.md`](seams.md) |
-| What product architecture has been selected? | [`decisions/`](decisions/) |
-| What target and sequence are active? | [`evolution/ACTIVE.md`](evolution/ACTIVE.md) |
+| What product architecture has been selected? | [`decisions/`](decisions/) — several ADRs are **direction archive**, not live |
+| What 2026-07 target still sits on disk? | [`evolution/ACTIVE.md`](evolution/ACTIVE.md) — **superseded as live law**; qwentts is the mouth |
 | What work is authorized and who owns it? | the city `sc` work ledger |
 | What proves a completed claim? | linked commits, tests, traces, and review evidence when required by the work item |
 
@@ -22,9 +22,9 @@ blend values.
 
 ## Current implementation
 
-- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.** isolated CosyVoice3 RL playground: `~/workspace/cosyvoice_playground`.
+- [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.** live call is sibling voicecat, not `speech-out-live-session`.
 - [`qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md) — live cutover evidence.
-- [`qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md) — pcm-out streams; text-in is one-shot.
+- [`qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md) — pcm-out streams; leftover append is the voicecat hop.
 - [`seams.md`](seams.md) — current component contracts.
 - [`turn-detection.md`](turn-detection.md) — VAD, smart-turn, close policy, diagnostics, and tuning.
 - [`smart-turn-v3.md`](smart-turn-v3.md) — model artifact, preprocessing, runtime behavior, and verification.
@@ -32,18 +32,12 @@ blend values.
 
 ## Selected product architecture
 
-- [`decisions/`](decisions/) — selected Speech Core directions; acceptance is not implementation.
-- [`evolution/README.md`](evolution/README.md) — target-document semantics and reading order.
-- [`evolution/ACTIVE.md`](evolution/ACTIVE.md) — concise target, gap, and sequence.
-- numbered evolution documents — detailed Speech Core target contracts and gates.
+- [`decisions/`](decisions/) — selected Speech Core directions; acceptance is not implementation. ADR-001 still talks CosyVoice/Supertonic as 2026-07 qualification policy; live pin is qwentts (2026-08-18).
+- [`evolution/README.md`](evolution/README.md) — target-document semantics. treat the numbered files as archive until a speech-out spec change is opened.
+- [`evolution/ACTIVE.md`](evolution/ACTIVE.md) — 2026-07 delivery sequence. **not the live map.**
 
-## Evaluation and focused tracks
+## Parked tracks
 
-- [`golden-suite-spec.md`](golden-suite-spec.md) — golden capture, assertion, and release specification.
+- [`../lab/README.md`](../lab/README.md) — dual-Nemotron, CUPE/BFA, CosyVoice qual, talker-session, laptop-audio.
+- [`golden-suite-spec.md`](golden-suite-spec.md) — golden capture/assertion spec (synthetic; not the live mic).
 - [`../scripts/README-golden-assert.md`](../scripts/README-golden-assert.md) — assertion tool usage.
-- [`barge-in-dual-asr.md`](barge-in-dual-asr.md) — dual-Nemotron implementation track.
-- [`assistant-self-asr-eval.md`](assistant-self-asr-eval.md) — evaluation-only assistant self-ASR track.
-
-## Platform support
-
-- [`../laptop-audio/README.md`](../laptop-audio/README.md) — laptop audio hygiene, AEC, and denoising outside the core runtime.

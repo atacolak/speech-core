@@ -16,7 +16,7 @@ finalize).
   order, and what can a controller rely on?"
 - owners: TurnManager (turn.rs), ModelProgressMap (model.rs), DetectorWorker (mod.rs).
 - why bounded: charter invariants 1-2 and 9 are directly testable here; 69 unit tests in
-  daemon plus `tests/test-barge-in-dual-asr.sh` touch this seam.
+  daemon plus parked `lab/tests/test-barge-in-dual-asr.sh` (not the live path).
 - why now: this is the product's authoritative snapshot boundary; every future controller
   depends on its exact ordering.
 
@@ -64,15 +64,15 @@ presence/versioning, install/rollback path.
 - why deferred: inventory.md §3 records the transcribe.cpp finding as the key
   UNRESOLVED; a spec here needs a versioning decision first.
 
-## Scope F — dogfood loop (barge-in + greying + Talker) (proposed, NOT drafted)
+## Scope F — dogfood loop (barge-in + greying + Talker) (parked)
 
 `speech-out-live-session.sh` harness, barge cut (provisional wall-clock → CTC refine),
-TUI greying, `speech_talker_session.py`.
+TUI greying. `lab/scripts/speech_talker_session.py` is parked. live call is voicecat;
+live CTC is `scripts/barge_in_align/` + `ata-speech-align.service`.
 
 - operator question: "What is the current live loop's contract so barge-in work can be
   evaluated against a moving spec?"
-- why deferred: Python/bash harness, few deterministic tests, and ADR-002/003/004
-  (proposed) may change Talker routing assumptions underneath it.
+- why parked: the live loop moved to voicecat. greying TUI is diagnostic-only.
 
 ## Recommended order
 

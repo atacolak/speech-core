@@ -186,7 +186,7 @@ Divergences from the draft:
   crate). Counts churn; this figure is a 2026-08-04 snapshot.
 - Line references re-cited to current positions (draft's cites were ±2 lines).
 
-Suggested probes (from the draft, still valid): run
-`tests/test-barge-in-dual-asr.sh` for event-order confirmation; file-adapter
-replay for a known-close wav; noise-only session to exercise the empty-commit
-path (turn.5).
+Suggested probes (from the draft, still valid): daemon crate unit tests for
+turn policy; file-adapter replay for a known-close wav; noise-only session to
+exercise the empty-commit path (turn.5). `lab/tests/test-barge-in-dual-asr.sh`
+is a parked dual-ASR harness, not a live-path probe.

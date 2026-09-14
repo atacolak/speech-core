@@ -1,0 +1,266 @@
+{
+  "schema": "speech-core.qualification.sc-zxf.v1",
+  "bead": "sc-zxf",
+  "executed_utc": {
+    "start": "2026-08-17T10:41:13Z",
+    "end": "2026-08-17T10:56:22Z"
+  },
+  "prefer_cv2": false,
+  "verdict": "KEEP aa86b67",
+  "swap_recommended": false,
+  "rollback": "do nothing; live unit was never switched",
+  "prefer_cv2_rule": "prefer cv2 ONLY if isolated ttfa (pcm p50) meaningfully beats live cv3 trt (~282 ms) AND quality is not worse",
+  "prefer_cv2_reason": "isolated CV2 AutoModel first-real-PCM p50 1149.26 ms (fp32) / 1249.96 ms (fp16) vs live CV3 TRT historical 281.96 ms and now-stamp 283.79 ms; ~4x slower. quality proxies not a reason to swap.",
+  "clocks": {
+    "start": "first usable text INTO cosy (worker receive speak / tts_start_s)",
+    "not_start": ["omp process start", "model load", "harness spawn"],
+    "domains": {
+      "W": "time.perf_counter in isolated worker / live worker child",
+      "D": "daemon request_received → first ws binary/pcm; daemon_mono only; never subtract D-W"
+    },
+    "ids": {
+      "t0": "speak text handed to inference",
+      "token": "tokens_ready_s — first speech tokens ready (LLM)",
+      "acoustic": "token2wav_first_s — first flow+HiFT",
+      "pcm": "first REAL non-silent PCM rms>1e-4 f32; also first_any and worker first_pcm",
+      "live_D": "daemon request_received → first ws pcm frame"
+    }
+  },
+  "live_pin": {
+    "unit": "speech-out-daemon.service",
+    "description": "Speech Out CosyVoice3 TensorRT low-latency candidate (aa86b67)",
+    "candidate": "/home/sf/.local/share/discord-voice-agent/candidates/speech-out-cosy3-trt-aa86b67-20260812",
+    "main_pid": 4345,
+    "worker_pid": 4378,
+    "active_enter_timestamp": "Sun 2026-08-16 14:57:23 AEST",
+    "bind": "0.0.0.0:8788",
+    "model_dir": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/models/Fun-CosyVoice3-0.5B",
+    "model_id": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "code_commit": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+    "worker": "/home/sf/.local/share/discord-voice-agent/candidates/speech-out-cosy3-trt-aa86b67-20260812/worker/cosyvoice_progressive_worker.py",
+    "env_file": "/home/sf/.config/speech-core/speech-out.env",
+    "knobs": {
+      "SPEECH_OUT_COSYVOICE_LOAD_TRT": "1",
+      "SPEECH_OUT_COSYVOICE_FLOW_STEPS_OVERRIDE": "4",
+      "SPEECH_OUT_COSYVOICE_BASE_HOP_OVERRIDE": "5",
+      "SPEECH_OUT_COSYVOICE_POLL_SLEEP_S": "0.001",
+      "SPEECH_OUT_COSYVOICE_FP16": "0"
+    },
+    "reference_sha256": "c7b31d6dbe7cc6a716dded00550db5b50940bf209e424e4ad207b12e657c8ff6",
+    "reference_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+    "nvidia_smi_worker_mib": 4946,
+    "nvidia_smi_card": {
+      "used_mib": 5258,
+      "free_mib": 6596,
+      "total_mib": 12282
+    },
+    "still_aa86b67_after_run": true,
+    "pids_unchanged": true,
+    "active_enter_unchanged": true,
+    "env_unedited": true,
+    "candidate_unedited": true
+  },
+  "cv2_pin": {
+    "model_id": "FunAudioLLM/CosyVoice2-0.5B",
+    "model_revision": "eec1ae6c79877dbd9379285cf8789c9e0879293d",
+    "code_commit": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+    "matcha": "dd9105b34bf2be2230f4aa1e4769fb586a3c824e",
+    "pin_root": "/home/sf/.cache/speech-out/cosyvoice2-lane2-20260812",
+    "model_dir": "/home/sf/.cache/speech-out/cosyvoice2-lane2-20260812/models/CosyVoice2-0.5B",
+    "code_root": "/home/sf/.cache/speech-out/cosyvoice2-lane2-20260812/src/CosyVoice",
+    "download_status": "OK",
+    "python": "/home/sf/.cache/speech-out/cosyvoice-qual-sc-e71.4/venv/bin/python",
+    "torch": "2.3.1+cu121",
+    "reference_wav": "/home/sf/.cache/speech-out/cosyvoice2-lane2-20260812/src/CosyVoice/asset/zero_shot_prompt.wav",
+    "reference_sha256": "c7b31d6dbe7cc6a716dded00550db5b50940bf209e424e4ad207b12e657c8ff6",
+    "reference_text": "希望你以后能够做的比我还好呦。",
+    "hash_file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/pins/model-sha256.txt",
+    "hashes_reverified": true,
+    "hashes": {
+      "llm.pt": "b144ef55b51ce8cfb79a73c90dbba0bdaba4e451c0ebcfab20f769264f84a608",
+      "flow.pt": "ff4c2f867674411e0a08cee702996df13fa67c1cd864c06108da88d16d088541",
+      "hift.pt": "3386cc880324d4e98e05987b99107f49e40ed925b8ecc87c1f4939432d429879",
+      "speech_tokenizer_v2.onnx": "d43342aa12163a80bf07bffb94c9de2e120a8df2f9917cd2f642e7f4219c6f71",
+      "speech_tokenizer_v2.batch.onnx": "5b45a98572ed21e3a3ebf50201f3020567f7db40e9a57509b790b2982f5c07b7",
+      "flow.decoder.estimator.fp32.onnx": "cd54e4281701e6630730da64502d77b7e8b6e5c057cca65128bffb50f85cbf98",
+      "campplus.onnx": "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73",
+      "cosyvoice2.yaml": "0af2c0d010c477187c39f3e8fd5f1ae2e4e6f90ad03ba37c10ed6c6a87b05959",
+      "CosyVoice-BlankEN/model.safetensors": "130282af0dfa9fe5840737cc49a0d339d06075f83c5a315c3372c9a0740d0b96"
+    }
+  },
+  "historical_cv3_trt_n25": {
+    "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane1/results/trt_s4_h5_p1ms_n25.json",
+    "note": "cited; CV3 was not reloaded",
+    "n": 25,
+    "non_silent": 25,
+    "p50_real_pcm_ms": 281.96063195355237,
+    "p95_real_pcm_ms": 603.3914115745572,
+    "stage_p50": {
+      "tokens_ready_s": 0.17777583398856223,
+      "token2wav_first_s": 0.09981089795473963,
+      "token_hop_len": 5,
+      "token_count_at_first": 11
+    },
+    "cancel_file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane1/results/trt-cancel-survival.json",
+    "cancel_ack_ms": 161.0115299699828,
+    "frames_after_ack": 0,
+    "same_pid_survived": true
+  },
+  "live_8788_nowstamp": {
+    "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/live8788-nowstamp-n5.json",
+    "clock_domain": "daemon_process_clock_monotonic",
+    "n": 5,
+    "skip": 2,
+    "prompts_file": "/home/sf/workspace/speech-core/scripts/cosyvoice_qual/sc-zxf-prompts.txt",
+    "completed": 5,
+    "daemon_request_received_to_first_pcm_ms": {
+      "count": 5,
+      "min": 268.006698,
+      "max": 426.151447,
+      "mean": 306.2599014,
+      "p50": 283.794696,
+      "p95": 397.9652956
+    },
+    "worker_first_pcm_latency_ms": {
+      "count": 5,
+      "min": 267.94959,
+      "max": 426.101011,
+      "mean": 306.20461839999996,
+      "p50": 283.735924,
+      "p95": 397.9141864
+    },
+    "token_acoustic_on_ws": "not_on_daemon_ws",
+    "second_cv3_loaded": false
+  },
+  "isolated_cv2": {
+    "campaign_dir": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812",
+    "gpu_flock": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/gpu-run",
+    "campaign_lane": "cosy2",
+    "arm_a_fp32": {
+      "label": "sc-zxf_speaker_cache_fp32",
+      "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/speaker_cache_fp32_n20.json",
+      "n": 20,
+      "warmup": 2,
+      "fp16": false,
+      "host_opts": "ON",
+      "non_silent": 20,
+      "p50_real_pcm_ms": 1149.2593479997595,
+      "p95_real_pcm_ms": 1169.9146634440694,
+      "stage_p50": {
+        "tokens_ready_s": 0.6179630970000289,
+        "token2wav_first_s": 0.5208167585005867,
+        "token_hop_len": 25,
+        "token_count_at_first": 41
+      },
+      "rtf_host_over_audio_p50": 0.567913691004697,
+      "model_load_s": 14.312772627992672,
+      "warm_ready_s": 20.010523481003474,
+      "vram_after_load": {
+        "torch_allocated_mib": 2442.18701171875,
+        "torch_reserved_mib": 2642.0,
+        "torch_used_mib": 9124.8125,
+        "torch_free_mib": 2728.0625
+      },
+      "vram_after_prompt_cache": {
+        "torch_allocated_mib": 2442.24365234375,
+        "torch_reserved_mib": 2642.0,
+        "torch_used_mib": 9164.8125,
+        "torch_free_mib": 2688.0625
+      }
+    },
+    "arm_b_fp16": {
+      "label": "sc-zxf_speaker_cache_fp16",
+      "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/speaker_cache_fp16_n20.json",
+      "n": 20,
+      "warmup": 2,
+      "fp16": true,
+      "host_opts": "ON",
+      "non_silent": 20,
+      "p50_real_pcm_ms": 1249.9617005087202,
+      "p95_real_pcm_ms": 1270.4756411010749,
+      "stage_p50": {
+        "tokens_ready_s": 0.6814490745018702,
+        "token2wav_first_s": 0.5639812114968663,
+        "token_hop_len": 25,
+        "token_count_at_first": 41
+      },
+      "model_load_s": 16.21235758900002,
+      "warm_ready_s": 21.283846012986032,
+      "vram_after_prompt_cache": {
+        "torch_allocated_mib": 2442.24365234375,
+        "torch_reserved_mib": 2642.0,
+        "torch_used_mib": 9172.8125,
+        "torch_free_mib": 2680.0625
+      },
+      "note": "fp16 loaded without killing live; did not improve TTFA"
+    },
+    "old_n5_not_enough": {
+      "speaker_cache_p50_ms": 1347.5695529486984,
+      "stock_p50_ms": 2413.6303450213745,
+      "jit": "failed; no flow.encoder zip"
+    },
+    "cancel": {
+      "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/cv2-cancel-survival.json",
+      "helper": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/scripts/trt_cancel_survival.py",
+      "cancel_ack": true,
+      "cancel_to_ack_ms": 7.08134999149479,
+      "frames_after_ack": 0,
+      "same_pid_survived": true,
+      "post_cancel_completed": true,
+      "worker_pid": 3677845
+    }
+  },
+  "quality": {
+    "status": "measured_cpu_proxy",
+    "note": "CV2 is a latency hatch, not a quality upgrade. Official published scores prefer CV3. CPU whisper/campplus on same 10 prompts; no extra GPU.",
+    "official_readme": {
+      "cv2_test_en_wer": 2.57,
+      "cv2_test_en_ss": 65.9,
+      "cv3_test_en_wer": 2.24,
+      "cv3_test_en_ss": 71.8
+    },
+    "whisper": {
+      "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/quality10-whisper.json",
+      "model": "faster-whisper-base.en int8 cpu",
+      "cv3_trt_micro_wer": 0.3333333333333333,
+      "cv3_trt_exact": 4,
+      "cv2_fp32_micro_wer": 0.3181818181818182,
+      "cv2_fp32_exact": 3
+    },
+    "campplus": {
+      "file": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/quality10-campplus.json",
+      "cv3_prompt_cos_p50": 0.6902336319940374,
+      "cv2_prompt_cos_p50": 0.7175941397006391,
+      "cv3_cv2_cos_p50": 0.8384981719374751
+    },
+    "wavs_cv2": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf/audio/cv2-quality10-fp32",
+    "wavs_cv3_historical": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane1/audio/quality10-trt-s4-h5-p1ms"
+  },
+  "triton_trtllm_fp16": {
+    "served": false,
+    "compiled": false,
+    "status": "BLOCKED-COEXISTENCE",
+    "image": "soar97/triton-cosyvoice:25.06",
+    "image_id": "b8b6df1f4f4e",
+    "image_digest": "sha256:b8b6df1f4f4ef248ccb3639b8fc6af446b1e76bc8608f4aaf44e392cdc399a27",
+    "campaign": "/home/sf/.cache/speech-out/triton-campaign-20260812",
+    "cv2_llm": {
+      "path": "/home/sf/.cache/speech-out/triton-campaign-20260812/models/cosyvoice2_llm/model.safetensors",
+      "bytes": 1283621816,
+      "aria2": true,
+      "complete": false
+    },
+    "engines_present": false,
+    "prior_oom_risk": "HIGH even without live 5GB pin (stage-readiness.json)",
+    "would_be_vram": "live ~5.0 GiB + isolated AutoModel ~3.9 GiB left ~2.7 GiB free; triton+trtllm-serve will not fit beside live"
+  },
+  "artifacts": {
+    "md": "docs/qualification/cosyvoice2-sc-zxf.md",
+    "json": "docs/qualification/cosyvoice2-sc-zxf-report.json",
+    "reproduce": "scripts/cosyvoice_qual/reproduce-sc-zxf.sh",
+    "prompts": "scripts/cosyvoice_qual/sc-zxf-prompts.txt",
+    "live_probe": "scripts/cosyvoice_qual/live_8788_probe.py",
+    "results_dir": "/home/sf/.local/state/discord-voice-agent/latency-campaign-20260812/lane2/results/sc-zxf"
+  }
+}

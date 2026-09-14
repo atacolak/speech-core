@@ -1,0 +1,46 @@
+[
+  {
+    "id": "minute-detail",
+    "text": "I need a minute amount of extra context, not a sixty-minute meeting.",
+    "overrides": [
+      {
+        "span": "minute",
+        "context": "minute amount",
+        "intended_reading": "my-noot",
+        "source": "operator"
+      }
+    ]
+  },
+  {
+    "id": "proper-noun",
+    "text": "Ask Niru on voicecat before touching leftover qwentts.",
+    "overrides": [
+      {
+        "span": "Niru",
+        "intended_reading": "nee-roo",
+        "source": "operator"
+      },
+      {
+        "span": "qwentts",
+        "intended_reading": "qwen-tts",
+        "source": "operator"
+      }
+    ]
+  },
+  {
+    "id": "acronym",
+    "text": "TTFA is first audible PCM, not wall-clock gossip.",
+    "overrides": [
+      {
+        "span": "TTFA",
+        "intended_reading": "tee-tee-eff-ay",
+        "source": "operator"
+      },
+      {
+        "span": "PCM",
+        "intended_reading": "pee-see-em",
+        "source": "operator"
+      }
+    ]
+  }
+]
