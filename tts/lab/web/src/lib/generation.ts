@@ -15,7 +15,7 @@ export type GenerationState = {
 }
 
 export const DEFAULT_GENERATION: GenerationState = {
-  cfg: 4,
+  cfg: 1,
   seed: 42,
   temperature: 0.9,
   depthTemperature: 0.9,
