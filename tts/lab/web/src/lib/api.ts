@@ -224,6 +224,36 @@ export type GenerationBody = {
 
 export type VoiceGeneration = GenerationBody
 
+export type GenerateSegment = {
+  index: number
+  text: string
+  state: 'pending' | 'queued' | 'generating' | 'generated' | 'cancelled' | 'error'
+  duration_s: number | null
+  audio_url: string | null
+}
+
+export type GenerateJob = {
+  id: string
+  state: 'running' | 'complete' | 'cancelled' | 'error'
+  cursor: number
+  lookahead: number
+  blocked_on_live_call: boolean
+  run_id: string | null
+  output_artifact_id: string | null
+  error: string | null
+  segments: GenerateSegment[]
+}
+
+/** `/api/generate` takes the same body as `/api/synthesize`; only the response differs. */
+export type GenerateInput = {
+  text: string
+  steer?: string
+  synthesis_text?: string
+  voice_profile_id: string
+  reference_variant_id?: string
+  generation?: GenerationBody
+}
+
 export class ApiError extends Error {
   status: number
   code?: string
@@ -681,6 +711,52 @@ export async function synthesize(input: {
     throw await readError(response, 'synthesize')
   }
   return (await response.json()) as Take
+}
+
+/** Progressive generate: one job, many segments, playable as they land. */
+export async function startGenerate(input: GenerateInput): Promise<GenerateJob> {
+  const response = await apiFetch('/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'generate')
+  }
+  return (await response.json()) as GenerateJob
+}
+
+export async function fetchGenerateJob(jobId: string): Promise<GenerateJob> {
+  const response = await apiFetch(`/api/generate/${jobId}`)
+  if (!response.ok) {
+    throw await readError(response, 'generate status')
+  }
+  return (await response.json()) as GenerateJob
+}
+
+/** The highest contiguously completed segment; a lost report only throttles generation. */
+export async function reportGenerateCursor(jobId: string, index: number): Promise<GenerateJob> {
+  const response = await apiFetch(`/api/generate/${jobId}/cursor`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index }),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'generate cursor')
+  }
+  return (await response.json()) as GenerateJob
+}
+
+export async function cancelGenerate(jobId: string): Promise<GenerateJob> {
+  const response = await apiFetch(`/api/generate/${jobId}/cancel`, { method: 'POST' })
+  if (!response.ok) {
+    throw await readError(response, 'generate cancel')
+  }
+  return (await response.json()) as GenerateJob
+}
+
+export function generateSegmentAudioUrl(jobId: string, index: number): string {
+  return apiUrl(`/api/generate/${jobId}/segments/${index}/audio`)
 }
 
 export function formatBytes(value?: number | null): string {
