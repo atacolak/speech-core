@@ -73,6 +73,31 @@ class SynthesisApi(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.content[:4], b"RIFF")
 
+    def test_synthesis_run_records_the_generation_snapshot(self) -> None:
+        wav = _wav(self.root / "record-ref.wav")
+        with wav.open("rb") as handle:
+            voice = self.client.post(
+                "/api/voices",
+                data={"name": "record", "transcript": "fixture"},
+                files={"audio": ("ref.wav", handle, "audio/wav")},
+            ).json()
+        sent = {"guidance": {"mode": "single", "cfg": 3.0}, "seed": 7}
+        response = self.client.post(
+            "/api/synthesize",
+            json={
+                "text": "the same one-shot contract remains",
+                "steer": "calm",
+                "voice_profile_id": voice["id"],
+                "generation": sent,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        run = self.client.get(f"/api/runs/{response.json()['id']}").json()
+        self.assertEqual(run["request_snapshot"]["generation"], sent)
+        refreshed = self.client.get("/api/voices").json()["items"]
+        stored = next(item for item in refreshed if item["id"] == voice["id"])
+        self.assertEqual(stored["generation"], sent)
+
 
 if __name__ == "__main__":
     unittest.main()

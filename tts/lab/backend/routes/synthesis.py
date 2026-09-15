@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -103,31 +104,17 @@ def _fill_ref_text(store: Any, voice: dict[str, Any], reference_path: Path) -> s
     return text
 
 
-@router.post("/api/synthesize")
-def synthesize(request: Request, body: SynthesisBody) -> dict[str, Any]:
-    state = request.app.state.lab
-    if state.engine is None:
-        runtime_state = state.runtime.status().state
-        if runtime_state in {"unloaded", "insufficient_vram", "error"}:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "runtime_unloaded", "runtime": "e2", "state": runtime_state},
-            )
-        if runtime_state in {"loading", "unloading"}:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "runtime_busy", "runtime": "e2", "state": runtime_state},
-            )
-        remaining = float(getattr(state.runtime, "live_call_remaining_s", lambda: 0.0)())
-        if remaining > 0:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "live_call_active",
-                    "message": "live call owns the engine",
-                    "remaining_s": remaining,
-                },
-            )
+@dataclass(frozen=True)
+class ResolvedSynthesis:
+    voice: dict[str, Any]
+    artifact: Any
+    reference_path: Path
+    reference_text: str
+    settings: GenerationSettings
+
+
+def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthesis:
+    """Resolve the voice, reference audio/transcript, and settings for one request."""
     voice = get_voice_or_404(state.store, body.voice_profile_id)
     from tts.lab.backend.models import Interval
     from tts.lab.backend.services.references import (
@@ -156,67 +143,25 @@ def synthesize(request: Request, body: SynthesisBody) -> dict[str, Any]:
         reference_path = dest
     settings = _settings_from_generation(body.generation)
     reference_text = _fill_ref_text(state.store, voice, Path(reference_path))
-    try:
-        if state.engine is not None:
-            result = synthesize_e2(
-                SynthesisRequest(
-                    text=body.text,
-                    steer=body.steer,
-                    synthesis_text=body.synthesis_text,
-                    voice_profile_id=body.voice_profile_id,
-                    reference_audio=reference_path,
-                    reference_text=reference_text,
-                    generation=settings,
-                ),
-                engine=state.engine,
-            )
-        else:
-            payload = state.runtime.synthesize(
-                {
-                    "text": body.text,
-                    "steer": body.steer,
-                    "synthesis_text": body.synthesis_text,
-                    "voice_profile_id": body.voice_profile_id,
-                    "reference_audio": str(reference_path),
-                    "reference_text": reference_text,
-                    "generation": settings.to_dict(),
-                }
-            )
-            result = SimpleNamespace(
-                wav_path=Path(payload["wav_path"]),
-                duration_s=float(payload["duration_s"]),
-                wall_s=float(payload["wall_s"]),
-                first_audio_s=payload.get("first_audio_s"),
-            )
-    except RuntimeUnloaded as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "runtime_unloaded", "runtime": "e2", "state": exc.state},
-        ) from exc
-    except RuntimeBusy as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "runtime_busy", "runtime": "e2", "state": exc.state},
-        ) from exc
-    except LiveCallActive as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "live_call_active",
-                "message": "live call owns the engine",
-                "remaining_s": exc.remaining_s,
-            },
-        ) from exc
-    except RuntimeError as exc:
-        message = str(exc)
-        missing = "missing template fields" in message or "ref_text" in message
-        raise HTTPException(
-            status_code=422 if missing else 500,
-            detail={
-                "code": "missing_ref_text" if missing else "synthesize_failed",
-                "message": message,
-            },
-        ) from exc
+    return ResolvedSynthesis(
+        voice=voice,
+        artifact=artifact,
+        reference_path=reference_path,
+        reference_text=reference_text,
+        settings=settings,
+    )
+
+
+def record_synthesis_run(
+    state: Any,
+    body: SynthesisBody,
+    resolved: ResolvedSynthesis,
+    result: Any,
+) -> dict[str, Any]:
+    """Persist the produced audio as a run and return the route response."""
+    voice = resolved.voice
+    artifact = resolved.artifact
+    settings = resolved.settings
     output = state.store.import_audio(result.wav_path)
     run_id = new_id("run")
     state.store.pin(output.id, reason=f"run:{run_id}")
@@ -280,3 +225,93 @@ def synthesize(request: Request, body: SynthesisBody) -> dict[str, Any]:
         "request_snapshot": snapshot,
         "wav_path": str(output.path),
     }
+
+
+@router.post("/api/synthesize")
+def synthesize(request: Request, body: SynthesisBody) -> dict[str, Any]:
+    state = request.app.state.lab
+    if state.engine is None:
+        runtime_state = state.runtime.status().state
+        if runtime_state in {"unloaded", "insufficient_vram", "error"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "runtime_unloaded", "runtime": "e2", "state": runtime_state},
+            )
+        if runtime_state in {"loading", "unloading"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "runtime_busy", "runtime": "e2", "state": runtime_state},
+            )
+        remaining = float(getattr(state.runtime, "live_call_remaining_s", lambda: 0.0)())
+        if remaining > 0:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "live_call_active",
+                    "message": "live call owns the engine",
+                    "remaining_s": remaining,
+                },
+            )
+    resolved = resolve_synthesis_request(state, body)
+    try:
+        if state.engine is not None:
+            result = synthesize_e2(
+                SynthesisRequest(
+                    text=body.text,
+                    steer=body.steer,
+                    synthesis_text=body.synthesis_text,
+                    voice_profile_id=body.voice_profile_id,
+                    reference_audio=resolved.reference_path,
+                    reference_text=resolved.reference_text,
+                    generation=resolved.settings,
+                ),
+                engine=state.engine,
+            )
+        else:
+            payload = state.runtime.synthesize(
+                {
+                    "text": body.text,
+                    "steer": body.steer,
+                    "synthesis_text": body.synthesis_text,
+                    "voice_profile_id": body.voice_profile_id,
+                    "reference_audio": str(resolved.reference_path),
+                    "reference_text": resolved.reference_text,
+                    "generation": resolved.settings.to_dict(),
+                }
+            )
+            result = SimpleNamespace(
+                wav_path=Path(payload["wav_path"]),
+                duration_s=float(payload["duration_s"]),
+                wall_s=float(payload["wall_s"]),
+                first_audio_s=payload.get("first_audio_s"),
+            )
+    except RuntimeUnloaded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "runtime_unloaded", "runtime": "e2", "state": exc.state},
+        ) from exc
+    except RuntimeBusy as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "runtime_busy", "runtime": "e2", "state": exc.state},
+        ) from exc
+    except LiveCallActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "live_call_active",
+                "message": "live call owns the engine",
+                "remaining_s": exc.remaining_s,
+            },
+        ) from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        missing = "missing template fields" in message or "ref_text" in message
+        raise HTTPException(
+            status_code=422 if missing else 500,
+            detail={
+                "code": "missing_ref_text" if missing else "synthesize_failed",
+                "message": message,
+            },
+        ) from exc
+    return record_synthesis_run(state, body, resolved, result)
