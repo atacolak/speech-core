@@ -106,21 +106,25 @@ describe('TTS lab shell', () => {
     vi.unstubAllGlobals()
   })
 
-  it('renders the voice picker, composition, and settings', async () => {
+  it('opens on GENERATE with the voice picker and composition, settings on demand', async () => {
     renderApp()
     expect(screen.getByRole('banner')).toHaveTextContent('TTS lab')
+    expect(screen.getByRole('button', { name: 'GENERATE' })).toHaveAttribute('aria-current', 'page')
     expect(screen.getByRole('heading', { name: 'Voices' })).toBeInTheDocument()
     expect(screen.getByText(/^Say$/i)).toBeInTheDocument()
     expect(screen.getByText(/^Delivery$/i)).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Takes' })).toBeInTheDocument()
     expect(await screen.findByText(/No voices yet/i)).toBeInTheDocument()
     expect(screen.getAllByText(/No takes yet/i).length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Generate' })).toBeEnabled()
     expect(screen.getByRole('button', { name: '+ Import voice' })).toBeInTheDocument()
+    // Settings is a drawer, not a permanently allocated panel.
+    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull()
+    expect(screen.queryByText(/cfg_scale/i)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(await screen.findByRole('heading', { name: 'Settings' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Takes' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Save transcript' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Use selection' })).not.toBeInTheDocument()
-    expect(screen.queryByText(/cfg_scale/i)).not.toBeInTheDocument()
   })
 
   it('auto-selects the George Hotz sample as the dogfood voice', async () => {

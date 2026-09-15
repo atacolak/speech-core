@@ -266,7 +266,7 @@ function renderWorkbench() {
 }
 
 function renderShell() {
-  useWorkspace.setState({ selectedVoiceId: 'vp1', editorOpen: true })
+  useWorkspace.setState({ mode: 'voice-lab', selectedVoiceId: 'vp1', editorOpen: true })
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>

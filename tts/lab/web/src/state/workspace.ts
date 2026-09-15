@@ -1,26 +1,28 @@
 import { create } from 'zustand'
 import { DEFAULT_GENERATION, type GenerationState } from '@/lib/generation'
 
-export const PANE_IDS = ['voices', 'synthesis', 'inspector'] as const
-export type PaneId = (typeof PANE_IDS)[number]
-/** The lab has two benches; the top nav is the only way between them. */
-export type BenchId = 'voices' | 'sources'
+/** Two modes; the top nav is the only way between them. */
+export type ModeId = 'generate' | 'voice-lab'
 export type { GenerationState }
 
 type WorkspaceState = {
-  panes: readonly PaneId[]
-  bench: BenchId
+  mode: ModeId
   selectedVoiceId: string | null
+  /** Set while the lab is showing material; picking a voice clears it and vice versa. */
+  selectedMaterialId: string | null
   selectedRunId: string | null
   editorOpen: boolean
+  settingsOpen: boolean
   text: string
   steer: string
   generation: GenerationState
-  selectBench: (bench: BenchId) => void
+  selectMode: (mode: ModeId) => void
   selectVoice: (id: string | null) => void
+  selectMaterial: (id: string | null) => void
   selectRun: (id: string | null) => void
   openEditor: () => void
   closeEditor: () => void
+  toggleSettings: () => void
   setText: (text: string) => void
   setSteer: (steer: string) => void
   patchGeneration: (patch: Partial<GenerationState>) => void
@@ -28,19 +30,23 @@ type WorkspaceState = {
 }
 
 export const useWorkspace = create<WorkspaceState>((set) => ({
-  panes: PANE_IDS,
-  bench: 'voices',
+  mode: 'generate',
   selectedVoiceId: null,
+  selectedMaterialId: null,
   selectedRunId: null,
   editorOpen: false,
+  settingsOpen: false,
   text: "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
   steer: 'fast, dry, technically confident, faintly amused.',
   generation: { ...DEFAULT_GENERATION },
-  selectBench: (bench) => set({ bench }),
-  selectVoice: (id) => set({ selectedVoiceId: id, selectedRunId: null }),
+  selectMode: (mode) => set({ mode }),
+  selectVoice: (id) => set({ selectedVoiceId: id, selectedMaterialId: null, selectedRunId: null }),
+  selectMaterial: (id) => set({ selectedMaterialId: id }),
   selectRun: (id) => set({ selectedRunId: id }),
-  openEditor: () => set({ editorOpen: true }),
+  // The workbench is a lab surface: opening it from the generate rail moves to the lab.
+  openEditor: () => set({ editorOpen: true, mode: 'voice-lab' }),
   closeEditor: () => set({ editorOpen: false }),
+  toggleSettings: () => set((state) => ({ settingsOpen: !state.settingsOpen })),
   setText: (text) => set({ text }),
   setSteer: (steer) => set({ steer }),
   patchGeneration: (patch) =>

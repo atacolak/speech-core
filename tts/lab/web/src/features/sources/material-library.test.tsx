@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Toaster } from 'sonner'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { MaterialLibrary } from '@/features/sources/material-library'
 import type { MediaSource } from '@/features/sources/sources-api'
-import { SourcesView } from '@/features/sources/sources-view'
+import { useWorkspace } from '@/state/workspace'
 
 type Call = { method: string; url: string; body: unknown }
 
@@ -73,45 +74,56 @@ function stubLab(items: MediaSource[], status = 201) {
   return calls
 }
 
-function renderView() {
+function renderLibrary() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
-      <SourcesView />
+      <MaterialLibrary />
       <Toaster />
     </QueryClientProvider>,
   )
 }
 
-describe('sources view', () => {
+describe('material library', () => {
+  beforeEach(() => {
+    useWorkspace.setState({ selectedVoiceId: null, selectedMaterialId: null })
+  })
+
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('says so when there are no sources yet', async () => {
+  it('says so when there is no material yet', async () => {
     stubLab([])
-    renderView()
-    expect(await screen.findByText(/No sources yet/i)).toBeInTheDocument()
+    renderLibrary()
+    expect(await screen.findByText(/No material yet/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'ANALYZE whole' })).toBeNull()
   })
 
-  it('lists sources by title and picks one for the bench', async () => {
+  it('lists material by title and hands the pick to the lab', async () => {
     stubLab([WESTWORLD, INTERVIEW])
-    renderView()
+    renderLibrary()
     const westworld = await screen.findByRole('button', { name: /Westworld S01E01/ })
     expect(screen.getByRole('button', { name: /interview\.wav/ })).toBeInTheDocument()
     expect(screen.getAllByText(/not analyzed/).length).toBe(2)
-    expect(screen.queryByLabelText('waveform')).toBeNull()
+    expect(useWorkspace.getState().selectedMaterialId).toBeNull()
 
     fireEvent.click(westworld)
 
-    expect(await screen.findByLabelText('waveform')).toBeInTheDocument()
-    expect(screen.getByLabelText('analyzed coverage')).toHaveAttribute('data-coverage', '0')
-    expect(screen.getByRole('button', { name: 'ANALYZE whole' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'ANALYZE selection' })).toBeDisabled()
+    expect(useWorkspace.getState().selectedMaterialId).toBe('src_ww')
+    expect(westworld).toHaveAttribute('aria-current', 'true')
+
+    fireEvent.click(screen.getByRole('button', { name: /interview\.wav/ }))
+
+    expect(useWorkspace.getState().selectedMaterialId).toBe('src_interview')
+    expect(screen.getByRole('button', { name: /interview\.wav/ })).toHaveAttribute(
+      'aria-current',
+      'true',
+    )
+    expect(westworld).not.toHaveAttribute('aria-current')
   })
 
-  it('counts the analyzed speakers and clips of a source in the list', async () => {
+  it('counts the analyzed speakers and clips of a material in the list', async () => {
     stubLab([
       source({
         coverage: [{ start_s: 0, end_s: 5 }],
@@ -127,9 +139,7 @@ describe('sources view', () => {
             created_at: '2026-09-14T00:00:00Z',
           },
         ],
-        speakers: [
-          { local_id: 'S1', label: 'Speaker 1', duration_s: 5, mapped_voice_id: null },
-        ],
+        speakers: [{ local_id: 'S1', label: 'Speaker 1', duration_s: 5, mapped_voice_id: null }],
         clips: [
           {
             id: 'clip_1',
@@ -145,13 +155,13 @@ describe('sources view', () => {
         ],
       }),
     ])
-    renderView()
+    renderLibrary()
     expect(await screen.findByText(/1 speaker\(s\) · 1 clip\(s\)/)).toBeInTheDocument()
   })
 
   it('submits a URL source without transcribing anything', async () => {
     const calls = stubLab([], 501)
-    renderView()
+    renderLibrary()
     const url = await screen.findByLabelText('Source URL')
     fireEvent.change(url, { target: { value: 'https://www.youtube.com/watch?v=fixture' } })
     fireEvent.click(screen.getByRole('button', { name: '+ Add source' }))
@@ -169,7 +179,7 @@ describe('sources view', () => {
 
   it('offers a local file without a URL', async () => {
     const calls = stubLab([])
-    renderView()
+    renderLibrary()
     const file = await screen.findByLabelText('Source file')
     const take = new File(['riff'], 'take.wav', { type: 'audio/wav' })
     fireEvent.change(file, { target: { files: [take] } })
