@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Any, Protocol
@@ -30,6 +30,10 @@ _cancel = threading.Event()
 
 class WorkerChannelDirty(RuntimeError):
     """Stdout still holds a previous command's events; respawn before the next RPC."""
+
+
+class StreamCancelled(RuntimeError):
+    """A cooperative cancel predicate aborted an in-flight pcm_chunk stream."""
 
 
 def _on_usr1(_signum: int, _frame: Any) -> None:
@@ -299,6 +303,7 @@ class WorkerHandle(Protocol):
         payload: dict[str, Any],
         timeout: float,
         on_progress: Any | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Iterator[bytes]: ...
     def is_alive(self) -> bool: ...
     def terminate(self, timeout: float = 2.0) -> None: ...
@@ -419,6 +424,7 @@ class SubprocessWorker:
         payload: dict[str, Any],
         timeout: float,
         on_progress: Any | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Iterator[bytes]:
         proc = self._require_proc()
         deadline = time.monotonic() + timeout
@@ -430,6 +436,11 @@ class SubprocessWorker:
                     proc.stdout, timeout, on_progress=on_progress, request_id=request_id
                 ):
                     if decoded.get("event") == "pcm_chunk":
+                        if should_cancel is not None and should_cancel():
+                            self._signal_cancel()
+                            remaining = max(0.5, min(8.0, deadline - time.monotonic()))
+                            self._drain_or_dirty(proc.stdout, remaining, request_id)
+                            raise StreamCancelled("synthesize cancelled")
                         pcm = base64.b64decode(decoded.get("pcm_b64") or "")
                         if pcm:
                             yield pcm
@@ -442,6 +453,8 @@ class SubprocessWorker:
                 self._drain_or_dirty(proc.stdout, remaining, request_id)
                 raise
             except WorkerChannelDirty:
+                raise
+            except StreamCancelled:
                 raise
             except Exception as exc:
                 remaining = max(0.5, deadline - time.monotonic())
@@ -605,6 +618,7 @@ class FakeWorkerHandle:
         payload: dict[str, Any],
         timeout: float,
         on_progress: Any | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Iterator[bytes]:
         reply = self.rpc(payload, timeout, on_progress=on_progress)
         if not reply.get("ok"):
@@ -618,14 +632,23 @@ class FakeWorkerHandle:
         tail = pcm[len(head) :]
         self.cancel_requested = False
         try:
+            self._check_cancel(should_cancel)
             yield head
             if self.stream_delay_s > 0:
                 time.sleep(self.stream_delay_s)
+            self._check_cancel(should_cancel)
             if tail:
                 yield tail
         except GeneratorExit:
             self.cancel_requested = True
             raise
+
+    def _check_cancel(self, should_cancel: Callable[[], bool] | None) -> None:
+        """Mirror the subprocess reader: cancel before delivering the next chunk."""
+        if should_cancel is None or not should_cancel():
+            return
+        self.cancel_requested = True
+        raise StreamCancelled("synthesize cancelled")
 
     def is_alive(self) -> bool:
         return self._alive

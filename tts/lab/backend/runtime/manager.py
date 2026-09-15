@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -481,7 +482,11 @@ class E2RuntimeManager:
             with self._lock:
                 self._synth_inflight = max(0, self._synth_inflight - 1)
 
-    def synthesize_stream(self, request: dict[str, Any]) -> Any:
+    def synthesize_stream(
+        self,
+        request: dict[str, Any],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> Any:
         """Yield s16le PCM as the worker emits chunks. Occupies until the last chunk."""
         with self._lock:
             worker = self._claim_ready_worker()
@@ -495,13 +500,17 @@ class E2RuntimeManager:
                     payload["output_path"] = str(dest)
                 cmd = {"cmd": "synthesize", "request": payload}
                 try:
-                    yield from current.iter_synthesize(cmd, timeout=self.synth_timeout_s)
+                    yield from current.iter_synthesize(
+                        cmd, timeout=self.synth_timeout_s, should_cancel=should_cancel
+                    )
                     return
                 except WorkerChannelDirty:
                     with self._lock:
                         held = self._worker if self._worker is not None else current
                         current = self._reload_dirty_worker(held)
-                    yield from current.iter_synthesize(cmd, timeout=self.synth_timeout_s)
+                    yield from current.iter_synthesize(
+                        cmd, timeout=self.synth_timeout_s, should_cancel=should_cancel
+                    )
             finally:
                 with self._lock:
                     self._synth_inflight = max(0, self._synth_inflight - 1)

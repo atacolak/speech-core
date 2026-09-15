@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ from tts.lab.backend.runtime.auk import AukRuntimeManager
 from tts.lab.backend.runtime.leftover import NoopLeftover
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.runtime.processors import ProcessorLease
+from tts.lab.backend.services.progressive import ProgressiveJobs
 from tts.lab.backend.store.artifacts import ArtifactStore
 from tts.paths import lab_root
 
@@ -23,6 +24,7 @@ class LabState:
     auk: AukRuntimeManager
     engine: Any | None = None
     leftover_parked: bool = False
+    progressive: ProgressiveJobs = field(default_factory=ProgressiveJobs)
 
 
 def create_state(
