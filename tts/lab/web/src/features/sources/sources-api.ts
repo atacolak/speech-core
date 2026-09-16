@@ -51,6 +51,10 @@ export type SourceClip = {
   created_at: string
   source_title?: string
   source_kind?: MediaSourceKind
+  /** Set when the mapped extraction enrolled a voice source; null when clip-only. */
+  voice_source_id?: string | null
+  /** The lineage root `voice_artifact(kind="original")` the enrolment created. */
+  voice_artifact_id?: string | null
 }
 
 export type MediaSource = {
@@ -119,6 +123,40 @@ export async function addSourceUrl(url: string): Promise<MediaSource> {
   const form = new FormData()
   form.append('url', url)
   return (await sourceRequest('/api/sources', { method: 'POST', body: form })) as MediaSource
+}
+
+/**
+ * Register one already-retained take as material. The source points at the
+ * run's existing audio artifact — no binary copy, no run-history import — and
+ * nothing is enrolled onto a voice.
+ */
+export async function addSourceArtifact(input: {
+  artifactId: string
+  runId: string
+  title: string
+}): Promise<MediaSource> {
+  return (await sourceRequest('/api/sources/from-artifact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      artifact_id: input.artifactId,
+      run_id: input.runId,
+      title: input.title,
+    }),
+  })) as MediaSource
+}
+
+/** Speaker ids stay source-local until the operator maps one onto a voice. */
+export async function mapSourceSpeaker(
+  sourceId: string,
+  localId: string,
+  voiceId: string | null,
+): Promise<MediaSource> {
+  return sourceRequest(`/api/sources/${sourceId}/speakers/${localId}/map`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voice_id: voiceId }),
+  }) as Promise<MediaSource>
 }
 
 export async function analyzeSource(

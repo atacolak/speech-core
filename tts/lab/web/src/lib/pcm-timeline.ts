@@ -76,7 +76,19 @@ export class PcmTimeline {
 
   /** Downsample to `buckets` min/max pairs for the waveform. */
   peaks(buckets: number): Peak[] {
-    const count = Math.min(Math.max(Math.floor(buckets), 0), this.samples)
+    return this.peaksRange(0, this.durationS, buckets)
+  }
+
+  /**
+   * Downsample only `[startS, stopS)` — the visible window, not the whole take.
+   *
+   * Seconds are clamped into the stored samples first, so a window over a
+   * growing take costs the range it shows and never the audio behind it.
+   */
+  peaksRange(startS: number, stopS: number, buckets: number): Peak[] {
+    const from = this.sampleIndex(startS)
+    const to = this.sampleIndex(stopS)
+    const count = Math.min(Math.max(Math.floor(buckets), 0), to - from)
     if (count === 0) {
       return []
     }
@@ -84,8 +96,8 @@ export class PcmTimeline {
     let chunk = 0
     let chunkStart = 0
     for (let bucket = 0; bucket < count; bucket += 1) {
-      const start = Math.floor((bucket * this.samples) / count)
-      const stop = Math.floor(((bucket + 1) * this.samples) / count)
+      const start = from + Math.floor((bucket * (to - from)) / count)
+      const stop = from + Math.floor(((bucket + 1) * (to - from)) / count)
       let min = Infinity
       let max = -Infinity
       for (let index = start; index < stop; index += 1) {
@@ -104,6 +116,15 @@ export class PcmTimeline {
       peaks.push({ min, max })
     }
     return peaks
+  }
+
+  /** Nearest stored sample for a wall-clock second, clamped to the decoded audio. */
+  private sampleIndex(seconds: number): number {
+    const index = Math.round(seconds * this.sampleRate)
+    if (!Number.isFinite(index) || index <= 0) {
+      return 0
+    }
+    return Math.min(index, this.samples)
   }
 }
 

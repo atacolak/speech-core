@@ -84,6 +84,8 @@ export type VoiceSource = {
   label: string
   artifact_id: string
   transcript?: string | null
+  /** A manual edit locks this source's transcript; transcription never overwrites it. */
+  transcript_locked?: boolean
   duration_s?: number | null
   keep_intervals?: Interval[]
 }
@@ -173,9 +175,18 @@ export type Voice = {
   /** The voice's most recent ordinary take; survives navigation and restart. */
   latest_take_id: string | null
   take_limit?: number
+  /** How many enrolled `voice_sources` this voice may hold. */
+  source_limit?: number
   created_at: string
   updated_at: string
   transcribe?: { text: string; wall_s: number }
+}
+
+/** CPU Parakeet word timing cached on a settled run. Breeze itself supplies none. */
+export type RunAlignment = {
+  status: 'pending' | 'ready' | 'unavailable'
+  text?: string
+  words?: Array<{ text: string; start_s: number; end_s: number }>
 }
 
 export type RunItem = {
@@ -185,6 +196,11 @@ export type RunItem = {
     text?: string
     steer?: string
     synthesis_text?: string
+    /** The exact prefix that became audio; absent on old one-shot runs. */
+    produced_text?: string
+    segments_planned?: number
+    segments_completed?: number
+    stopped?: boolean
     generation?: Record<string, unknown>
     voice_profile_id?: string
   }
@@ -195,6 +211,8 @@ export type RunItem = {
   rating: string | null
   tags: string[]
   created_at?: string
+  /** `null` on runs recorded before alignment existed, or when none is cached. */
+  alignment?: RunAlignment | null
 }
 
 export type Take = {
@@ -333,12 +351,17 @@ const REFERENCE_WORDS: Record<string, string> = {
   resemble: 'denoised',
 }
 
+/** The neutral word for a reference kind; the one vocabulary every surface uses. */
+export function referenceWord(kind: string): string {
+  return REFERENCE_WORDS[kind] ?? kind
+}
+
 export function activeReferenceLabel(voice: Voice | undefined): string {
   const variant = voice?.active_variant
   if (!variant || variant.kind === 'original') {
     return 'original'
   }
-  const word = REFERENCE_WORDS[variant.kind] ?? variant.kind
+  const word = referenceWord(variant.kind)
   return variant.stale ? `${word} (stale)` : word
 }
 
@@ -451,6 +474,7 @@ export async function patchVoice(
     notes?: string
     generation?: GenerationBody | null
     take_limit?: number
+    source_limit?: number
   },
 ): Promise<Voice> {
   const response = await apiFetch(`/api/voices/${voiceId}`, {
@@ -481,6 +505,17 @@ export async function transcribeVoice(voiceId: string): Promise<Voice> {
 
 export async function denoiseVoice(voiceId: string): Promise<Voice> {
   const response = await apiFetch(`/api/voices/${voiceId}/reference/denoise`, { method: 'POST' })
+  if (!response.ok) {
+    throw await readError(response, 'voices')
+  }
+  return (await response.json()) as Voice
+}
+
+/** Resemble cleanup of ONE enrolled source; the legacy route only cleans the primary. */
+export async function denoiseVoiceSource(voiceId: string, sourceId: string): Promise<Voice> {
+  const response = await apiFetch(`/api/voices/${voiceId}/sources/${sourceId}/denoise`, {
+    method: 'POST',
+  })
   if (!response.ok) {
     throw await readError(response, 'voices')
   }
@@ -544,6 +579,51 @@ export async function activateVariant(voiceId: string, variantId: string): Promi
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ variant_id: variantId }),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'voices')
+  }
+  return (await response.json()) as Voice
+}
+
+/** A manual transcript edit on one enrolled source locks that source alone. */
+export async function patchVoiceSource(
+  voiceId: string,
+  sourceId: string,
+  patch: { transcript?: string; label?: string },
+): Promise<Voice> {
+  const response = await apiFetch(`/api/voices/${voiceId}/sources/${sourceId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'voices')
+  }
+  return (await response.json()) as Voice
+}
+
+/** Cropping a source materializes a lineage child; the source's own audio is untouched. */
+export async function cropVoiceSource(
+  voiceId: string,
+  sourceId: string,
+  request: { intervals: Interval[]; name: string },
+): Promise<Voice> {
+  const response = await apiFetch(`/api/voices/${voiceId}/sources/${sourceId}/crop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'voices')
+  }
+  return (await response.json()) as Voice
+}
+
+/** Promote one lineage child to the reference; siblings are never deleted. */
+export async function approveVoiceArtifact(voiceId: string, artifactId: string): Promise<Voice> {
+  const response = await apiFetch(`/api/voices/${voiceId}/artifacts/${artifactId}/approve`, {
+    method: 'POST',
   })
   if (!response.ok) {
     throw await readError(response, 'voices')

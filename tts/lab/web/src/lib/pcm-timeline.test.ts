@@ -6,6 +6,19 @@ function pcm(...samples: number[]): ArrayBuffer {
   return values.buffer.slice(0)
 }
 
+/**
+ * Sixteen non-uniform samples at 8 Hz, so a two second take has one distinct
+ * value per sample and a range scan cannot be confused with a slice of the
+ * whole-take buckets.
+ */
+function growing(): PcmTimeline {
+  const timeline = new PcmTimeline(8)
+  timeline.appendS16(
+    pcm(-32768, -16384, -8192, -4096, -2048, -1024, -512, -256, 0, 256, 512, 1024, 2048, 4096, 8192, 16384),
+  )
+  return timeline
+}
+
 type WavOptions = {
   format?: number
   channels?: number
@@ -84,6 +97,39 @@ describe('PcmTimeline', () => {
     const copy = timeline.toFloat32()
     copy[0] = 0
     expect(timeline.toFloat32()[0]).toBeCloseTo(1000 / 32768)
+  })
+
+  it('scans only the requested range for peaks', () => {
+    const timeline = growing()
+    expect(timeline.durationS).toBe(2)
+    expect(timeline.peaksRange(0.5, 1.5, 4)).toEqual([
+      { min: -2048 / 32768, max: -1024 / 32768 },
+      { min: -512 / 32768, max: -256 / 32768 },
+      { min: 0, max: 256 / 32768 },
+      { min: 512 / 32768, max: 1024 / 32768 },
+    ])
+  })
+
+  it('clamps a range past the end and collapses an empty one', () => {
+    const timeline = growing()
+    expect(timeline.peaksRange(1.5, 99, 2)).toEqual([
+      { min: 2048 / 32768, max: 4096 / 32768 },
+      { min: 8192 / 32768, max: 16384 / 32768 },
+    ])
+    expect(timeline.peaksRange(4, 9, 3)).toEqual([])
+    expect(timeline.peaksRange(0, 0, 3)).toEqual([])
+    expect(timeline.peaksRange(0.5, 1.5, 0)).toEqual([])
+  })
+
+  it('delegates the whole take to the range scan', () => {
+    const timeline = growing()
+    expect(timeline.peaks(4)).toEqual(timeline.peaksRange(0, timeline.durationS, 4))
+    expect(timeline.peaks(4)).toEqual([
+      { min: -1, max: -4096 / 32768 },
+      { min: -2048 / 32768, max: -256 / 32768 },
+      { min: 0, max: 1024 / 32768 },
+      { min: 2048 / 32768, max: 16384 / 32768 },
+    ])
   })
 })
 
