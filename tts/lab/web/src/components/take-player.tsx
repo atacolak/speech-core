@@ -1,51 +1,136 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Pause, Play, SkipBack, SkipForward } from 'lucide-react'
 import type { PointerEvent as ReactPointerEvent, ReactElement } from 'react'
-import { formatSeconds } from '@/lib/format'
 import type { PcmTimeline } from '@/lib/pcm-timeline'
+import { followPlayhead, waveWindow, windowFraction } from '@/lib/wave-window'
+import type { WaveWindow } from '@/lib/wave-window'
 
 const SKIP_S = 5
 const EPSILON_S = 1e-6
+const WAVE_WIDTH = 360
+const WAVE_HEIGHT = 128
+const PLAYHEAD_WIDTH = 1
+const PLAYHEAD_COLOR = '#38bdf8'
+const SILENT_STOPS = ['rgba(113,113,122,0.25)', 'rgba(161,161,170,0.6)', 'rgba(113,113,122,0.25)'] as const
+const PLAYED_STOPS = ['rgba(148,163,184,0.5)', 'rgba(241,245,249,0.95)', 'rgba(148,163,184,0.5)'] as const
+
+/** Vertical softness for one envelope fill: quiet at both edges, solid at the axis. */
+function envelopeGradient(
+  drawing: CanvasRenderingContext2D,
+  height: number,
+  stops: readonly [string, string, string],
+): CanvasGradient {
+  const gradient = drawing.createLinearGradient(0, 0, 0, height)
+  gradient.addColorStop(0, stops[0])
+  gradient.addColorStop(0.5, stops[1])
+  gradient.addColorStop(1, stops[2])
+  return gradient
+}
+
+/** One mirrored filled envelope of the visible window, with the played part lit. */
+function paintWave(
+  drawing: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  timeline: PcmTimeline,
+  visible: WaveWindow,
+  playhead: number,
+): void {
+  const { width, height } = canvas
+  const axis = height / 2
+  const peaks = timeline.peaksRange(
+    visible.startS,
+    visible.startS + visible.visibleS,
+    Math.max(1, Math.floor(width / 2)),
+  )
+  const slot = width / Math.max(peaks.length, 1)
+  drawing.clearRect(0, 0, width, height)
+  drawing.beginPath()
+  drawing.moveTo(0, axis)
+  peaks.forEach((peak, index) => {
+    drawing.lineTo(index * slot, axis - peak.max * axis * 0.92)
+  })
+  for (let index = peaks.length - 1; index >= 0; index -= 1) {
+    drawing.lineTo(index * slot, axis - peaks[index].min * axis * 0.92)
+  }
+  drawing.closePath()
+  drawing.fillStyle = envelopeGradient(drawing, height, SILENT_STOPS)
+  drawing.fill()
+
+  const fraction = windowFraction(visible, playhead)
+  const played = Math.min(Math.max(fraction ?? (playhead < visible.startS ? 0 : 1), 0), 1)
+  drawing.save()
+  drawing.clip()
+  drawing.fillStyle = envelopeGradient(drawing, height, PLAYED_STOPS)
+  drawing.fillRect(0, 0, played * width, height)
+  drawing.restore()
+
+  const playheadX = Math.min(Math.max(played * width - PLAYHEAD_WIDTH / 2, 0), width - PLAYHEAD_WIDTH)
+  drawing.fillStyle = PLAYHEAD_COLOR
+  drawing.fillRect(playheadX, 0, PLAYHEAD_WIDTH, height)
+}
 
 /**
- * Compact growing-take transport: one canvas waveform, play/pause, ±5 s, seek.
+ * A physical window over one growing take: the playhead is read from the audio
+ * clock every animation frame, the wave shows at most ten seconds, and a
+ * separate scrollbar moves the viewport without ever moving the playhead.
  *
  * The buffer is read from `timeline` when a source starts, so an append only
  * lengthens what the next start would read; it never re-instantiates a source
- * URL, which is what keeps `playing` and `offsetS` across growth.
+ * URL, which is what keeps playback across growth.
  */
 export function TakePlayer({
   timeline,
   autoplay,
   live,
   label,
+  onPlayheadChange,
 }: {
   timeline: PcmTimeline | null
   autoplay: boolean
   live: boolean
   label?: string
+  onPlayheadChange?: (seconds: number) => void
 }): ReactElement | null {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const contextRef = useRef<AudioContext | null>(null)
   const sourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const drawingRef = useRef<CanvasRenderingContext2D | null>(null)
+  const drawingReadRef = useRef(false)
+  const frameRef = useRef<number | null>(null)
   const timelineRef = useRef<PcmTimeline | null>(timeline)
   const liveRef = useRef(live)
+  const onPlayheadChangeRef = useRef(onPlayheadChange)
   const draggingRef = useRef(false)
   const autoplayedRef = useRef(false)
   const playingRef = useRef(false)
-  const offsetRef = useRef(0)
+  const playheadRef = useRef(0)
+  const startedFromRef = useRef(0)
+  const startedAtContextRef = useRef(0)
+  const windowStartRef = useRef(0)
+  const reportedRef = useRef(Number.NaN)
   const [playing, setPlaying] = useState(false)
-  const [offsetS, setOffsetS] = useState(0)
+  const [windowStartS, setWindowStartS] = useState(0)
 
   timelineRef.current = timeline
   liveRef.current = live
+  onPlayheadChangeRef.current = onPlayheadChange
   const length = timeline?.length ?? 0
   const durationS = timeline?.durationS ?? 0
+  const visible = waveWindow(durationS, windowStartS)
+  windowStartRef.current = visible.startS
 
   function ensureContext(): AudioContext {
     if (contextRef.current === null) {
       contextRef.current = new window.AudioContext()
     }
     return contextRef.current
+  }
+
+  function stopFrames(): void {
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current)
+      frameRef.current = null
+    }
   }
 
   function retireSource(): void {
@@ -55,6 +140,71 @@ export function TakePlayer({
       source.onended = null
       source.stop()
     }
+  }
+
+  /** Move the playhead to `seconds`, dragging the visible window with it. */
+  function advanceTo(seconds: number): void {
+    const current = timelineRef.current
+    const duration = current?.durationS ?? 0
+    const limit = current === null ? Math.max(seconds, 0) : duration
+    playheadRef.current = Math.min(Math.max(Number.isFinite(seconds) ? seconds : 0, 0), limit)
+    const shown = waveWindow(duration, windowStartRef.current)
+    if (!shown.scrollable) {
+      return
+    }
+    const followed = followPlayhead(shown, duration, playheadRef.current)
+    if (followed.startS !== shown.startS) {
+      windowStartRef.current = followed.startS
+      setWindowStartS(followed.startS)
+    }
+  }
+
+  /**
+   * Write the audible position to the canvas and the consumer without a React
+   * render: only the transport's play/pause flag is component state.
+   */
+  function paint(): void {
+    const canvas = canvasRef.current
+    const current = timelineRef.current
+    if (canvas === null || current === null) {
+      return
+    }
+    const duration = current.durationS
+    const playhead = Math.min(Math.max(playheadRef.current, 0), duration)
+    canvas.setAttribute('aria-valuemin', '0')
+    canvas.setAttribute('aria-valuemax', String(duration))
+    canvas.setAttribute('aria-valuenow', String(playhead))
+    if (playhead !== reportedRef.current) {
+      reportedRef.current = playhead
+      onPlayheadChangeRef.current?.(playhead)
+    }
+    if (!drawingReadRef.current) {
+      drawingReadRef.current = true
+      drawingRef.current = canvas.getContext('2d')
+    }
+    if (drawingRef.current === null) {
+      return
+    }
+    paintWave(drawingRef.current, canvas, current, waveWindow(duration, windowStartRef.current), playhead)
+  }
+
+  function onFrame(): void {
+    frameRef.current = null
+    const audio = contextRef.current
+    const current = timelineRef.current
+    if (!playingRef.current || audio === null || current === null) {
+      return
+    }
+    advanceTo(startedFromRef.current + (audio.currentTime - startedAtContextRef.current))
+    paint()
+    scheduleFrame()
+  }
+
+  function scheduleFrame(): void {
+    if (frameRef.current !== null || !playingRef.current) {
+      return
+    }
+    frameRef.current = requestAnimationFrame(onFrame)
   }
 
   const startFrom = useCallback((offset: number) => {
@@ -68,7 +218,7 @@ export function TakePlayer({
     const buffer = audio.createBuffer(1, samples.length, current.sampleRate)
     buffer.getChannelData(0).set(samples)
     const clamped = Math.min(Math.max(offset, 0), current.durationS)
-    const playedTo = current.durationS
+    const soundedTo = current.durationS
     const next = audio.createBufferSource()
     next.buffer = buffer
     next.connect(audio.destination)
@@ -81,30 +231,53 @@ export function TakePlayer({
         return
       }
       const latest = timelineRef.current
-      offsetRef.current = playedTo
-      setOffsetS(playedTo)
-      if (latest !== null && latest.durationS > playedTo + EPSILON_S) {
-        startFrom(playedTo)
+      const from = Math.min(soundedTo, latest?.durationS ?? soundedTo)
+      playheadRef.current = from
+      stopFrames()
+      if (latest !== null && latest.durationS > soundedTo + EPSILON_S) {
+        // PCM that landed while this buffer played: finish the take it started.
+        startFrom(soundedTo)
         return
       }
-      if (!liveRef.current) {
-        playingRef.current = false
-        setPlaying(false)
+      if (liveRef.current) {
+        // The stream is still running: stay armed and roll on with the next
+        // chunk when it arrives.
+        paint()
+        return
       }
+      playingRef.current = false
+      setPlaying(false)
+      paint()
     }
     retireSource()
     sourceRef.current = next
     playingRef.current = true
     setPlaying(true)
-    offsetRef.current = clamped
-    setOffsetS(clamped)
+    startedFromRef.current = clamped
+    startedAtContextRef.current = audio.currentTime
     next.start(audio.currentTime, clamped)
+    advanceTo(clamped)
+    paint()
+    scheduleFrame()
   }, [])
 
+  /** Park the playhead on the clock, then keep the visible page where it is. */
   function pause(): void {
+    const audio = contextRef.current
+    const current = timelineRef.current
+    // Only a running source has a clock position; a parked transport keeps the
+    // position it parked on.
+    if (playingRef.current && sourceRef.current !== null && audio !== null && current !== null) {
+      playheadRef.current = Math.min(
+        Math.max(startedFromRef.current + (audio.currentTime - startedAtContextRef.current), 0),
+        current.durationS,
+      )
+    }
     playingRef.current = false
     setPlaying(false)
+    stopFrames()
     retireSource()
+    paint()
   }
 
   function seek(next: number): void {
@@ -113,11 +286,12 @@ export function TakePlayer({
       return
     }
     const clamped = Math.min(Math.max(next, 0), current.durationS)
-    offsetRef.current = clamped
-    setOffsetS(clamped)
     if (playingRef.current) {
       startFrom(clamped)
+      return
     }
+    advanceTo(clamped)
+    paint()
   }
 
   function seekFromPointer(event: ReactPointerEvent<HTMLCanvasElement>): void {
@@ -126,7 +300,9 @@ export function TakePlayer({
     if (rect.width <= 0 || current === null) {
       return
     }
-    seek(((event.clientX - rect.left) / rect.width) * current.durationS)
+    const shown = waveWindow(current.durationS, windowStartRef.current)
+    const fraction = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1)
+    seek(shown.startS + fraction * shown.visibleS)
   }
 
   useEffect(() => {
@@ -144,37 +320,24 @@ export function TakePlayer({
       return
     }
     const current = timelineRef.current
-    if (current === null || current.durationS <= offsetRef.current + EPSILON_S) {
+    if (current === null || current.durationS <= playheadRef.current + EPSILON_S) {
       return
     }
-    startFrom(offsetRef.current)
+    startFrom(playheadRef.current)
   }, [live, length, startFrom])
 
+  // An append lengthens the take behind the playhead; it never moves it.
   useEffect(() => {
-    const canvas = canvasRef.current
     const current = timelineRef.current
-    const drawing = canvas?.getContext('2d') ?? null
-    if (canvas === null || drawing === null || current === null) {
-      return
+    if (current !== null) {
+      playheadRef.current = Math.min(playheadRef.current, current.durationS)
     }
-    const { width, height } = canvas
-    const peaks = current.peaks(Math.max(1, Math.floor(width / 2)))
-    const slot = width / Math.max(peaks.length, 1)
-    drawing.clearRect(0, 0, width, height)
-    drawing.fillStyle = '#71717a'
-    peaks.forEach((peak, index) => {
-      const top = height / 2 - peak.max * (height / 2)
-      const bottom = height / 2 - peak.min * (height / 2)
-      drawing.fillRect(index * slot, top, Math.max(slot - 1, 1), Math.max(bottom - top, 1))
-    })
-    if (current.durationS > 0) {
-      drawing.fillStyle = '#38bdf8'
-      drawing.fillRect((offsetS / current.durationS) * width, 0, 2, height)
-    }
-  }, [length, offsetS])
+    paint()
+  }, [length, windowStartS])
 
   useEffect(() => () => {
     playingRef.current = false
+    stopFrames()
     retireSource()
     const audio = contextRef.current
     contextRef.current = null
@@ -195,8 +358,8 @@ export function TakePlayer({
       <canvas
         ref={canvasRef}
         aria-label="Waveform"
-        className="h-16 w-full cursor-pointer rounded-md border border-zinc-700 bg-zinc-950"
-        height={64}
+        className="h-32 w-full cursor-pointer rounded-md bg-zinc-950"
+        height={WAVE_HEIGHT}
         onPointerDown={(event) => {
           draggingRef.current = true
           seekFromPointer(event)
@@ -212,49 +375,60 @@ export function TakePlayer({
         onPointerUp={() => {
           draggingRef.current = false
         }}
-        width={360}
+        role="slider"
+        width={WAVE_WIDTH}
       />
-      <div className="flex items-center gap-2 text-xs text-zinc-300">
-        <button
-          type="button"
-          className="rounded-md border border-zinc-500 px-3 py-1"
-          onClick={() => {
-            if (playing) {
-              pause()
-            } else {
-              startFrom(offsetRef.current)
-            }
-          }}
-        >
-          {playing ? 'Pause' : 'Play'}
-        </button>
-        <button
-          type="button"
-          className="rounded-md border border-zinc-500 px-2 py-1"
-          onClick={() => seek(offsetRef.current - SKIP_S)}
-        >
-          Back {SKIP_S} seconds
-        </button>
-        <button
-          type="button"
-          className="rounded-md border border-zinc-500 px-2 py-1"
-          onClick={() => seek(offsetRef.current + SKIP_S)}
-        >
-          Forward {SKIP_S} seconds
-        </button>
+      {visible.scrollable ? (
         <input
-          aria-label="Seek"
-          className="min-w-0 flex-1 accent-zinc-200"
-          max={durationS}
+          aria-label="Window"
+          className="w-full accent-zinc-200"
+          max={visible.maxStartS}
           min={0}
-          onChange={(event) => seek(Number(event.target.value))}
+          onChange={(event) => {
+            const requested = Math.min(Math.max(Number(event.target.value), 0), visible.maxStartS)
+            windowStartRef.current = requested
+            setWindowStartS(requested)
+          }}
           step="any"
           type="range"
-          value={offsetS}
+          value={visible.startS}
         />
-        <span className="tabular-nums text-zinc-400">
-          {formatSeconds(offsetS)} / {formatSeconds(durationS)}
-        </span>
+      ) : null}
+      <div className="flex items-center justify-center gap-4 text-zinc-400">
+        <button
+          aria-label={`Back ${SKIP_S} seconds`}
+          className="rounded p-1 hover:text-zinc-100"
+          onClick={() => seek(playheadRef.current - SKIP_S)}
+          type="button"
+        >
+          <SkipBack aria-hidden="true" className="h-5 w-5" />
+        </button>
+        <button
+          aria-label={playing ? 'Pause' : 'Play'}
+          className="rounded p-1 text-zinc-100 hover:text-white"
+          onClick={() => {
+            if (playingRef.current) {
+              pause()
+              return
+            }
+            startFrom(playheadRef.current >= durationS - EPSILON_S ? 0 : playheadRef.current)
+          }}
+          type="button"
+        >
+          {playing ? (
+            <Pause aria-hidden="true" className="h-6 w-6" />
+          ) : (
+            <Play aria-hidden="true" className="h-6 w-6" />
+          )}
+        </button>
+        <button
+          aria-label={`Forward ${SKIP_S} seconds`}
+          className="rounded p-1 hover:text-zinc-100"
+          onClick={() => seek(playheadRef.current + SKIP_S)}
+          type="button"
+        >
+          <SkipForward aria-hidden="true" className="h-5 w-5" />
+        </button>
       </div>
     </div>
   )
