@@ -167,6 +167,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "latest_take_id" not in voice_cols:
         conn.execute("ALTER TABLE voices ADD COLUMN latest_take_id TEXT")
 
+    run_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "alignment_json" not in run_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN alignment_json TEXT")
+
     variant_cols = {row[1] for row in conn.execute("PRAGMA table_info(reference_variants)")}
     for column, ddl in (
         ("parent_variant_id", "TEXT"),

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Cached CPU Parakeet word alignment on settled runs. CPU only; never touches CUDA."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import numpy as np
+from fastapi.testclient import TestClient
+
+from tts.lab.backend.runtime.leftover import NoopLeftover
+from tts.lab.backend.runtime.manager import E2RuntimeManager
+from tts.lab.backend.runtime.vram import FixedVramProbe
+from tts.lab.backend.runtime.worker import CountingWorkerFactory, FakeWorkerHandle
+from tts.wav import write_wav
+
+GIB = 1024 ** 3
+SAMPLE_RATE = 24000
+POLL_S = 10.0
+
+ALIGN_TARGET = "tts.lab.backend.services.run_alignment.transcribe_alignment"
+
+WORDS = [
+    {"text": "hello", "start_s": 0.10, "end_s": 0.42},
+    {"text": "world", "start_s": 0.48, "end_s": 0.91},
+]
+HEARD = {"text": "hello world", "words": WORDS}
+
+
+class FakeAlignment:
+    """The CPU aligner stand-in: records calls, optionally held open by a gate."""
+
+    def __init__(self, result: dict[str, Any] | None = None, *, held: bool = False) -> None:
+        self.result = HEARD if result is None else result
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.paths: list[str] = []
+        self._lock = threading.Lock()
+        if not held:
+            self.release.set()
+
+    @property
+    def calls(self) -> int:
+        with self._lock:
+            return len(self.paths)
+
+    def __call__(self, path: Path | str) -> dict[str, Any]:
+        with self._lock:
+            self.paths.append(str(path))
+        self.entered.set()
+        self.release.wait(timeout=POLL_S)
+        return self.result
+
+
+class RunAlignmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tts.lab.backend.app import create_app
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.factory = CountingWorkerFactory(
+            handle_factory=lambda: FakeWorkerHandle(stream_delay_s=0.05)
+        )
+        self.runtime = E2RuntimeManager(
+            vram=FixedVramProbe(free=12 * GIB),
+            leftover=NoopLeftover(),
+            worker_factory=self.factory,
+            required_vram_bytes=8 * GIB,
+            vram_margin_bytes=0,
+        )
+        self.runtime.load()
+        self.client = TestClient(create_app(root=self.root, e2_runtime=self.runtime))
+        self.state = self.client.app.state.lab
+        ref = self.root / "ref.wav"
+        write_wav(ref, SAMPLE_RATE, np.zeros(2400, dtype=np.float32))
+        with ref.open("rb") as handle:
+            self.voice = self.client.post(
+                "/api/voices",
+                data={"name": "align", "transcript": "fixture"},
+                files={"audio": ("ref.wav", handle, "audio/wav")},
+            ).json()
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.runtime.unload()
+        self.tmp.cleanup()
+
+    def _body(self, text: str) -> dict:
+        return {"text": text, "steer": "calm", "voice_profile_id": self.voice["id"]}
+
+    def _synth_calls(self) -> list:
+        if not self.factory.handles:
+            return []
+        return [call for call in self.factory.handles[0].rpc_calls if call.get("cmd") == "synthesize"]
+
+    def _only_run_id(self) -> str:
+        rows = self.state.store.execute("SELECT id FROM runs ORDER BY rowid").fetchall()
+        self.assertEqual(len(rows), 1)
+        return str(rows[0]["id"])
+
+    def _output_path(self, run_id: str) -> Path:
+        row = self.state.store.execute(
+            "SELECT output_artifact_id FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return self.state.store.get(str(row["output_artifact_id"])).path
+
+    def _alignment(self, run_id: str, client: TestClient | None = None) -> dict:
+        response = (client or self.client).get(f"/api/runs/{run_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["alignment"]
+
+    def _settled(self, run_id: str, client: TestClient | None = None) -> dict:
+        """Poll the real run route until the cache leaves pending."""
+        deadline = time.monotonic() + POLL_S
+        while True:
+            response = (client or self.client).get(f"/api/runs/{run_id}")
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            alignment = body.get("alignment") or {}
+            if alignment.get("status") != "pending":
+                return body
+            if time.monotonic() >= deadline:
+                self.fail(f"alignment stayed pending: {response.text}")
+            time.sleep(0.02)
+
+    def test_run_returns_pending_then_cached_cpu_words(self) -> None:
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            try:
+                response = self.client.post(
+                    "/api/generate/stream", json=self._body("One short line.")
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertGreater(len(response.content), 0)
+                self.assertTrue(aligner.entered.wait(timeout=POLL_S), "alignment never started")
+                self.assertFalse(aligner.release.is_set())
+                run_id = self._only_run_id()
+                self.assertEqual(self._alignment(run_id), {"status": "pending"})
+                self.assertEqual(
+                    self.client.get("/api/runs").json()["items"][0]["alignment"],
+                    {"status": "pending"},
+                )
+            finally:
+                aligner.release.set()
+            body = self._settled(run_id)
+        self.assertEqual(
+            body["alignment"], {"status": "ready", "text": "hello world", "words": WORDS}
+        )
+        # Reads of the pending row never started a second alignment.
+        self.assertEqual(aligner.calls, 1)
+        self.assertEqual(aligner.paths, [str(self._output_path(run_id))])
+
+    def test_pending_alignment_resumes_after_restart(self) -> None:
+        from tts.lab.backend.app import create_app
+
+        settled = self.root / "settled.wav"
+        write_wav(
+            settled, SAMPLE_RATE, 0.1 * np.sin(2 * np.pi * 220 * np.arange(4800) / SAMPLE_RATE)
+        )
+        artifact = self.state.store.import_audio(settled)
+        run_id = "run_pending_seed"
+        self.state.store.execute(
+            """
+            INSERT INTO runs (
+                id, voice_id, request_json, output_artifact_id, effective_reference_json,
+                latency_ms, first_audio_ms, duration_s, rating, tags_json, created_at,
+                alignment_json
+            ) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)
+            """,
+            (
+                run_id,
+                json.dumps({"text": "hello world"}),
+                artifact.id,
+                json.dumps({}),
+                120.0,
+                0.2,
+                json.dumps([]),
+                "2026-09-16T00:00:00Z",
+                json.dumps({"status": "pending"}),
+            ),
+        )
+        self.state.store.commit()
+        self.client.close()
+
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            with TestClient(create_app(root=self.root, e2_runtime=self.runtime)) as restarted:
+                listed = restarted.get("/api/runs")
+                self.assertEqual(listed.status_code, 200, listed.text)
+                self.assertEqual(
+                    listed.json()["items"][0]["alignment"], {"status": "pending"}
+                )
+                self.assertTrue(
+                    aligner.entered.wait(timeout=POLL_S), "restart never resumed alignment"
+                )
+                try:
+                    self.assertEqual(
+                        self._alignment(run_id, restarted), {"status": "pending"}
+                    )
+                finally:
+                    aligner.release.set()
+                body = self._settled(run_id, restarted)
+        self.assertEqual(
+            body["alignment"], {"status": "ready", "text": "hello world", "words": WORDS}
+        )
+        self.assertEqual(aligner.paths, [str(artifact.path)])
+        self.assertEqual(aligner.calls, 1)
+
+    def test_unavailable_alignment_is_cached_without_gpu(self) -> None:
+        aligner = FakeAlignment(result={"text": "", "words": []})
+        with patch(ALIGN_TARGET, new=aligner):
+            response = self.client.post(
+                "/api/generate/stream", json=self._body("One short line.")
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertGreater(len(response.content), 0)
+            run_id = self._only_run_id()
+            body = self._settled(run_id)
+            self.assertEqual(
+                body["alignment"], {"status": "unavailable", "text": "", "words": []}
+            )
+            synth_calls = len(self._synth_calls())
+            self.assertGreaterEqual(synth_calls, 1)
+            for _ in range(3):
+                self.client.get(f"/api/runs/{run_id}")
+                self.client.get("/api/runs")
+            # An unavailable cache is durable and never reaches the worker runtime.
+            self.assertEqual(len(self._synth_calls()), synth_calls)
+        self.assertEqual(aligner.calls, 1)
+        self.assertEqual(aligner.paths, [str(self._output_path(run_id))])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -219,5 +219,6 @@ CREATE TABLE IF NOT EXISTS runs (
     rating TEXT,
     tags_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    alignment_json TEXT,
     FOREIGN KEY (output_artifact_id) REFERENCES artifacts(id)
 );

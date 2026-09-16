@@ -17,6 +17,7 @@ from tts.lab.backend.models import DualGuidance, parse_guidance
 from tts.lab.backend.routes.voices import get_voice_or_404
 from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.breeze import SynthesisRequest, synthesize_e2
+from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.packets import new_id
 
 router = APIRouter()
@@ -183,8 +184,9 @@ def record_synthesis_run(
         """
         INSERT INTO runs (
             id, voice_id, request_json, output_artifact_id, effective_reference_json,
-            latency_ms, first_audio_ms, duration_s, rating, tags_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            latency_ms, first_audio_ms, duration_s, rating, tags_json, created_at,
+            alignment_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -204,6 +206,7 @@ def record_synthesis_run(
             None,
             json.dumps([]),
             created,
+            json.dumps(pending_alignment()),
         ),
     )
     if body.voice_profile_id:
@@ -225,6 +228,8 @@ def record_synthesis_run(
         body.voice_profile_id,
         voice_take_limit(state.store, body.voice_profile_id),
     )
+    # The run is durable before the CPU aligner starts; the worker only updates it.
+    state.run_alignments.schedule(state.store, run_id, output.id)
     return {
         "id": run_id,
         "output_artifact_id": output.id,

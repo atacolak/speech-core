@@ -13,6 +13,7 @@ from tts.lab.backend.runtime.leftover import NoopLeftover
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.runtime.processors import ProcessorLease
 from tts.lab.backend.services.progressive import GenerateStreams
+from tts.lab.backend.services.run_alignment import RunAlignments
 from tts.lab.backend.store.artifacts import ArtifactStore
 from tts.paths import lab_root
 
@@ -25,6 +26,7 @@ class LabState:
     engine: Any | None = None
     leftover_parked: bool = False
     generate_streams: GenerateStreams = field(default_factory=GenerateStreams)
+    run_alignments: RunAlignments = field(default_factory=RunAlignments)
 
 
 def create_state(

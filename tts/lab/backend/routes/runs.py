@@ -16,6 +16,21 @@ DEFAULT_TAKE_LIMIT = 5
 MAX_TAKE_LIMIT = 50
 
 
+def _alignment(row: Any) -> dict[str, Any] | None:
+    raw = row["alignment_json"]
+    return json.loads(raw) if raw else None
+
+
+def _resume_pending(state: Any, rows: list[Any]) -> None:
+    """A pending row read after a restart gets its alignment thread back."""
+    for row in rows:
+        alignment = _alignment(row)
+        if alignment is not None and alignment.get("status") == "pending":
+            state.run_alignments.schedule(
+                state.store, str(row["id"]), str(row["output_artifact_id"])
+            )
+
+
 def _run_row(row: Any) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -29,6 +44,7 @@ def _run_row(row: Any) -> dict[str, Any]:
         "rating": row["rating"],
         "tags": json.loads(row["tags_json"]),
         "created_at": row["created_at"],
+        "alignment": _alignment(row),
     }
 
 
@@ -72,7 +88,8 @@ def prune_unsaved_runs(store: Any, voice_id: str | None, take_limit: int | None 
 
 @router.get("/api/runs")
 def list_runs(request: Request, voice_id: str | None = None) -> dict[str, Any]:
-    store = request.app.state.lab.store
+    state = request.app.state.lab
+    store = state.store
     if voice_id:
         rows = store.execute(
             "SELECT * FROM runs WHERE voice_id = ? ORDER BY created_at DESC, rowid DESC",
@@ -80,15 +97,18 @@ def list_runs(request: Request, voice_id: str | None = None) -> dict[str, Any]:
         ).fetchall()
     else:
         rows = store.execute("SELECT * FROM runs ORDER BY created_at DESC, rowid DESC").fetchall()
+    _resume_pending(state, rows)
     return {"items": [_run_row(row) for row in rows]}
 
 
 @router.get("/api/runs/{run_id}")
 def get_run(request: Request, run_id: str) -> dict[str, Any]:
-    store = request.app.state.lab.store
+    state = request.app.state.lab
+    store = state.store
     row = store.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+    _resume_pending(state, [row])
     return _run_row(row)
 
 
