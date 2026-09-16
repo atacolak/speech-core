@@ -170,6 +170,8 @@ export type Voice = {
   source_duration_s?: number | null
   effective_duration_s?: number | null
   generation?: GenerationBody | null
+  /** The voice's most recent ordinary take; survives navigation and restart. */
+  latest_take_id: string | null
   take_limit?: number
   created_at: string
   updated_at: string
@@ -757,6 +759,49 @@ export async function cancelGenerate(jobId: string): Promise<GenerateJob> {
 
 export function generateSegmentAudioUrl(jobId: string, index: number): string {
   return apiUrl(`/api/generate/${jobId}/segments/${index}/audio`)
+}
+
+/** One continuous raw s16le PCM generation, plus the id that stops it. */
+export type GenerateStream = {
+  id: string
+  sampleRate: number
+  chunks: AsyncGenerator<ArrayBuffer, void, void>
+}
+
+export async function openGenerateStream(input: GenerateInput): Promise<GenerateStream> {
+  const response = await apiFetch('/api/generate/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+  if (!response.ok) throw await readError(response, 'generate')
+  const id = response.headers.get('X-Generate-Id')
+  const sampleRate = Number(response.headers.get('X-Sample-Rate'))
+  if (!id || !Number.isFinite(sampleRate) || sampleRate <= 0 || !response.body) {
+    throw new Error('generate stream missing id, sample rate, or body')
+  }
+  const reader = response.body.getReader()
+  async function* chunks() {
+    try {
+      while (true) {
+        const item = await reader.read()
+        if (item.done) return
+        if (item.value.byteLength) yield item.value.buffer.slice(
+          item.value.byteOffset,
+          item.value.byteOffset + item.value.byteLength,
+        )
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  }
+  return { id, sampleRate, chunks: chunks() }
+}
+
+export async function stopGenerate(id: string): Promise<{ id: string; stopped: true }> {
+  const response = await apiFetch(`/api/generate/${id}/stop`, { method: 'POST' })
+  if (!response.ok) throw await readError(response, 'generate stop')
+  return (await response.json()) as { id: string; stopped: true }
 }
 
 export function formatBytes(value?: number | null): string {

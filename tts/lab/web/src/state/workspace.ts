@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import { DEFAULT_GENERATION, type GenerationState } from '@/lib/generation'
+import type { Voice } from '@/lib/api'
+import { DEFAULT_GENERATION, fromStoredGeneration, type GenerationState } from '@/lib/generation'
 
 /** Two modes; the top nav is the only way between them. */
 export type ModeId = 'generate' | 'voice-lab'
@@ -11,6 +12,8 @@ type WorkspaceState = {
   /** Set while the lab is showing material; picking a voice clears it and vice versa. */
   selectedMaterialId: string | null
   selectedRunId: string | null
+  /** The voice whose stored generation currently fills `generation`; null until hydrated. */
+  hydratedVoiceId: string | null
   editorOpen: boolean
   settingsOpen: boolean
   text: string
@@ -20,6 +23,7 @@ type WorkspaceState = {
   selectVoice: (id: string | null) => void
   selectMaterial: (id: string | null) => void
   selectRun: (id: string | null) => void
+  hydrateGeneration: (voice: Pick<Voice, 'id' | 'generation'> | null) => void
   openEditor: () => void
   closeEditor: () => void
   toggleSettings: () => void
@@ -34,15 +38,30 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
   selectedVoiceId: null,
   selectedMaterialId: null,
   selectedRunId: null,
+  hydratedVoiceId: null,
   editorOpen: false,
   settingsOpen: false,
   text: "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
   steer: 'fast, dry, technically confident, faintly amused.',
   generation: { ...DEFAULT_GENERATION },
   selectMode: (mode) => set({ mode }),
-  selectVoice: (id) => set({ selectedVoiceId: id, selectedMaterialId: null, selectedRunId: null }),
+  selectVoice: (id) =>
+    set({ selectedVoiceId: id, selectedMaterialId: null, selectedRunId: null, hydratedVoiceId: null }),
   selectMaterial: (id) => set({ selectedMaterialId: id }),
   selectRun: (id) => set({ selectedRunId: id }),
+  hydrateGeneration: (voice) =>
+    set((state) => {
+      if (!voice) {
+        return { hydratedVoiceId: null }
+      }
+      if (state.hydratedVoiceId === voice.id) {
+        return state
+      }
+      return {
+        hydratedVoiceId: voice.id,
+        generation: fromStoredGeneration(voice.generation),
+      }
+    }),
   // The workbench is a lab surface: opening it from the generate rail moves to the lab.
   openEditor: () => set({ editorOpen: true, mode: 'voice-lab' }),
   closeEditor: () => set({ editorOpen: false }),

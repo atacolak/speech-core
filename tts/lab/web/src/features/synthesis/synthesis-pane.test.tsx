@@ -4,79 +4,108 @@ import type { ReactElement } from 'react'
 import type { Mock } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
-import type { GenerateJob, GenerateSegment } from '@/lib/api'
 import { DEFAULT_GENERATION } from '@/lib/generation'
 import { useWorkspace } from '@/state/workspace'
 
-const mocks = vi.hoisted(() => ({
-  enqueue: vi.fn(async (_index: number, _wavUrl: string) => {}),
-  stop: vi.fn(),
-  ended: undefined as ((index: number) => void) | undefined,
-}))
-
-vi.mock('@/features/synthesis/progressive', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/features/synthesis/progressive')>()
-  class MockProgressivePlayer {
-    constructor(_context?: AudioContext, onEnded?: (index: number) => void) {
-      mocks.ended = onEnded
-    }
-    enqueue(index: number, wavUrl: string) {
-      return mocks.enqueue(index, wavUrl)
-    }
-    stop() {
-      mocks.stop()
-    }
-  }
-  return { ...actual, ProgressivePlayer: MockProgressivePlayer }
-})
-
 const RUNTIME = { state: 'ready', live_call_active: false }
+const SAMPLE_RATE = 24000
 
+/** Two voices whose stored generation and latest take both differ. */
 const VOICES = [
-  { id: 'vp1', name: 'ata', tags: [] },
-  { id: 'vp2', name: 'bex', tags: [] },
+  {
+    id: 'vp1',
+    name: 'ata',
+    tags: [],
+    latest_take_id: 'run_a',
+    generation: { guidance: { mode: 'single', cfg: 1 }, seed: 7 },
+  },
+  {
+    id: 'vp2',
+    name: 'bex',
+    tags: [],
+    latest_take_id: 'run_b',
+    generation: { guidance: { mode: 'single', cfg: 3 }, seed: 9 },
+  },
 ]
 
-const TAKES = [
+const RUNS = [
   {
-    id: 'run_done',
+    id: 'run_a',
     voice_id: 'vp1',
-    output_artifact_id: 'art_done',
+    output_artifact_id: 'art_a',
+    latency_ms: 800,
+    first_audio_ms: 210,
+    duration_s: 1,
+    rating: null,
+    tags: [],
+  },
+  {
+    id: 'run_b',
+    voice_id: 'vp2',
+    output_artifact_id: 'art_b',
     latency_ms: 900,
-    first_audio_ms: 320,
-    duration_s: 42,
+    first_audio_ms: 240,
+    duration_s: 2,
     rating: null,
     tags: [],
   },
 ]
 
-function segment(index: number, state: GenerateSegment['state']): GenerateSegment {
-  return {
-    index,
-    text: `segment ${index}`,
-    state,
-    duration_s: state === 'generated' ? 1 : null,
-    audio_url: state === 'generated' ? `/api/generate/job1/segments/${index}/audio` : null,
+type Started = { when: number; offset: number }
+
+class FakeSource {
+  buffer: AudioBuffer | null = null
+  readonly started: Started[] = []
+  stopped = false
+  onended: (() => void) | null = null
+
+  connect() {}
+  disconnect() {}
+
+  start(when: number, offset?: number) {
+    this.started.push({ when, offset: offset ?? 0 })
+  }
+
+  stop() {
+    this.stopped = true
   }
 }
 
-function job(overrides: Partial<GenerateJob> = {}): GenerateJob {
-  return {
-    id: 'job1',
-    state: 'running',
-    cursor: -1,
-    lookahead: 2,
-    blocked_on_live_call: false,
-    run_id: null,
-    output_artifact_id: null,
-    error: null,
-    segments: [
-      segment(0, 'generated'),
-      segment(1, 'generating'),
-      segment(2, 'queued'),
-      segment(3, 'pending'),
-    ],
-    ...overrides,
+class FakeAudioContext {
+  static readonly contexts: FakeAudioContext[] = []
+  static readonly sources: FakeSource[] = []
+
+  readonly destination = {}
+  currentTime = 0
+  closed = false
+
+  constructor() {
+    FakeAudioContext.contexts.push(this)
+  }
+
+  createBuffer(_channels: number, length: number, sampleRate: number) {
+    const channel = new Float32Array(length)
+    return {
+      length,
+      sampleRate,
+      duration: length / sampleRate,
+      getChannelData: () => channel,
+    } as unknown as AudioBuffer
+  }
+
+  createBufferSource() {
+    const source = new FakeSource()
+    FakeAudioContext.sources.push(source)
+    return source as unknown as AudioBufferSourceNode
+  }
+
+  resume() {
+    return Promise.resolve()
+  }
+
+  close() {
+    this.closed = true
+    return Promise.resolve()
   }
 }
 
@@ -87,13 +116,57 @@ function json(body: unknown, status = 200) {
   })
 }
 
+/** `seconds` of audible s16le mono, so the timeline duration is exact. */
+function pcmChunk(seconds: number, fill = 8000): Uint8Array {
+  const frames = Math.round(seconds * SAMPLE_RATE)
+  const samples = new Int16Array(frames)
+  samples.fill(fill)
+  return new Uint8Array(samples.buffer)
+}
+
+/** A tiny valid mono 16-bit PCM WAV, as `/api/artifacts/{id}/audio` serves. */
+function wav(seconds: number): ArrayBuffer {
+  const samples = new Int16Array(Math.round(seconds * SAMPLE_RATE))
+  samples.fill(4000)
+  const bytes = new Uint8Array(44 + samples.byteLength)
+  const view = new DataView(bytes.buffer)
+  view.setUint32(0, 0x52494646, false)
+  view.setUint32(4, 36 + samples.byteLength, true)
+  view.setUint32(8, 0x57415645, false)
+  view.setUint32(12, 0x666d7420, false)
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, SAMPLE_RATE, true)
+  view.setUint32(28, SAMPLE_RATE * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  view.setUint32(36, 0x64617461, false)
+  view.setUint32(40, samples.byteLength, true)
+  bytes.set(new Uint8Array(samples.buffer), 44)
+  return bytes.buffer
+}
+
+type Lab = {
+  fetchMock: Mock
+  push: (bytes: Uint8Array) => void
+  close: () => void
+}
+
 /**
- * Stubs the whole lab surface. `polls` is the status body sequence the pane
- * sees after its initial status fetch; the start response is always a fresh
- * running job, as the server answers it.
+ * Stubs the whole lab surface. `/api/generate/stream` hands back a controlled
+ * raw-PCM body: a test enqueues chunks itself and closes it during cleanup, so
+ * the stream stays open across Stop exactly as the server keeps it open while
+ * it finalizes the take.
  */
-function stubLab(polls: GenerateJob[] = [job()], started: GenerateJob = job({ segments: [segment(0, 'queued'), segment(1, 'pending')] })) {
-  let poll = 0
+function stubLab(): Lab {
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null
+  let closed = false
+  const body = new ReadableStream<Uint8Array>({
+    start(next) {
+      controller = next
+    },
+  })
   const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
@@ -104,42 +177,46 @@ function stubLab(polls: GenerateJob[] = [job()], started: GenerateJob = job({ se
       return json({ items: VOICES })
     }
     if (url.includes('/api/runs')) {
-      return json({ items: TAKES })
+      return json({ items: RUNS })
     }
     if (url.includes('/api/fixtures/steer')) {
       return json({ items: [] })
     }
-    if (url.endsWith('/api/generate') && method === 'POST') {
-      return json(started)
+    if (url.includes('/api/generate/stream') && method === 'POST') {
+      return new Response(body, {
+        status: 200,
+        headers: { 'X-Generate-Id': 'gen_1', 'X-Sample-Rate': String(SAMPLE_RATE) },
+      })
     }
-    if (url.includes('/cancel')) {
-      return json(
-        job({
-          state: 'cancelled',
-          segments: [
-            segment(0, 'generated'),
-            segment(1, 'cancelled'),
-            segment(2, 'pending'),
-            segment(3, 'pending'),
-          ],
-        }),
-      )
+    if (url.includes('/stop')) {
+      return json({ id: 'gen_1', stopped: true })
     }
-    if (url.includes('/cursor')) {
-      return json(job())
+    if (url.includes('/api/artifacts/art_a/audio')) {
+      return new Response(wav(1), { status: 200 })
     }
-    if (url.includes('/segments/')) {
-      return new Response(new Uint8Array([0, 1]).buffer, { status: 200 })
-    }
-    if (url.includes('/api/generate/')) {
-      const body = polls[Math.min(poll, polls.length - 1)]
-      poll += 1
-      return json(body)
+    if (url.includes('/api/artifacts/art_b/audio')) {
+      return new Response(wav(2), { status: 200 })
     }
     return json({ detail: 'missing' }, 404)
   })
   vi.stubGlobal('fetch', fetchMock)
-  return fetchMock
+  return {
+    fetchMock,
+    push: (bytes) => {
+      controller?.enqueue(bytes)
+    },
+    close: () => {
+      if (closed) {
+        return
+      }
+      closed = true
+      try {
+        controller?.close()
+      } catch {
+        // Already closed by the reader.
+      }
+    },
+  }
 }
 
 function renderPane(node: ReactElement) {
@@ -149,7 +226,8 @@ function renderPane(node: ReactElement) {
     selectedRunId: null,
     text: 'hello world',
     steer: 'dry',
-    generation: { ...DEFAULT_GENERATION },
+    // Deliberately not the stored profile: hydration is what must fix it.
+    generation: { ...DEFAULT_GENERATION, cfg: 4 },
   })
   return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>)
 }
@@ -158,128 +236,111 @@ function callsTo(fetchMock: Mock, fragment: string) {
   return fetchMock.mock.calls.filter((call) => String(call[0]).includes(fragment))
 }
 
-async function pressGenerate() {
-  fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+function postBody(fetchMock: Mock, fragment: string) {
+  const call = callsTo(fetchMock, fragment)[0]
+  return JSON.parse(String((call?.[1] as RequestInit | undefined)?.body)) as {
+    generation: { guidance: unknown }
+  }
 }
 
-describe('GENERATE play-as-you-go', () => {
+describe('GENERATE take player', () => {
+  let lab: Lab
+
   beforeEach(() => {
-    mocks.enqueue.mockClear()
-    mocks.stop.mockClear()
-    mocks.ended = undefined
+    FakeAudioContext.contexts.length = 0
+    FakeAudioContext.sources.length = 0
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+    lab = stubLab()
   })
 
   afterEach(() => {
+    lab.close()
     // The stub stays installed: panes refetch during teardown, and a relative URL
     // reaching the real fetch would throw after the run.
     useWorkspace.setState({ selectedVoiceId: null, selectedRunId: null })
   })
 
-  it('plays the first generated segment while the job is running', async () => {
-    const fetchMock = stubLab()
+  it('consumes first stream chunk into one player', async () => {
     renderPane(<SynthesisPane />)
-    await pressGenerate()
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining('/api/generate'),
-        expect.objectContaining({ method: 'POST' }),
-      ),
-    )
-    expect(await screen.findByText('generated')).toBeInTheDocument()
-    expect(screen.getByText('generating')).toBeInTheDocument()
-    expect(screen.getByText('queued')).toBeInTheDocument()
-    expect(screen.getByText('pending')).toBeInTheDocument()
-    await waitFor(() =>
-      expect(mocks.enqueue).toHaveBeenCalledWith(
-        0,
-        expect.stringContaining('/segments/0/audio'),
-      ),
-    )
-    // A whole-document wait would post one synthesize and produce no per-segment audio.
-    expect(callsTo(fetchMock, '/api/synthesize')).toHaveLength(0)
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+    await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
 
-    // The caret only moves once the scheduled segment actually finishes.
-    expect(callsTo(fetchMock, '/cursor')).toHaveLength(0)
-    act(() => mocks.ended?.(0))
-    await waitFor(() => expect(callsTo(fetchMock, '/cursor')).toHaveLength(1))
-    expect(callsTo(fetchMock, '/cursor')[0][1]).toMatchObject({ method: 'POST' })
+    act(() => lab.push(pcmChunk(1)))
+    await waitFor(() => expect(screen.getByRole('slider', { name: 'Seek' }).getAttribute('max')).toBe('1'))
+    // Autoplay is the only way a 1 s take is not silent.
+    expect(FakeAudioContext.sources.map((source) => source.started)).toEqual([[{ when: 0, offset: 0 }]])
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument()
+
+    // Later PCM grows the same buffer instead of a second player.
+    act(() => lab.push(pcmChunk(1)))
+    await waitFor(() => expect(screen.getByRole('slider', { name: 'Seek' }).getAttribute('max')).toBe('2'))
+    expect(screen.getAllByLabelText('Waveform')).toHaveLength(1)
+    expect(FakeAudioContext.sources).toHaveLength(1)
+    expect(document.querySelector('audio')).toBeNull()
   })
 
-  it('cancels pending work without stopping produced playback', async () => {
-    const fetchMock = stubLab()
+  it('posts Stop and never renders Cancel or segment states', async () => {
     renderPane(<SynthesisPane />)
-    await pressGenerate()
-    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining('/cancel'),
-        expect.objectContaining({ method: 'POST' }),
-      ),
-    )
-    expect(mocks.stop).not.toHaveBeenCalled()
-    expect(screen.getByText('generated')).toBeInTheDocument()
-  })
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+    await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
+    act(() => lab.push(pcmChunk(1)))
 
-  it('invalidates the old snapshot when text changes', async () => {
-    const fetchMock = stubLab()
-    renderPane(<SynthesisPane />)
-    await pressGenerate()
-    fireEvent.change(await screen.findByLabelText('Say'), { target: { value: 'hello edited' } })
+    expect(screen.queryByText(/generated|generating|queued|pending/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
     await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining('/cancel'),
-        expect.objectContaining({ method: 'POST' }),
-      ),
+      expect(callsTo(lab.fetchMock, '/api/generate/gen_1/stop')).toHaveLength(1),
     )
-    expect(callsTo(fetchMock, '/cancel')).toHaveLength(1)
-  })
-
-  it.each([
-    ['delivery', () => fireEvent.change(screen.getByLabelText('Delivery'), { target: { value: 'changed' } })],
-    ['generation setting', () => act(() => useWorkspace.getState().patchGeneration({ cfg: 2 }))],
-    ['selected voice', () => act(() => useWorkspace.getState().selectVoice('vp2'))],
-  ])('invalidates the old snapshot when %s changes', async (_name, change) => {
-    const fetchMock = stubLab()
-    renderPane(<SynthesisPane />)
-    await pressGenerate()
-    change()
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining('/cancel'),
-        expect.objectContaining({ method: 'POST' }),
-      ),
-    )
-    expect(mocks.stop).not.toHaveBeenCalled()
-  })
-
-  it('selects the composed run and refreshes takes on the complete poll', async () => {
-    const fetchMock = stubLab([
-      job({
-        state: 'complete',
-        cursor: 3,
-        run_id: 'run_done',
-        output_artifact_id: 'art_done',
-        segments: [
-          segment(0, 'generated'),
-          segment(1, 'generated'),
-          segment(2, 'generated'),
-          segment(3, 'generated'),
-        ],
-      }),
-    ])
-    renderPane(<SynthesisPane />)
-    await pressGenerate()
-    await waitFor(() => expect(callsTo(fetchMock, '/api/runs').length).toBeGreaterThan(1))
-    expect(useWorkspace.getState().selectedRunId).toBe('run_done')
-    const audio = await waitFor(() => {
-      const node = document.querySelector('audio')
-      expect(node?.getAttribute('src')).toContain('art_done')
-      return node as HTMLAudioElement
+    expect(callsTo(lab.fetchMock, '/api/generate/gen_1/stop')[0][1]).toMatchObject({
+      method: 'POST',
     })
-    expect(audio.getAttribute('src')).toContain('art_done')
+    // Stop ends unborn work; it never silences produced audio.
+    expect(FakeAudioContext.sources.every((source) => !source.stopped)).toBe(true)
+  })
+
+  it('gives Say the min-h-70 instrument height', async () => {
+    renderPane(<SynthesisPane />)
+    const say = await screen.findByLabelText('Say')
+    expect(say).toHaveClass('min-h-70')
+    expect(say).not.toHaveClass('min-h-28')
+  })
+
+  it('hydrates stored cfg before first Generate', async () => {
+    renderPane(<SynthesisPane />)
+    await waitFor(() => expect(useWorkspace.getState().generation.cfg).toBe(1))
+    // No Settings drawer is ever mounted here.
+    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+    await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
+    expect(postBody(lab.fetchMock, '/api/generate/stream').generation.guidance).toEqual({
+      mode: 'single',
+      cfg: 1,
+    })
+    expect(useWorkspace.getState().generation.seed).toBe(7)
+  })
+
+  it('restores each selected voice latest take without audio src', async () => {
+    renderPane(<SynthesisPane />)
+    await waitFor(() =>
+      expect(callsTo(lab.fetchMock, '/api/artifacts/art_a/audio').length).toBeGreaterThan(0),
+    )
+    expect(screen.getByLabelText('Waveform')).toBeInTheDocument()
+    expect(document.querySelector('audio')).toBeNull()
     expect(await screen.findByRole('link', { name: /Download/ })).toHaveAttribute(
       'href',
-      expect.stringContaining('art_done'),
+      expect.stringContaining('art_a'),
+    )
+
+    act(() => useWorkspace.getState().selectVoice('vp2'))
+    await waitFor(() =>
+      expect(callsTo(lab.fetchMock, '/api/artifacts/art_b/audio').length).toBeGreaterThan(0),
+    )
+    expect(callsTo(lab.fetchMock, '/api/artifacts/art_a/audio').length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('Waveform')).toBeInTheDocument()
+    expect(document.querySelector('audio')).toBeNull()
+    expect(screen.getByRole('link', { name: /Download/ })).toHaveAttribute(
+      'href',
+      expect.stringContaining('art_b'),
     )
   })
 })
