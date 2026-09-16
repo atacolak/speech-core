@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS voices (
     transcript_locked INTEGER NOT NULL DEFAULT 0,
     speaker_analysis_id TEXT,
     default_reference_id TEXT,
+    latest_take_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_artifact_id) REFERENCES artifacts(id)

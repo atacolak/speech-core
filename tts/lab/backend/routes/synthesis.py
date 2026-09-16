@@ -202,6 +202,11 @@ def record_synthesis_run(
             created,
         ),
     )
+    if body.voice_profile_id:
+        state.store.execute(
+            "UPDATE voices SET latest_take_id = ?, updated_at = ? WHERE id = ?",
+            (run_id, created, body.voice_profile_id),
+        )
     state.store.commit()
     if body.generation is not None:
         state.store.execute(

@@ -32,14 +32,15 @@ class VoiceTakes(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.client = self._client_for_root(self.root)
+
+    def _client_for_root(self, root: Path) -> TestClient:
         engine = BreezeEngine(
             EngineConfig(name="E2", precision="bf16"),
             ckpt_dir=".",
             backend=FakeBackend(),
         )
-        self.client = TestClient(
-            create_app(root=self.root, engine=engine, leftover_parked=True)
-        )
+        return TestClient(create_app(root=root, engine=engine, leftover_parked=True))
 
     def tearDown(self) -> None:
         self.client.close()
@@ -148,6 +149,32 @@ class VoiceTakes(unittest.TestCase):
         self.assertEqual([item["id"] for item in runs], [keep["id"]])
         missing = self.client.get(f"/api/voices/{left['id']}")
         self.assertEqual(missing.status_code, 404)
+
+    def test_synthesize_sets_latest_take_and_lists_it(self) -> None:
+        voice = self._voice("ata")
+        run = self._synth(voice["id"])
+        listed = self.client.get("/api/voices").json()["items"]
+        item = next(row for row in listed if row["id"] == voice["id"])
+        self.assertEqual(item["latest_take_id"], run["id"])
+
+    def test_latest_take_is_per_voice_and_survives_reopen(self) -> None:
+        first = self._voice("ata")
+        second = self._voice("bex")
+        first_run = self._synth(first["id"])
+        second_run = self._synth(second["id"])
+        self.client.close()
+        self.client = self._client_for_root(self.root)
+        items = {item["id"]: item for item in self.client.get("/api/voices").json()["items"]}
+        self.assertEqual(items[first["id"]]["latest_take_id"], first_run["id"])
+        self.assertEqual(items[second["id"]]["latest_take_id"], second_run["id"])
+
+    def test_deleted_latest_take_serializes_as_null(self) -> None:
+        voice = self._voice("ata")
+        run = self._synth(voice["id"])
+        self.assertEqual(self.client.delete(f"/api/runs/{run['id']}").status_code, 200)
+        listed = self.client.get("/api/voices").json()["items"]
+        item = next(row for row in listed if row["id"] == voice["id"])
+        self.assertIsNone(item["latest_take_id"])
 
 
 if __name__ == "__main__":

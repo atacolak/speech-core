@@ -254,6 +254,7 @@ def _voice_row(store, row: Any) -> dict[str, Any]:
         "notes": row["notes"] if "notes" in row.keys() else None,
         "generation": _voice_generation(row),
         "take_limit": _voice_take_limit(row),
+        "latest_take_id": _latest_take_id(store, row),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -281,6 +282,16 @@ def _voice_take_limit(row: Any) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(50, value))
+
+
+def _latest_take_id(store, row: Any) -> str | None:
+    if "latest_take_id" not in row.keys() or not row["latest_take_id"]:
+        return None
+    found = store.execute(
+        "SELECT id FROM runs WHERE id = ? AND voice_id = ?",
+        (row["latest_take_id"], row["id"]),
+    ).fetchone()
+    return None if found is None else str(found["id"])
 
 
 def _source_words(voice: dict[str, Any]) -> list[dict[str, Any]]:

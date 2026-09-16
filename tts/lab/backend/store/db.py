@@ -164,6 +164,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE voices ADD COLUMN speaker_analysis_id TEXT")
     if "default_reference_id" not in voice_cols:
         conn.execute("ALTER TABLE voices ADD COLUMN default_reference_id TEXT")
+    if "latest_take_id" not in voice_cols:
+        conn.execute("ALTER TABLE voices ADD COLUMN latest_take_id TEXT")
 
     variant_cols = {row[1] for row in conn.execute("PRAGMA table_info(reference_variants)")}
     for column, ddl in (
