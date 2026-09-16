@@ -319,9 +319,11 @@ def record_synthesis_run(
             output.id,
             json.dumps(
                 {
+                    # The transcript recorded is the one this request sent, so the
+                    # durable record pairs one origin's audio with its own text.
                     "artifact_id": artifact.id,
                     "keep_intervals": voice["keep_intervals"],
-                    "transcript": voice["effective_transcript"],
+                    "transcript": resolved.reference_text,
                 }
             ),
             float(result.wall_s) * 1000.0,

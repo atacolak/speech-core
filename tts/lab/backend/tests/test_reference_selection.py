@@ -8,6 +8,7 @@ reference.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from breeze_tts_qual.configs import EngineConfig
+from breeze_tts_qual.engine import BreezeEngine, FakeBackend
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -25,6 +28,7 @@ sys.path.insert(0, str(REPO / "lab" / "scripts"))
 from tts.lab.backend.app import create_app
 from tts.lab.backend.models import Interval
 from tts.lab.backend.routes.synthesis import SynthesisBody, resolve_synthesis_request
+from tts.lab.backend.services.references import clean_ref_text
 from tts.lab.backend.services.candidates import (
     EXPERIMENT,
     REFERENCE,
@@ -44,6 +48,41 @@ FIRST_TRANSCRIPT = "first clean transcript"
 SECOND_TRANSCRIPT = "second clean transcript"
 ASR_TEXT = "asr of the other origin"
 
+PROSE = "arrived by train and walked uphill"
+SPOKEN = "hello there"
+
+# Every timestamp form a stored transcript carries in the wild. The third column
+# is the prose the composed ref_text must carry; the invariant in
+# `_assert_prose_only` is what actually gates, so a shape nobody listed still
+# fails the test when a clock token survives.
+FORMAT_FIXTURES: tuple[tuple[str, str, str], ...] = (
+    (
+        "srt_two_cues_with_indices",
+        f"1\n00:00:00,000 --> 00:00:02,000\narrived by train\n\n"
+        f"2\n00:00:02,000 --> 00:00:04,500\nand walked uphill\n",
+        PROSE,
+    ),
+    (
+        "vtt_with_header",
+        f"WEBVTT\n\n00:00:00.000 --> 00:00:02.000\narrived by train\n\n"
+        f"00:00:02.000 --> 00:00:04.500\nand walked uphill\n",
+        PROSE,
+    ),
+    ("comma_ms", f"00:00:00,000 --> 00:00:02,000 {PROSE}", PROSE),
+    ("dot_ms", f"00:00:00.000 --> 00:00:02.000 {PROSE}", PROSE),
+    ("bare_minutes", f"0:00 --> 0:02 {PROSE}", PROSE),
+    ("square_bracket", f"[00:01.23] {PROSE}", PROSE),
+    ("paren_bracket", f"(00:01.23) {PROSE}", PROSE),
+    ("speaker_00", f"SPEAKER_00: {SPOKEN}", SPOKEN),
+    ("speaker_short", f"S0: {SPOKEN}", SPOKEN),
+    ("clean_control", PROSE, PROSE),
+)
+
+# The invariant, not the regex: Breeze gets prose. A clock-like token of any
+# width, a range arrow, or diarization markup reaching ref_text is the bug.
+_CLOCK_LIKE = re.compile(r"\d{1,2}:\d{2}")
+_SPEAKER_LIKE = re.compile(r"SPEAKER_\d+|S\d+\s*:")
+
 
 def _wav(path: Path, *, freq: float = 440.0) -> Path:
     sr = 24000
@@ -55,7 +94,12 @@ class ReferenceResolutionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.client = TestClient(create_app(root=self.root, leftover_parked=True))
+        engine = BreezeEngine(
+            EngineConfig(name="E2", precision="bf16"), ckpt_dir=".", backend=FakeBackend()
+        )
+        self.client = TestClient(
+            create_app(root=self.root, engine=engine, leftover_parked=True)
+        )
         self.state = self.client.app.state.lab
         self.store = self.state.store
         self.voice = self._create_voice()
@@ -390,6 +434,103 @@ class ReferenceResolutionTest(unittest.TestCase):
             "SELECT clean_transcript FROM clips WHERE id=?", (clip["id"],)
         ).fetchone()
         self.assertEqual(stored["clean_transcript"], marked)
+
+    def _assert_prose_only(self, label: str, text: str) -> None:
+        """The Breeze-facing invariant: a range, a clock or markup never survives."""
+        for needle in ("-->", "->"):
+            self.assertNotIn(needle, text, f"{label}: {needle!r} in {text!r}")
+        self.assertIsNone(_CLOCK_LIKE.search(text), f"{label}: clock token in {text!r}")
+        self.assertIsNone(_SPEAKER_LIKE.search(text), f"{label}: markup in {text!r}")
+
+    def _stored_transcript_rows(self, clip_id: str) -> dict[str, tuple]:
+        voice = self.store.execute(
+            "SELECT source_transcript, effective_transcript FROM voices WHERE id=?",
+            (self.voice["id"],),
+        ).fetchone()
+        source = self.store.execute(
+            "SELECT transcript FROM voice_sources WHERE id=?", (self.second_source,)
+        ).fetchone()
+        clip = self.store.execute(
+            "SELECT clean_transcript FROM clips WHERE id=?", (clip_id,)
+        ).fetchone()
+        return {"voice": tuple(voice), "source": tuple(source), "clip": tuple(clip)}
+
+    def test_every_timestamp_form_is_stripped_from_clean_ref_text(self) -> None:
+        for name, stored, expected in FORMAT_FIXTURES:
+            with self.subTest(fixture=name):
+                composed = clean_ref_text(stored)
+
+                self._assert_prose_only(f"clean_ref_text[{name}]", composed)
+                self.assertEqual(composed, expected)
+
+    def _write_transcript(self, origin: str, text: str, clip_id: str) -> None:
+        """Store a transcript body the way the product lets it arrive."""
+        if origin == "primary":
+            patched = self.client.patch(
+                f"/api/voices/{self.voice['id']}",
+                json={"source_transcript": text, "effective_transcript": text},
+            )
+            self.assertEqual(patched.status_code, 200, patched.text)
+            return
+        if origin == "voice_sources":
+            statement, row_id = (
+                "UPDATE voice_sources SET transcript=? WHERE id=?",
+                self.second_source,
+            )
+        else:
+            statement, row_id = "UPDATE clips SET clean_transcript=? WHERE id=?", clip_id
+        self.store.execute(statement, (text, row_id))
+        self.store.commit()
+
+    def test_every_origin_path_composes_prose_only_ref_text(self) -> None:
+        clip = self._clip_fixture()
+        clip_reference = self._reference(
+            clip["id"], audio=clip["audio_artifact_id"], source=None
+        )
+        origin_paths = (
+            ("primary", self.first_reference, self.voice["source_audio_artifact_id"]),
+            ("voice_sources", self.second_reference, "art_second"),
+            ("clip", clip_reference, clip["audio_artifact_id"]),
+        )
+        for name, stored, expected in FORMAT_FIXTURES:
+            for origin, reference, artifact_id in origin_paths:
+                with self.subTest(fixture=name, origin=origin):
+                    self._write_transcript(origin, stored, clip["id"])
+                    activated = self._activate(reference)
+                    self.assertEqual(activated.status_code, 200, activated.text)
+                    before = self._stored_transcript_rows(clip["id"])
+
+                    resolved = resolve_synthesis_request(self.state, self._body())
+
+                    self.assertEqual(resolved.artifact.id, artifact_id)
+                    self._assert_prose_only(f"{origin}[{name}]", resolved.reference_text)
+                    self.assertEqual(resolved.reference_text, expected)
+                    self.assertEqual(self._stored_transcript_rows(clip["id"]), before)
+
+    def test_run_record_keeps_the_reference_transcript_the_request_sent(self) -> None:
+        activated = self._activate(self.second_reference)
+        self.assertEqual(activated.status_code, 200, activated.text)
+        body = self._body()
+        sent = resolve_synthesis_request(self.state, body)
+        self.assertEqual(sent.artifact.id, "art_second")
+        self.assertEqual(sent.reference_text, SECOND_TRANSCRIPT)
+        self.assertNotEqual(sent.reference_text, FIRST_TRANSCRIPT)
+
+        created = self.client.post(
+            "/api/synthesize",
+            json={
+                "text": body.text,
+                "steer": body.steer,
+                "voice_profile_id": body.voice_profile_id,
+            },
+        )
+
+        self.assertEqual(created.status_code, 200, created.text)
+        run = self.client.get(f"/api/runs/{created.json()['id']}").json()
+        snapshot = run["effective_reference_snapshot"]
+        self.assertEqual(snapshot["artifact_id"], sent.artifact.id)
+        self.assertEqual(snapshot["transcript"], sent.reference_text)
+        self.assertNotEqual(snapshot["transcript"], FIRST_TRANSCRIPT)
 
 
 if __name__ == "__main__":

@@ -28,13 +28,24 @@ UNKNOWN = "unknown"
 # Breeze conditions on `ref_text`: prose only. The analysis boundary strips
 # diarization markup (`services/sources.py`); a stored top-level transcript may
 # still carry SRT/VTT ranges, and those are dropped at composition, not in place.
-_SPEAKER_MARKUP = re.compile(r"\bspeaker[_\s-]*\w+\s*:", re.IGNORECASE)
+#
+# A range is the one thing that names a cue, so it is matched with the shape a
+# cue has in either format: an optional bracket (`[00:01.23 --> 00:02.00]`), an
+# optional leading cue number on its own line (SRT numbers every cue), and no
+# bracket at all — a bare `00:00:00,000 --> 00:00:02,000` line is the common
+# form. A lone clock token is not a range: `_TIMESTAMP` only removes a bracketed
+# one, so prose that merely mentions a time is left alone.
+_CLOCK = r"\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?"
+_CUE_INDEX = r"(?:^[ \t]*\d{1,9}[ \t]*\r?\n[ \t]*)?"
 _SRT_RANGE = re.compile(
-    r"[\[(]\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*"
-    r"(?:-->|->|—|–|to)\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*[\])]",
-    re.IGNORECASE,
+    _CUE_INDEX + r"[\[(]?\s*" + _CLOCK + r"\s*(?:-->|->|—|–|to)\s*" + _CLOCK + r"\s*[\])]?",
+    re.IGNORECASE | re.MULTILINE,
 )
-_TIMESTAMP = re.compile(r"[\[(]\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*[\])]")
+_TIMESTAMP = re.compile(r"[\[(]\s*" + _CLOCK + r"\s*[\])]")
+# `SPEAKER_00:` and the short `S0:` the decoder also emits.
+_SPEAKER_MARKUP = re.compile(r"\b(?:speaker[_\s-]*\w+|s\d+)\s*:", re.IGNORECASE)
+# The WebVTT signature line. Only a header at the very start of the text is one.
+_WEBVTT_HEADER = re.compile(r"\AWEBVTT\b[^\n]*\r?\n?", re.IGNORECASE)
 
 
 def _as_interval(value: Interval) -> Interval:
@@ -355,9 +366,12 @@ def clean_ref_text(text: str) -> str:
     """Prose for Breeze: no timestamps, no SRT/VTT ranges, no diarization markup.
 
     Breeze conditions on `ref_text`, so the composition boundary strips what a
-    stored transcript may carry. The stored row is never rewritten.
+    stored transcript may carry: the WebVTT signature, every cue range with its
+    cue number, a bracketed clock token, and diarization markup. The stored row
+    is never rewritten.
     """
-    stripped = _SRT_RANGE.sub(" ", text)
+    stripped = _WEBVTT_HEADER.sub(" ", text)
+    stripped = _SRT_RANGE.sub(" ", stripped)
     stripped = _TIMESTAMP.sub(" ", stripped)
     stripped = _SPEAKER_MARKUP.sub(" ", stripped)
     return " ".join(stripped.split())
