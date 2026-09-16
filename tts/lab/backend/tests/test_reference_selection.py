@@ -102,7 +102,10 @@ FORMAT_FIXTURES: tuple[tuple[str, str, str], ...] = (
 # Prose the sanitiser must hand back byte-for-byte. Direction B: the operator's
 # own words are not timestamp material, and deleting them diverges the picker
 # quote from the sent `ref_text` by real words — silently. `9:00 to 5:00` and
-# `the s3: bucket policy` are the shapes an over-eager pass ate before.
+# `the s3: bucket policy` are the shapes an over-eager pass ate before. So is a
+# plain word that merely *starts* with a diarization token and is followed by a
+# colon: `speakers:` and `the speakerphone:` are the operator's sentence, not
+# markup, and a rule that lets the separator be zero width eats them.
 PROSE_SURVIVALS: tuple[str, ...] = (
     "it started at 3:30 pm",
     "note: bring water",
@@ -117,6 +120,10 @@ PROSE_SURVIVALS: tuple[str, ...] = (
     "the 9:00 \u2014 5:00 shift",
     "the s3: bucket policy",
     "The Talker: a subtitle",
+    "the speakerphone: muted for now",
+    "speakers: left and right channels",
+    "Speakers: Ata and Sam, we met at 3:30 pm",
+    "speakers: two of them",
 )
 
 # The invariant, not the regex: Breeze gets prose. A clock-like token of any
@@ -526,6 +533,21 @@ class ReferenceResolutionTest(unittest.TestCase):
         self.store.execute(statement, (text, row_id))
         self.store.commit()
 
+    def _shown_quote(self, voice: dict, origin: str, clip_id: str) -> str:
+        """The quote the surface shows for the selected origin, verbatim.
+
+        The editor's transcript box reads the selected source's `transcript` (the
+        bench asset list reads a clip's `clean_transcript`); neither is sanitised
+        on the way out. An over-eager pass made the shown quote and the sent
+        `ref_text` disagree by real words, silently.
+        """
+        if origin == "clip":
+            return next(
+                item["clean_transcript"] for item in voice["clips"] if item["id"] == clip_id
+            )
+        wanted = self.voice["sources"][0]["id"] if origin == "primary" else self.second_source
+        return next(item["transcript"] for item in voice["sources"] if item["id"] == wanted)
+
     def test_every_origin_path_composes_prose_only_ref_text(self) -> None:
         clip = self._clip_fixture()
         clip_reference = self._reference(
@@ -578,6 +600,10 @@ class ReferenceResolutionTest(unittest.TestCase):
                     resolved = resolve_synthesis_request(self.state, self._body())
 
                     self.assertEqual(resolved.reference_text, sample)
+                    self.assertEqual(
+                        self._shown_quote(activated.json(), origin, clip["id"]),
+                        resolved.reference_text,
+                    )
                     self.assertEqual(self._stored_transcript_rows(clip["id"]), before)
 
     def test_run_record_keeps_the_reference_transcript_the_request_sent(self) -> None:

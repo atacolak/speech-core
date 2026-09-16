@@ -56,10 +56,18 @@ _TIMESTAMP = re.compile(r"[\[(]\s*" + _CLOCK + r"\s*[\])]")
 # cue fragment. A bare `H:MM` can be a time of day (`4:15`, `3:30 pm`).
 _LONE_CLOCK = re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?\b|\b\d{1,2}:\d{2}[.,]\d{1,3}\b")
 # `SPEAKER_00:` anywhere, and the short `S0:` the decoder emits at a cue start.
-# The short form is a whole token at the head of a line: `the s3: bucket policy`
-# is prose, and the previous loose match ate it.
+# The id must be real: either a separator carries it (`SPEAKER_00:`,
+# `SPEAKER 01:`, `Speaker A:`) or it cannot continue the word — digits
+# (`speaker00:`) or a genuinely capitalised initial (`SpeakerA:`). A zero-width
+# separator in front of a plain lowercase word is not markup: `speakers:` and
+# `the speakerphone:` are the operator's sentence, and eating them showed a
+# picker quote the reference never sent. The capital test is case-scoped so the
+# flag above cannot collapse it into "any word". The short form is a whole token
+# at the head of a line: `the s3: bucket policy` is prose, and the previous
+# loose match ate it.
 _SPEAKER_MARKUP = re.compile(
-    r"\b(?:speaker[_\s-]*\w+)\s*:|^[ \t]*s\d+\s*:", re.IGNORECASE | re.MULTILINE
+    r"(?:\bspeaker(?:[_\s-]+\w+|\d{1,3}|(?-i:[A-Z])\w*)|^[ \t]*s\d+)\s*:",
+    re.IGNORECASE | re.MULTILINE,
 )
 # The WebVTT signature line. Only a header at the very start of the text is one,
 # and a BOM or a leading blank line is still the start.
