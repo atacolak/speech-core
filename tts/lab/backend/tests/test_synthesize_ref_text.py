@@ -46,8 +46,8 @@ class SynthesizeRefText(unittest.TestCase):
     def _create(self, *, transcript: str, import_text: str | None = None) -> dict:
         wav = _wav(self.root / "voice.wav")
         with patch(
-            "tts.lab.backend.services.voices.transcribe_reference",
-            return_value="" if import_text is None else import_text,
+            "tts.lab.backend.services.voices.transcribe_alignment",
+            return_value={"text": "" if import_text is None else import_text, "words": []},
         ):
             with wav.open("rb") as handle:
                 response = self.client.post(

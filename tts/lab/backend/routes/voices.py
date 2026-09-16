@@ -608,13 +608,24 @@ def activate_variant(request: Request, voice_id: str, body: ActivateBody) -> dic
         target = next((item for item in voice["variants"] if item["id"] == body.variant_id), None)
     elif body.kind:
         target = next((item for item in voice["variants"] if item["kind"] == body.kind), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail="reference variant not found")
-    store.execute(
-        "UPDATE voices SET active_reference_variant_id=?, updated_at=? WHERE id=?",
-        (target["id"], _now(), voice_id),
-    )
-    set_default_reference(store, voice_id, target["id"])
+    if target is not None:
+        store.execute(
+            "UPDATE voices SET active_reference_variant_id=?, updated_at=? WHERE id=?",
+            (target["id"], _now(), voice_id),
+        )
+        set_default_reference(store, voice_id, target["id"])
+        store.commit()
+        return get_voice_or_404(store, voice_id)
+    # An enrolled reference artifact, not a legacy variant. A GENERATION, an
+    # experiment or a foreign id is never eligible, and stored ids stay put.
+    artifact = None
+    if body.variant_id:
+        artifact = next(
+            (item for item in voice["artifacts"] if item["id"] == body.variant_id), None
+        )
+    if artifact is None or artifact.get("role") != REFERENCE:
+        raise HTTPException(status_code=404, detail="reference not found")
+    set_default_reference(store, voice_id, str(artifact["id"]))
     store.commit()
     return get_voice_or_404(store, voice_id)
 

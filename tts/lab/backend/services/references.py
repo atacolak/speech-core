@@ -182,3 +182,32 @@ def slice_transcript(
     kept = [word for word in words if _word_in_keep(word, windows)]
     return join_words(kept)
 
+
+def reference_transcript(voice: dict[str, Any], reference_id: str | None) -> str:
+    """The clean transcript of the selected reference, never another origin's.
+
+    One rule for the voice picker and for `ref_text`: a selected artifact's
+    `source_id` wins, then a clip's own clean transcript, then the primary
+    transcript for a legacy variant or no selection at all.
+    """
+    artifacts = voice.get("artifacts") or []
+    target = next((item for item in artifacts if item["id"] == reference_id), None)
+    if target is not None and target.get("source_id"):
+        source = next(
+            (item for item in voice.get("sources") or [] if item["id"] == target["source_id"]),
+            None,
+        )
+        if source is not None:
+            return str(source.get("transcript") or "").strip()
+    clip = next(
+        (
+            item
+            for item in voice.get("clips") or []
+            if reference_id in {item["id"], item["audio_artifact_id"]}
+        ),
+        None,
+    )
+    if clip is not None:
+        return str(clip.get("clean_transcript") or "").strip()
+    return str(voice.get("effective_transcript") or voice.get("source_transcript") or "").strip()
+

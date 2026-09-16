@@ -17,6 +17,7 @@ from tts.lab.backend.models import DualGuidance, parse_guidance
 from tts.lab.backend.routes.voices import get_voice_or_404
 from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.breeze import SynthesisRequest, synthesize_e2
+from tts.lab.backend.services.references import reference_transcript
 from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.packets import new_id
 
@@ -64,12 +65,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _reference_transcript(voice: dict[str, Any]) -> str:
-    return str(voice.get("effective_transcript") or voice.get("source_transcript") or "").strip()
-
-
-def _fill_ref_text(store: Any, voice: dict[str, Any], reference_path: Path) -> str:
-    text = _reference_transcript(voice)
+def _fill_ref_text(
+    store: Any, voice: dict[str, Any], reference_path: Path, reference_id: str | None
+) -> str:
+    text = reference_transcript(voice, reference_id)
     if text:
         return text
     try:
@@ -114,8 +113,33 @@ class ResolvedSynthesis:
     settings: GenerationSettings
 
 
+def _reference_audio_id(voice: dict[str, Any], reference_id: str | None) -> str | None:
+    """The audio artifact a selected reference id names, when it is not a legacy variant."""
+    if not reference_id:
+        return None
+    target = next(
+        (item for item in voice.get("artifacts") or [] if item["id"] == reference_id), None
+    )
+    if target is not None:
+        return str(target["audio_artifact_id"])
+    clip = next(
+        (
+            item
+            for item in voice.get("clips") or []
+            if reference_id in {item["id"], item["audio_artifact_id"]}
+        ),
+        None,
+    )
+    return None if clip is None else str(clip["audio_artifact_id"])
+
+
 def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthesis:
-    """Resolve the voice, reference audio/transcript, and settings for one request."""
+    """Resolve the voice, reference audio/transcript, and settings for one request.
+
+    One selection drives both halves: the picked reference's audio and that same
+    origin's clean transcript. A legacy variant keeps the keep-crop fallback and
+    the primary transcript it has always used.
+    """
     voice = get_voice_or_404(state.store, body.voice_profile_id)
     from tts.lab.backend.models import Interval
     from tts.lab.backend.services.references import (
@@ -130,7 +154,12 @@ def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthe
             (item for item in voice.get("variants") or [] if item["id"] == body.reference_variant_id),
             variant,
         )
-    if variant is not None and processed_variant_is_current(
+    selected = body.reference_variant_id or voice.get("default_reference_id")
+    selected_audio_id = _reference_audio_id(voice, selected)
+    if selected_audio_id is not None:
+        artifact = state.store.get(selected_audio_id)
+        reference_path = artifact.path
+    elif variant is not None and processed_variant_is_current(
         variant, source.sha256, voice["keep_intervals"]
     ):
         artifact = state.store.get(variant["audio_artifact_id"])
@@ -143,7 +172,12 @@ def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthe
         materialize_keep_wav(source.path, keep, dest)
         reference_path = dest
     settings = _settings_from_generation(body.generation)
-    reference_text = _fill_ref_text(state.store, voice, Path(reference_path))
+    reference_text = _fill_ref_text(
+        state.store,
+        voice,
+        Path(reference_path),
+        selected if selected_audio_id is not None else None,
+    )
     return ResolvedSynthesis(
         voice=voice,
         artifact=artifact,
