@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from tts.lab.backend.runtime.leftover import NoopLeftover
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.runtime.vram import FixedVramProbe
 from tts.lab.backend.runtime.worker import CountingWorkerFactory, FakeWorkerHandle
+from tts.lab.backend.services.run_alignment import align_run
 from tts.wav import write_wav
 
 GIB = 1024 ** 3
@@ -26,6 +28,7 @@ SAMPLE_RATE = 24000
 POLL_S = 10.0
 
 ALIGN_TARGET = "tts.lab.backend.services.run_alignment.transcribe_alignment"
+THREAD_TARGET = "tts.lab.backend.services.run_alignment.threading"
 
 WORDS = [
     {"text": "hello", "start_s": 0.10, "end_s": 0.42},
@@ -57,6 +60,16 @@ class FakeAlignment:
         self.entered.set()
         self.release.wait(timeout=POLL_S)
         return self.result
+
+
+class BrokenThreadStart:
+    """threading.Thread stand-in whose start() fails like an exhausted process."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def start(self) -> None:
+        raise RuntimeError("can't start new thread")
 
 
 class RunAlignmentTest(unittest.TestCase):
@@ -111,6 +124,41 @@ class RunAlignmentTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         return self.state.store.get(str(row["output_artifact_id"])).path
+
+    def _artifact_id(self, run_id: str) -> str:
+        row = self.state.store.execute(
+            "SELECT output_artifact_id FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return str(row["output_artifact_id"])
+
+    def _seed_pending_run(self, run_id: str = "run_pending_seed") -> tuple[str, str]:
+        """A durable pending row, as a restart or a stale read would find it."""
+        settled = self.root / f"{run_id}.wav"
+        write_wav(settled, SAMPLE_RATE, np.zeros(2400, dtype=np.float32))
+        artifact = self.state.store.import_audio(settled)
+        self.state.store.execute(
+            """
+            INSERT INTO runs (
+                id, voice_id, request_json, output_artifact_id, effective_reference_json,
+                latency_ms, first_audio_ms, duration_s, rating, tags_json, created_at,
+                alignment_json
+            ) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)
+            """,
+            (
+                run_id,
+                json.dumps({"text": "hello world"}),
+                artifact.id,
+                json.dumps({}),
+                120.0,
+                0.2,
+                json.dumps([]),
+                "2026-09-16T00:00:00Z",
+                json.dumps({"status": "pending"}),
+            ),
+        )
+        self.state.store.commit()
+        return run_id, artifact.id
 
     def _alignment(self, run_id: str, client: TestClient | None = None) -> dict:
         response = (client or self.client).get(f"/api/runs/{run_id}")
@@ -236,6 +284,58 @@ class RunAlignmentTest(unittest.TestCase):
             self.assertEqual(len(self._synth_calls()), synth_calls)
         self.assertEqual(aligner.calls, 1)
         self.assertEqual(aligner.paths, [str(self._output_path(run_id))])
+
+    def test_late_duplicate_pending_snapshot_cannot_downgrade_ready(self) -> None:
+        """A duplicate pass from a stale pending snapshot cannot overwrite a settled cache."""
+        aligner = FakeAlignment()
+        with patch(ALIGN_TARGET, new=aligner):
+            response = self.client.post(
+                "/api/generate/stream", json=self._body("One short line.")
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertGreater(len(response.content), 0)
+            run_id = self._only_run_id()
+            body = self._settled(run_id)
+        self.assertEqual(
+            body["alignment"], {"status": "ready", "text": "hello world", "words": WORDS}
+        )
+        # A reader holding the pre-settlement snapshot schedules one more pass.
+        late = FakeAlignment(result={"text": "", "words": []})
+        with patch(ALIGN_TARGET, new=late):
+            align_run(self.state.store, run_id, self._artifact_id(run_id))
+        self.assertEqual(late.calls, 1)
+        self.assertEqual(
+            self._alignment(run_id),
+            {"status": "ready", "text": "hello world", "words": WORDS},
+        )
+
+    def test_failed_thread_start_leaves_run_reschedulable(self) -> None:
+        """A start() that blows up must not strand the run id as unschedulable."""
+        run_id, _artifact_id = self._seed_pending_run()
+        leaked: Exception | None = None
+        with patch(THREAD_TARGET, new=SimpleNamespace(Thread=BrokenThreadStart)):
+            try:
+                listed = self.client.get("/api/runs")
+            except Exception as exc:  # 388db09 lets the start failure escape the route
+                leaked = exc
+            self.assertIsNone(leaked, "a failed thread start must not escape the run route")
+            self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()["items"][0]["alignment"], {"status": "pending"})
+        # Still pending, so the next read has to schedule it again.
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            fetched = self.client.get(f"/api/runs/{run_id}")
+            self.assertEqual(fetched.status_code, 200, fetched.text)
+            self.assertTrue(aligner.entered.wait(timeout=POLL_S), "run was never rescheduled")
+            try:
+                self.assertEqual(fetched.json()["alignment"], {"status": "pending"})
+            finally:
+                aligner.release.set()
+            body = self._settled(run_id)
+        self.assertEqual(
+            body["alignment"], {"status": "ready", "text": "hello world", "words": WORDS}
+        )
+        self.assertEqual(aligner.calls, 1)
 
 
 if __name__ == "__main__":

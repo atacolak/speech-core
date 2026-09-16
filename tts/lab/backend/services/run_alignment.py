@@ -65,9 +65,11 @@ def align_run(store: Any, run_id: str, artifact_id: str) -> None:
         # Fail closed through the same cached shape the missing-tooling path uses.
         alignment = unavailable_alignment()
     try:
+        # Guarded on the pending cache: a duplicate pass holding a stale snapshot
+        # must never overwrite a cache that already settled. Zero rows is a no-op.
         store.execute(
-            "UPDATE runs SET alignment_json = ? WHERE id = ?",
-            (json.dumps(alignment), run_id),
+            "UPDATE runs SET alignment_json = ? WHERE id = ? AND alignment_json = ?",
+            (json.dumps(alignment), run_id, json.dumps(pending_alignment())),
         )
         store.commit()
     except Exception:
@@ -82,17 +84,25 @@ class RunAlignments:
         self._active: set[str] = set()
 
     def schedule(self, store: Any, run_id: str, artifact_id: str) -> None:
-        """Start alignment for a pending run unless it is already running."""
+        """Start alignment for a pending run unless it is already running.
+
+        A thread that cannot start (exhaustion) leaves the row pending and
+        resumable; the failure never escapes the caller recording the run.
+        """
         with self._lock:
             if run_id in self._active:
                 return
             self._active.add(run_id)
-        threading.Thread(
-            target=self._run,
-            args=(store, run_id, artifact_id),
-            name=f"run-align-{run_id}",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._run,
+                args=(store, run_id, artifact_id),
+                name=f"run-align-{run_id}",
+                daemon=True,
+            ).start()
+        except Exception:
+            with self._lock:
+                self._active.discard(run_id)
 
     def _run(self, store: Any, run_id: str, artifact_id: str) -> None:
         try:
