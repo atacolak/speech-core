@@ -21,12 +21,24 @@ class ProgressiveSegmenterTest(unittest.TestCase):
 
     def test_keeps_decimal_abbreviation_and_cjk_words(self) -> None:
         prefix = "Steady context " * 10
-        text = prefix + "uses 3.14 and e.g. this value. 下一句结束。 Tail."
-        parts = segment_text(text, min_chars=80, max_chars=150)
+        tail = " More context follows here." * 4
+        text = prefix + "uses 3.14 and e.g. this value. 下一句结束。 Tail." + tail
+        parts = segment_text(text, min_chars=80, max_chars=200)
         self.assertNotEqual(parts[0][-2:], "3.")
         self.assertNotEqual(parts[0][-3:], "e.g")
         self.assertTrue(parts[0].endswith("."))
+        self.assertTrue(all(len(part) <= 200 for part in parts))
         self.assertEqual(" ".join(" ".join(parts).split()), " ".join(text.split()))
+
+    def test_run_on_sentence_never_exceeds_hard_cap(self) -> None:
+        text = ("alpha beta gamma delta " * 300) + "end."
+        parts = segment_text(text)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= SEGMENT_MAX_CHARS for part in parts))
+        self.assertEqual(
+            " ".join(" ".join(parts).split()),
+            " ".join(text.split()),
+        )
 
     def test_falls_back_to_whitespace_then_hard_cut(self) -> None:
         words = "word " * 100

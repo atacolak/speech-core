@@ -38,6 +38,7 @@ def segment_text(
     min_chars: int = SEGMENT_MIN_CHARS,
     max_chars: int = SEGMENT_MAX_CHARS,
 ) -> list[str]:
+    """Split at speech boundaries while keeping every part within max_chars."""
     if min_chars < 1 or max_chars <= min_chars:
         raise ValueError("segment bounds require 1 <= min_chars < max_chars")
     remaining = text.strip()
@@ -51,10 +52,6 @@ def segment_text(
         cut = next((end for end in reversed(paragraphs) if end >= min_chars), None)
         if cut is None:
             cut = _sentence_end(remaining, min_chars, max_chars)
-        if cut is None:
-            # No sentence boundary inside the window: keep the sentence whole
-            # instead of slicing it at whitespace, then fall back.
-            cut = _sentence_end(remaining, max_chars, len(remaining))
         if cut is None:
             spaces = [index for index, char in enumerate(window) if char.isspace()]
             cut = spaces[-1] if spaces else max_chars
