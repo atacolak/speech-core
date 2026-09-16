@@ -1,11 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { InspectorPane } from '@/features/inspector/inspector-pane'
 import { VoicesPane } from '@/features/voices/voices-pane'
 import { useWorkspace } from '@/state/workspace'
 
-function variantVoice(overrides: Record<string, unknown> = {}) {
+type VoiceFixture = Record<string, unknown>
+
+/** A profile voice: two enrolled references, one of them a clip with its own clean transcript. */
+function profileVoice(overrides: VoiceFixture = {}): VoiceFixture {
   return {
     id: 'vp1',
     name: 'ata',
@@ -13,45 +16,124 @@ function variantVoice(overrides: Record<string, unknown> = {}) {
     source_audio_artifact_id: 'art_src',
     original_artifact_id: 'art_src',
     original_format: 'wav',
-    source_transcript: 'hello',
+    source_transcript: 'source A words',
     keep_intervals: [{ start_s: 0, end_s: 11.5 }],
-    effective_transcript: 'hello',
-    active_reference_variant_id: 'rv_den',
-    active_variant: {
-      id: 'rv_den',
-      voice_profile_id: 'vp1',
-      kind: 'resemble',
-      audio_artifact_id: 'art_den',
-      duration_s: 11.5,
-      stale: false,
-    },
+    effective_transcript: 'source A words',
+    sources: [
+      {
+        id: 'src_a',
+        label: 'take A',
+        artifact_id: 'art_src',
+        transcript: 'source A words',
+        duration_s: 11.5,
+      },
+    ],
+    clips: [
+      { id: 'clip_b', audio_artifact_id: 'art_clip_b', clean_transcript: 'clip B clean words' },
+    ],
+    artifacts: [
+      {
+        id: 'ref_a',
+        role: 'reference',
+        kind: 'original',
+        name: 'take A',
+        audio_artifact_id: 'art_src',
+        source_id: 'src_a',
+      },
+      {
+        id: 'ref_b',
+        role: 'reference',
+        kind: 'original',
+        name: 'clip B',
+        audio_artifact_id: 'art_clip_b',
+        source_id: null,
+      },
+    ],
+    default_reference_id: 'ref_a',
+    active_reference_variant_id: null,
+    active_variant: null,
     variants: [],
     speaker_analysis: null,
     duration_s: 11.5,
     source_duration_s: 12,
     effective_duration_s: 11.5,
-    created_at: '2026-09-12T00:00:00Z',
-    updated_at: '2026-09-12T00:00:00Z',
+    latest_take_id: 'run_1',
+    created_at: '2026-09-16T00:00:00Z',
+    updated_at: '2026-09-16T00:00:00Z',
     ...overrides,
   }
 }
 
-function stubLab(current: unknown) {
+const ORIGINAL_VARIANT = {
+  id: 'rv_orig',
+  voice_profile_id: 'vp1',
+  kind: 'original',
+  audio_artifact_id: 'art_src',
+  duration_s: 11.5,
+}
+
+/** A legacy voice: `reference_variants` rows are its references. */
+function legacyVoice(
+  activeVariant: Record<string, unknown> = {
+    id: 'rv_den',
+    voice_profile_id: 'vp1',
+    kind: 'resemble',
+    audio_artifact_id: 'art_den',
+    duration_s: 11.5,
+    stale: false,
+  },
+  overrides: VoiceFixture = {},
+): VoiceFixture {
+  return profileVoice({
+    artifacts: [],
+    default_reference_id: null,
+    active_reference_variant_id: activeVariant.id,
+    active_variant: activeVariant,
+    variants: [ORIGINAL_VARIANT, activeVariant],
+    ...overrides,
+  })
+}
+
+/** A parked AuK candidate: its task word must never name the asset. */
+const AUK_VARIANT = {
+  id: 'rv_auk',
+  voice_profile_id: 'vp1',
+  kind: 'auk',
+  audio_artifact_id: 'art_auk',
+  duration_s: 11.5,
+  auk_task: 'enhance',
+  auk_precision: 'bf16',
+  stale: false,
+}
+
+type Call = { url: string; method: string; body: string }
+
+function stubLab(
+  read: () => VoiceFixture,
+  options: { runs?: unknown[]; activate?: (id: string) => void } = {},
+) {
+  const calls: Call[] = []
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: RequestInfo) => {
+    vi.fn(async (input: RequestInfo, init?: RequestInit) => {
       const url = String(input)
-      const body = url.includes('/api/runtime')
+      const body = typeof init?.body === 'string' ? init.body : ''
+      calls.push({ url, method: init?.method ?? 'GET', body })
+      if (url.includes('/reference/activate')) {
+        options.activate?.(JSON.parse(body).variant_id as string)
+      }
+      const payload = url.includes('/api/runtime')
         ? { active_voice_id: null, lease_owner: null, phase: 'idle', leases: [] }
         : url.includes('/api/runs')
-          ? { items: [] }
-          : { items: [current] }
-      return new Response(JSON.stringify(body), {
+          ? { items: options.runs ?? [] }
+          : { items: [read()] }
+      return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
     }),
   )
+  return calls
 }
 
 function renderPane(node: React.ReactElement) {
@@ -60,99 +142,177 @@ function renderPane(node: React.ReactElement) {
   return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>)
 }
 
-function audioSources(container: HTMLElement) {
-  return Array.from(container.querySelectorAll('audio')).map((node) =>
-    node.getAttribute('src') ?? '',
-  )
+function optionValues(picker: HTMLElement) {
+  return Array.from(picker.querySelectorAll('option')).map((node) => node.value)
 }
 
-describe('reference variant chrome', () => {
+describe('reference picker chrome', () => {
   afterEach(() => {
     // The stub stays installed: panes refetch during teardown, and a relative URL
     // reaching the real fetch would throw after the run.
     useWorkspace.setState({ selectedVoiceId: null })
   })
 
-  it('names a parked denoise variant without the resemble product name and plays its artifact', async () => {
-    stubLab(variantVoice())
-    renderPane(<VoicesPane />)
-    const label = await screen.findByText(/reference: denoised/)
-    const card = label.closest('div') as HTMLElement
-    expect(screen.getByText(/▶ denoised/)).toBeInTheDocument()
-    expect(screen.queryByText(/resemble/i)).toBeNull()
-    expect(audioSources(card).some((src) => src.includes('art_den'))).toBe(true)
+  it('activates the picked reference and moves the quote and audio to its own origin', async () => {
+    let voice = profileVoice()
+    const calls = stubLab(() => voice, {
+      activate: (id) => {
+        voice = profileVoice({ default_reference_id: id })
+      },
+    })
+    const { container } = renderPane(<VoicesPane />)
+
+    const picker = await screen.findByLabelText('Reference')
+    const card = picker.closest('div') as HTMLElement
+    expect(within(picker).getByRole('option', { name: '★ take A' })).toBeInTheDocument()
+    expect(await within(card).findByText('source A words')).toBeInTheDocument()
+
+    fireEvent.change(picker, { target: { value: 'ref_b' } })
+
+    expect(await within(card).findByText('clip B clean words')).toBeInTheDocument()
+    const post = calls.find((call) => call.url.includes('/reference/activate'))
+    expect(post?.method).toBe('POST')
+    expect(post?.url).toContain('/api/voices/vp1/reference/activate')
+    expect(JSON.parse(post?.body ?? '{}')).toEqual({ variant_id: 'ref_b' })
+    expect(within(card).queryByText('source A words')).toBeNull()
+    expect((picker as HTMLSelectElement).value).toBe('ref_b')
+    expect(
+      Array.from(card.querySelectorAll('audio')).some((node) =>
+        (node.getAttribute('src') ?? '').includes('art_clip_b'),
+      ),
+    ).toBe(true)
+    expect(container.querySelectorAll('audio').length).toBeGreaterThan(0)
   })
 
-  it('falls back to the keep crop and flags a stale denoise variant', async () => {
-    stubLab(
-      variantVoice({
-        active_variant: {
-          id: 'rv_den',
-          voice_profile_id: 'vp1',
-          kind: 'resemble',
-          audio_artifact_id: 'art_den',
-          duration_s: 11.5,
-          stale: true,
-        },
+  it('offers the voice references in stored order and never a run', async () => {
+    stubLab(() => profileVoice())
+    renderPane(<VoicesPane />)
+
+    const picker = await screen.findByLabelText('Reference')
+
+    expect(optionValues(picker)).toEqual(['ref_a', 'ref_b'])
+    expect(optionValues(picker)).not.toContain('run_1')
+    expect(within(picker).getByRole('option', { name: 'clip B' })).toBeInTheDocument()
+  })
+
+  it('names a parked denoise variant without the resemble product name and plays its artifact', async () => {
+    stubLab(() => legacyVoice())
+    const { container } = renderPane(<VoicesPane />)
+
+    const picker = await screen.findByLabelText('Reference')
+
+    expect(within(picker).getByRole('option', { name: '★ denoised' })).toBeInTheDocument()
+    expect(within(picker).getByRole('option', { name: 'original' })).toBeInTheDocument()
+    expect(screen.queryByText(/resemble/i)).toBeNull()
+    expect(
+      Array.from(container.querySelectorAll('audio')).some((node) =>
+        (node.getAttribute('src') ?? '').includes('art_den'),
+      ),
+    ).toBe(true)
+  })
+
+  it('flags a stale denoise variant and falls back to the keep crop', async () => {
+    stubLab(() =>
+      legacyVoice({
+        id: 'rv_den',
+        voice_profile_id: 'vp1',
+        kind: 'resemble',
+        audio_artifact_id: 'art_den',
+        duration_s: 11.5,
+        stale: true,
       }),
     )
-    renderPane(<VoicesPane />)
-    const label = await screen.findByText(/reference: denoised \(stale\)/)
-    // The reference chrome is the card; the bench may list the same artifact on its own.
-    const sources = audioSources(label.closest('div') as HTMLElement)
+    const { container } = renderPane(<VoicesPane />)
+
+    const picker = await screen.findByLabelText('Reference')
+
+    expect(within(picker).getByRole('option', { name: '★ denoised (stale)' })).toBeInTheDocument()
+    const sources = Array.from(container.querySelectorAll('audio')).map(
+      (node) => node.getAttribute('src') ?? '',
+    )
     expect(sources.some((src) => src.includes('art_den'))).toBe(false)
     expect(sources.some((src) => src.includes('/reference/audio'))).toBe(true)
   })
 
-  it('reports the active reference kind in the settings pane', async () => {
-    stubLab(variantVoice())
-    renderPane(<InspectorPane />)
-    expect(await screen.findByText(/^denoised · /)).toBeInTheDocument()
-    expect(screen.queryByText(/resemble/i)).toBeNull()
-  })
-
   it('names a parked auk variant by a neutral word, not its task or the product', async () => {
-    stubLab(
-      variantVoice({
-        active_reference_variant_id: 'rv_auk',
-        active_variant: {
-          id: 'rv_auk',
-          voice_profile_id: 'vp1',
-          kind: 'auk',
-          audio_artifact_id: 'art_auk',
-          duration_s: 11.5,
-          auk_task: 'enhance',
-          auk_precision: 'bf16',
-          stale: false,
-        },
-      }),
-    )
+    stubLab(() => legacyVoice(AUK_VARIANT))
     renderPane(<VoicesPane />)
-    const label = await screen.findByText(/reference: candidate/)
+
+    const picker = await screen.findByLabelText('Reference')
+
+    expect(within(picker).getByRole('option', { name: '★ candidate' })).toBeInTheDocument()
     expect(screen.getByText(/▶ candidate/)).toBeInTheDocument()
     // Exact text only: prose may describe processing, but no asset is *named* by a task word.
     expect(screen.queryByText('enhance')).toBeNull()
     expect(screen.queryByText(/auk/i)).toBeNull()
-    const card = label.closest('div') as HTMLElement
-    expect(audioSources(card).some((src) => src.includes('art_auk'))).toBe(true)
+  })
+
+  it('reports the active reference kind in the settings pane', async () => {
+    stubLab(() => legacyVoice())
+    renderPane(<InspectorPane />)
+
+    expect(await screen.findByText(/^denoised · /)).toBeInTheDocument()
+    expect(screen.queryByText(/resemble/i)).toBeNull()
   })
 
   it('reports the parked auk variant as a candidate in the settings pane', async () => {
-    stubLab(
-      variantVoice({
-        active_reference_variant_id: 'rv_auk',
-        active_variant: {
-          id: 'rv_auk',
-          voice_profile_id: 'vp1',
-          kind: 'auk',
-          audio_artifact_id: 'art_auk',
-          duration_s: 11.5,
-          stale: false,
-        },
-      }),
-    )
+    stubLab(() => legacyVoice(AUK_VARIANT))
     renderPane(<InspectorPane />)
+
     expect(await screen.findByText(/^candidate · /)).toBeInTheDocument()
     expect(screen.queryByText(/auk/i)).toBeNull()
+  })
+
+  it('keeps Takes and drops every voice bench pile from the inspector', async () => {
+    stubLab(() => legacyVoice(), {
+      runs: [
+        {
+          id: 'run_1',
+          voice_id: 'vp1',
+          output_artifact_id: 'art_take',
+          latency_ms: 200,
+          first_audio_ms: 30,
+          duration_s: 3.2,
+          rating: null,
+          tags: [],
+          request_snapshot: {
+            text: 'Born. UNBORN.',
+            produced_text: 'Born.',
+            segments_planned: 2,
+            segments_completed: 1,
+            stopped: true,
+            generation: { seed: 7 },
+          },
+        },
+      ],
+    })
+    renderPane(<InspectorPane />)
+
+    expect(await screen.findByRole('heading', { name: 'Takes' })).toBeInTheDocument()
+    for (const name of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES']) {
+      expect(screen.queryByRole('heading', { name })).toBeNull()
+      expect(screen.queryByRole('region', { name })).toBeNull()
+    }
+    const transcript = await screen.findByText('Born.…')
+    expect(transcript.textContent).toBe('Born.…')
+    for (const className of ['mt-1', 'line-clamp-4', 'text-[11px]', 'italic', 'text-zinc-500']) {
+      expect(transcript.classList.contains(className)).toBe(true)
+    }
+    expect(document.body.textContent).not.toContain('UNBORN')
+  })
+
+  it('renders neither GENERATE workbench door', async () => {
+    stubLab(() => profileVoice())
+    renderPane(
+      <>
+        <VoicesPane />
+        <InspectorPane />
+      </>,
+    )
+
+    await screen.findByLabelText('Reference')
+
+    expect(screen.queryByRole('button', { name: 'Open workbench' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
   })
 })

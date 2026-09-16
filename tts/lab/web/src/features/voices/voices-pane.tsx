@@ -2,33 +2,42 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AudioBar } from '@/components/audio-bar'
+import { type ReferenceOption, referenceOptions } from '@/features/voices/reference-options'
 import { VoiceList } from '@/features/voices/voice-list'
 import {
-  activeReferenceLabel,
+  activateVariant,
   artifactAudioUrl,
   createVoice,
   deleteVoice,
-  effectiveDurationS,
   fetchRuntime,
   fetchVoices,
   formatApiError,
-  isCroppedReference,
   patchVoice,
   pickDefaultVoice,
   setActiveVoice,
-  sourceDurationS,
+  type Voice,
   voiceReferenceAudioUrl,
 } from '@/lib/api'
-import { formatSeconds } from '@/lib/format'
 import { useWorkspace } from '@/state/workspace'
 
 const ACCEPT = '.wav,.mp3,.flac,.m4a,.ogg,.aac,.opus,audio/*'
+
+/**
+ * The audio behind the picker. A derived reference plays its own render; the
+ * primary source is the lab's keep crop, and a stale render no longer matches
+ * the material it was made from, so both fall back to the reference endpoint.
+ */
+function referenceAudioSrc(voice: Voice, option: ReferenceOption | undefined): string {
+  if (option && option.audioArtifactId !== voice.source_audio_artifact_id && !option.stale) {
+    return artifactAudioUrl(option.audioArtifactId)
+  }
+  return voiceReferenceAudioUrl(voice.id, voice.updated_at)
+}
 
 export function VoicesPane() {
   const client = useQueryClient()
   const selectedVoiceId = useWorkspace((state) => state.selectedVoiceId)
   const selectVoice = useWorkspace((state) => state.selectVoice)
-  const openEditor = useWorkspace((state) => state.openEditor)
   const voices = useQuery({ queryKey: ['voices'], queryFn: fetchVoices })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: fetchRuntime })
   const [nameDraft, setNameDraft] = useState('')
@@ -46,6 +55,12 @@ export function VoicesPane() {
   })
   const rename = useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) => patchVoice(id, { name }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: ['voices'] }),
+    onError: (error) => toast.error(formatApiError(error)),
+  })
+  const activate = useMutation({
+    mutationFn: ({ voiceId, target }: { voiceId: string; target: string }) =>
+      activateVariant(voiceId, target),
     onSuccess: () => void client.invalidateQueries({ queryKey: ['voices'] }),
     onError: (error) => toast.error(formatApiError(error)),
   })
@@ -87,8 +102,14 @@ export function VoicesPane() {
     setNameDraft(selected?.name ?? '')
   }, [selected?.id, selected?.name])
 
-  const variant = selected?.active_variant
-  const hasReference = Boolean(selected?.source_audio_artifact_id && (selected.duration_s ?? 0) > 0)
+  const options = referenceOptions(selected)
+  const picked = options.find((option) => option.selected)
+  const hasReference = Boolean(selected && options.length > 0 && (selected.duration_s ?? 0) > 0)
+  // The reference in use: the picked origin, or the primary source the lab itself
+  // falls back to, which is the voice's keep crop and its voice-level transcript.
+  const quote = picked
+    ? picked.transcript
+    : (selected?.effective_transcript || selected?.source_transcript || '')
 
   const commitName = () => {
     if (!selected) {
@@ -135,33 +156,29 @@ export function VoicesPane() {
           </label>
           {hasReference ? (
             <>
-              <p className="text-xs text-zinc-400">
-                reference: {activeReferenceLabel(selected)} ·{' '}
-                {formatSeconds(effectiveDurationS(selected))}
-                {isCroppedReference(selected) ? (
-                  <span> of {formatSeconds(sourceDurationS(selected))}</span>
-                ) : null}
-              </p>
-              <AudioBar
-                label=""
-                src={
-                  variant && variant.kind !== 'original' && !variant.stale
-                    ? artifactAudioUrl(variant.audio_artifact_id)
-                    : voiceReferenceAudioUrl(selected.id, selected.updated_at)
-                }
-              />
-              {selected.effective_transcript || selected.source_transcript ? (
-                <p className="text-sm italic text-zinc-400">
-                  {selected.effective_transcript || selected.source_transcript}
-                </p>
-              ) : null}
-              <button
-                type="button"
-                className="w-fit rounded-md border border-zinc-500 px-3 py-1.5 text-xs text-zinc-100"
-                onClick={() => openEditor()}
-              >
-                Open workbench
-              </button>
+              <label className="text-xs uppercase tracking-wide text-zinc-400">
+                Reference
+                <select
+                  aria-label="Reference"
+                  className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1.5 text-sm font-medium normal-case text-zinc-50"
+                  value={picked?.id ?? ''}
+                  disabled={activate.isPending}
+                  onChange={(event) => {
+                    const option = options.find((item) => item.id === event.target.value)
+                    if (option && selected) {
+                      activate.mutate({ voiceId: selected.id, target: option.target })
+                    }
+                  }}
+                >
+                  {options.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <AudioBar label="" src={selected ? referenceAudioSrc(selected, picked) : undefined} />
+              {quote ? <p className="text-sm italic text-zinc-400">{quote}</p> : null}
             </>
           ) : (
             <>

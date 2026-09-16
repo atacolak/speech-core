@@ -2,7 +2,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AudioBar } from '@/components/audio-bar'
-import { VoiceBench } from '@/features/voices/voice-bench'
 import {
   activeReferenceLabel,
   artifactAudioUrl,
@@ -20,6 +19,7 @@ import {
   toGenerationBody,
 } from '@/lib/generation'
 import { formatMs, formatSeconds } from '@/lib/format'
+import { takeTranscript } from '@/lib/take-transcript'
 import { cn } from '@/lib/utils'
 import { useWorkspace } from '@/state/workspace'
 
@@ -79,7 +79,6 @@ export function InspectorPane() {
   const selectedVoiceId = useWorkspace((state) => state.selectedVoiceId)
   const selectedRunId = useWorkspace((state) => state.selectedRunId)
   const selectRun = useWorkspace((state) => state.selectRun)
-  const openEditor = useWorkspace((state) => state.openEditor)
   const generation = useWorkspace((state) => state.generation)
   const patchGeneration = useWorkspace((state) => state.patchGeneration)
   const replaceGeneration = useWorkspace((state) => state.replaceGeneration)
@@ -167,11 +166,6 @@ export function InspectorPane() {
             {activeReferenceLabel(voice)}
             {voice?.duration_s != null ? ` · ${formatSeconds(voice.duration_s)}` : ''}
           </p>
-          {voice ? (
-            <button type="button" className="text-xs text-zinc-300 underline" onClick={() => openEditor()}>
-              Edit
-            </button>
-          ) : null}
         </div>
         <div className="space-y-2">
           <p className="text-xs uppercase tracking-wide text-zinc-400">Guidance</p>
@@ -274,7 +268,6 @@ export function InspectorPane() {
           </p>
         </details>
       </div>
-      <VoiceBench omitTakes voice={voice} />
       <div className="mt-2 flex items-center justify-between gap-2">
         <h2 className="text-base font-semibold text-zinc-50">Takes</h2>
         {voice ? (
@@ -324,6 +317,7 @@ export function InspectorPane() {
               | undefined
             const saved = run.rating === 'keep'
             const guidance = snapshot?.guidance
+            const transcript = takeTranscript(run)
             const cfgLabel =
               guidance?.mode === 'dual'
                 ? `dual ${guidance.reference ?? '—'}/${guidance.instruction ?? '—'}`
@@ -352,6 +346,11 @@ export function InspectorPane() {
                         ? `first audio ${formatMs(run.first_audio_ms)}`
                         : formatSeconds(run.duration_s)}
                     </p>
+                    {transcript.text ? (
+                      <p className="mt-1 line-clamp-4 text-[11px] italic text-zinc-500">
+                        {transcript.text}
+                      </p>
+                    ) : null}
                   </button>
                   <div className="mt-2 flex flex-wrap gap-2 text-xs">
                     <button
