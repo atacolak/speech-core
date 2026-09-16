@@ -12,7 +12,7 @@ from tts.lab.backend.runtime.auk import AukRuntimeManager
 from tts.lab.backend.runtime.leftover import NoopLeftover
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.runtime.processors import ProcessorLease
-from tts.lab.backend.services.progressive import ProgressiveJobs
+from tts.lab.backend.services.progressive import GenerateStreams
 from tts.lab.backend.store.artifacts import ArtifactStore
 from tts.paths import lab_root
 
@@ -24,7 +24,7 @@ class LabState:
     auk: AukRuntimeManager
     engine: Any | None = None
     leftover_parked: bool = False
-    progressive: ProgressiveJobs = field(default_factory=ProgressiveJobs)
+    generate_streams: GenerateStreams = field(default_factory=GenerateStreams)
 
 
 def create_state(

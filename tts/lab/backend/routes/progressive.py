@@ -1,4 +1,4 @@
-"""Progressive GENERATE HTTP surface. not on the voicecat path.
+"""Streamed GENERATE HTTP surface. not on the voicecat path.
 
 Reads the live-call lease; never sets it, never takes a second GPU occupant.
 """
@@ -8,18 +8,17 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 from tts.lab.backend.routes.synthesis import SynthesisBody, resolve_synthesis_request
-from tts.lab.backend.services.progressive import GenerationActive, ProgressiveJob
+from tts.lab.backend.services.progressive import (
+    SAMPLE_RATE,
+    GenerationActive,
+    iter_generate_pcm,
+)
 from tts.lab.backend.services.segmenter import segment_text
 
 router = APIRouter()
-
-
-class CursorBody(BaseModel):
-    index: int
 
 
 def _preflight(state: Any) -> None:
@@ -49,16 +48,8 @@ def _preflight(state: Any) -> None:
         )
 
 
-def _get_job(request: Request, job_id: str) -> ProgressiveJob:
-    """Registry lookup; an unknown id is a 404, never a 500."""
-    try:
-        return request.app.state.lab.progressive.get(job_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail={"code": "job_not_found"}) from exc
-
-
-@router.post("/api/generate")
-def start_generate(request: Request, body: SynthesisBody) -> dict[str, Any]:
+@router.post("/api/generate/stream")
+def stream_generate(request: Request, body: SynthesisBody) -> StreamingResponse:
     state = request.app.state.lab
     _preflight(state)
     resolved = resolve_synthesis_request(state, body)
@@ -66,45 +57,23 @@ def start_generate(request: Request, body: SynthesisBody) -> dict[str, Any]:
     if not segments:
         raise HTTPException(status_code=422, detail={"code": "empty_text"})
     try:
-        job = state.progressive.create(
-            state, body=body, resolved=resolved, segments=segments
-        )
+        stream = state.generate_streams.begin(voice_profile_id=body.voice_profile_id)
     except GenerationActive as exc:
         raise HTTPException(
             status_code=409, detail={"code": "generation_active"}
         ) from exc
-    return job.to_dict()
+    return StreamingResponse(
+        iter_generate_pcm(state, stream, body, resolved, segments),
+        media_type="application/octet-stream",
+        headers={"X-Generate-Id": stream.id, "X-Sample-Rate": str(SAMPLE_RATE)},
+    )
 
 
-@router.get("/api/generate/{job_id}")
-def get_generate(request: Request, job_id: str) -> dict[str, Any]:
-    return _get_job(request, job_id).to_dict()
-
-
-@router.post("/api/generate/{job_id}/cursor")
-def set_generate_cursor(request: Request, job_id: str, body: CursorBody) -> dict[str, Any]:
-    job = _get_job(request, job_id)
-    if body.index < -1 or body.index >= len(job.segments):
-        raise HTTPException(status_code=422, detail={"code": "invalid_cursor"})
+@router.post("/api/generate/{stream_id}/stop")
+def stop_generate(request: Request, stream_id: str) -> dict[str, Any]:
     try:
-        job = request.app.state.lab.progressive.set_cursor(job_id, body.index)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail={"code": "invalid_cursor"}) from exc
-    return job.to_dict()
+        stream = request.app.state.lab.generate_streams.stop(stream_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail={"code": "stream_not_found"}) from exc
+    return {"id": stream.id, "stopped": True}
 
-
-@router.post("/api/generate/{job_id}/cancel")
-def cancel_generate(request: Request, job_id: str) -> dict[str, Any]:
-    _get_job(request, job_id)
-    return request.app.state.lab.progressive.cancel(job_id).to_dict()
-
-
-@router.get("/api/generate/{job_id}/segments/{index}/audio")
-def get_generate_segment(request: Request, job_id: str, index: int) -> FileResponse:
-    job = _get_job(request, job_id)
-    if index < 0 or index >= len(job.segments):
-        raise HTTPException(status_code=404, detail={"code": "segment_not_found"})
-    segment = job.segments[index]
-    if segment.state != "generated" or segment.wav_path is None:
-        raise HTTPException(status_code=409, detail={"code": "segment_not_ready"})
-    return FileResponse(segment.wav_path, media_type="audio/wav")
