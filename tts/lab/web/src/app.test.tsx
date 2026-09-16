@@ -61,6 +61,23 @@ const OTHER_VOICE = {
   duration_s: 3,
 }
 
+/** The one material the lab already holds: choosing it is how the workbench is entered. */
+const MATERIAL = {
+  id: 'src_ww',
+  kind: 'file',
+  origin: 'ww-01.wav',
+  title: 'Westworld S01E01',
+  audio_artifact_id: 'art_src',
+  waveform_artifact_id: 'art_wave',
+  duration_s: 20,
+  meta: {},
+  created_at: '2026-09-14T00:00:00Z',
+  coverage: [],
+  analyses: [],
+  speakers: [],
+  clips: [],
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -68,7 +85,7 @@ function jsonResponse(body: unknown, status = 200) {
   })
 }
 
-function mockLabFetch(voices: unknown[] = []) {
+function mockLabFetch(voices: unknown[] = [], sources: unknown[] = [MATERIAL]) {
   return vi.fn(async (input: RequestInfo) => {
     const url = String(input)
     if (url.includes('/api/runtime')) {
@@ -76,6 +93,9 @@ function mockLabFetch(voices: unknown[] = []) {
     }
     if (url.includes('/api/voices')) {
       return jsonResponse({ items: voices })
+    }
+    if (url.includes('/api/sources')) {
+      return jsonResponse({ items: sources })
     }
     if (url.includes('/api/runs')) {
       return jsonResponse({ items: [] })
@@ -139,35 +159,28 @@ describe('TTS lab shell', () => {
 
 describe('parked AuK surface', () => {
   beforeEach(() => {
-    // jsdom has no matchMedia; WaveSurfer's region drag asks for it when the workbench mounts.
-    vi.stubGlobal(
-      'matchMedia',
-      (query: string): MediaQueryList =>
-        ({
-          matches: false,
-          media: query,
-          onchange: null,
-          addEventListener: () => {},
-          removeEventListener: () => {},
-          addListener: () => {},
-          removeListener: () => {},
-          dispatchEvent: () => false,
-        }) as unknown as MediaQueryList,
-    )
+    vi.stubGlobal('fetch', mockLabFetch())
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('opens the workbench with no AuK chrome and no auk traffic', async () => {
+  it('opens the workbench inside VOICE LAB with no AuK chrome and no auk traffic', async () => {
     const fetchMock = mockLabFetch([SAMPLE_VOICE])
     vi.stubGlobal('fetch', fetchMock)
     renderApp()
-    fireEvent.click(await screen.findByRole('button', { name: 'Open workbench' }))
-    expect(await screen.findByRole('heading', { name: /Voice workbench/ })).toBeInTheDocument()
-    // Positive control: this is the load control that sat beside Load/Unload AuK.
-    expect(screen.getByRole('button', { name: 'Load Breeze' })).toBeInTheDocument()
+
+    // GENERATE keeps no door to a workbench of its own.
+    expect(screen.queryByRole('button', { name: 'Open workbench' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+    expect(await screen.findByTestId('runtime-status')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Westworld/ }))
+    expect(await screen.findByLabelText('waveform')).toBeInTheDocument()
+    expect(screen.queryByText(/Voice workbench/)).toBeNull()
+
     expect(screen.queryByRole('button', { name: 'Load AuK' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Unload AuK' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Generate candidate' })).toBeNull()

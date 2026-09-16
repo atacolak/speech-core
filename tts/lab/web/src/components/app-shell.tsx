@@ -4,13 +4,11 @@ import { InspectorPane } from '@/features/inspector/inspector-pane'
 import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
 import { VoiceLab } from '@/features/voice-lab/voice-lab'
 import { VoicesPane } from '@/features/voices/voices-pane'
-import { VoiceWorkbench } from '@/features/voices/workbench'
 import { cn } from '@/lib/utils'
 import { useWorkspace } from '@/state/workspace'
 
 export function AppShell() {
   const mode = useWorkspace((state) => state.mode)
-  const editorOpen = useWorkspace((state) => state.editorOpen)
   const settingsOpen = useWorkspace((state) => state.settingsOpen)
 
   return (
@@ -34,8 +32,6 @@ export function AppShell() {
             </>
           ) : null}
         </Group>
-      ) : editorOpen ? (
-        <VoiceWorkbench />
       ) : (
         <VoiceLab />
       )}

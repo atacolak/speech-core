@@ -36,7 +36,34 @@ const INTERVIEW = source({
   audio_artifact_id: 'art_src2',
 })
 
-function stubLab(items: MediaSource[], status = 201) {
+/** Two takes the lab still retains: listing them is not importing them. */
+const RETAINED = [
+  {
+    id: 'run_1',
+    voice_id: 'vp_ford',
+    output_artifact_id: 'art_take_1',
+    latency_ms: 900,
+    first_audio_ms: 120,
+    duration_s: 3.2,
+    rating: null,
+    tags: [],
+    request_snapshot: { produced_text: 'these violent delights' },
+  },
+  {
+    id: 'run_2',
+    voice_id: 'vp_ford',
+    output_artifact_id: 'art_take_2',
+    latency_ms: 800,
+    first_audio_ms: 90,
+    duration_s: 4.5,
+    rating: null,
+    tags: [],
+    request_snapshot: { produced_text: 'have violent ends' },
+  },
+]
+
+function stubLab(items: MediaSource[], options: { status?: number; runs?: unknown[] } = {}) {
+  const { status = 201, runs = [] } = options
   const calls: Call[] = []
   vi.stubGlobal(
     'fetch',
@@ -50,9 +77,15 @@ function stubLab(items: MediaSource[], status = 201) {
           init?.body instanceof FormData
             ? Object.fromEntries(init.body.entries())
             : init?.body
-              ? String(init.body)
+              ? (JSON.parse(String(init.body)) as unknown)
               : null,
       })
+      if (url.includes('/api/runs')) {
+        return new Response(JSON.stringify({ items: runs }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
       if (method === 'POST') {
         if (status >= 400) {
           return new Response(JSON.stringify({ detail: 'not_implemented' }), {
@@ -160,7 +193,7 @@ describe('material library', () => {
   })
 
   it('submits a URL source without transcribing anything', async () => {
-    const calls = stubLab([], 501)
+    const calls = stubLab([], { status: 501 })
     renderLibrary()
     const url = await screen.findByLabelText('Source URL')
     fireEvent.change(url, { target: { value: 'https://www.youtube.com/watch?v=fixture' } })
@@ -189,5 +222,36 @@ describe('material library', () => {
       )
     })
     expect(calls.find((call) => call.method === 'POST')?.body).toEqual({ file: take })
+  })
+
+  it('registers one retained take as material only when the operator asks', async () => {
+    const calls = stubLab([WESTWORLD], { runs: RETAINED })
+    renderLibrary()
+    const first = await screen.findByRole('button', { name: /take run_1/ })
+    expect(screen.getByRole('button', { name: /take run_2/ })).toBeInTheDocument()
+    const add = screen.getByRole('button', { name: 'Add to workbench' })
+
+    // Listing retained history is not importing it.
+    expect(add).toBeDisabled()
+    expect(calls.filter((call) => call.method === 'POST')).toEqual([])
+
+    fireEvent.click(first)
+
+    expect(calls.filter((call) => call.method === 'POST')).toEqual([])
+    expect(add).toBeEnabled()
+
+    fireEvent.click(add)
+
+    await waitFor(() => {
+      expect(calls.filter((call) => call.method === 'POST').length).toBe(1)
+    })
+    const posted = calls.find((call) => call.method === 'POST')
+    expect(posted?.url).toContain('/api/sources/from-artifact')
+    expect(posted?.body).toEqual({
+      artifact_id: 'art_take_1',
+      run_id: 'run_1',
+      title: 'take run_1',
+    })
+    expect(useWorkspace.getState().selectedMaterialId).toBe('src_ww')
   })
 })

@@ -14,7 +14,6 @@ type WorkspaceState = {
   selectedRunId: string | null
   /** The voice whose stored generation currently fills `generation`; null until hydrated. */
   hydratedVoiceId: string | null
-  editorOpen: boolean
   settingsOpen: boolean
   text: string
   steer: string
@@ -24,8 +23,6 @@ type WorkspaceState = {
   selectMaterial: (id: string | null) => void
   selectRun: (id: string | null) => void
   hydrateGeneration: (voice: Pick<Voice, 'id' | 'generation'> | null) => void
-  openEditor: () => void
-  closeEditor: () => void
   toggleSettings: () => void
   setText: (text: string) => void
   setSteer: (steer: string) => void
@@ -39,7 +36,6 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
   selectedMaterialId: null,
   selectedRunId: null,
   hydratedVoiceId: null,
-  editorOpen: false,
   settingsOpen: false,
   text: "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
   steer: 'fast, dry, technically confident, faintly amused.',
@@ -62,9 +58,6 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
         generation: fromStoredGeneration(voice.generation),
       }
     }),
-  // The workbench is a lab surface: opening it from the generate rail moves to the lab.
-  openEditor: () => set({ editorOpen: true, mode: 'voice-lab' }),
-  closeEditor: () => set({ editorOpen: false }),
   toggleSettings: () => set((state) => ({ settingsOpen: !state.settingsOpen })),
   setText: (text) => set({ text }),
   setSteer: (steer) => set({ steer }),

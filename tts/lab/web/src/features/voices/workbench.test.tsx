@@ -1,204 +1,141 @@
+/**
+ * The workbench capability ledger, driven through the lab shell.
+ *
+ * Every capability the deleted `features/voices/workbench.tsx` owned is asserted
+ * at its new home: the Voice Lab's existing MaterialLibrary -> SourceBench, or
+ * the selected voice's store. The old surface is never imported here.
+ */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { Toaster } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppShell } from '@/components/app-shell'
-import { VoicesPane } from '@/features/voices/voices-pane'
-import { VoiceWorkbench } from '@/features/voices/workbench'
-import type { Voice, VoiceArtifact } from '@/lib/api'
+import type { Voice, VoiceArtifact, VoiceSource } from '@/lib/api'
 import { useWorkspace } from '@/state/workspace'
 
-const h = vi.hoisted(() => ({
-  regions: [] as Array<{
-    id?: string
-    start: number
-    end: number
-    color?: string
-    remove?: () => void
-  }>,
-  plays: [] as Array<[number?, number?]>,
-  duration: 12,
-  handlers: {} as Record<string, Array<(...args: unknown[]) => void>>,
-}))
+const RUNTIME = {
+  selected: 'E2',
+  status: 'unloaded',
+  state: 'unloaded',
+  leftover_parked: false,
+  not_a_pin_swap: true,
+  voicecat_path: true,
+  engine: 'breeze-tts2',
+  worker_pid: null,
+  required_vram_bytes: 1,
+  free_vram_bytes: 2,
+  last_error: null,
+  live_call_active: false,
+  processor: null,
+}
 
-vi.mock('wavesurfer.js', () => {
-  class FakeWaveSurfer {
-    static create() {
-      return new FakeWaveSurfer()
-    }
-    on(event: string, callback: (...args: unknown[]) => void) {
-      h.handlers[event] = [...(h.handlers[event] ?? []), callback]
-    }
-    getDuration() {
-      return h.duration
-    }
-    play(start?: number, end?: number) {
-      h.plays.push([start, end])
-    }
-    destroy() {}
-  }
-  return { default: FakeWaveSurfer }
-})
-
-vi.mock('wavesurfer.js/dist/plugins/regions.esm.js', () => {
-  class FakeRegions {
-    static create() {
-      return new FakeRegions()
-    }
-    enableDragSelection() {}
-    on() {}
-    getRegions() {
-      return h.regions
-    }
-    addRegion(options: { id?: string; start: number; end: number; color?: string }) {
-      const region = {
-        ...options,
-        remove: () => {
-          h.regions = h.regions.filter((item) => item !== region)
-        },
-      }
-      h.regions.push(region)
-      return region
-    }
-  }
-  return { default: FakeRegions }
-})
-
-/** A live diarization result: parked from the default surface, never absent from the API. */
-const ANALYSIS = {
-  id: 'sa1',
+/** The material the operator works: two source-local speakers, one already mapped to Ford. */
+const MATERIAL = {
+  id: 'src_ww',
+  kind: 'file',
+  origin: 'ww-01.wav',
+  title: 'Westworld S01E01',
+  audio_artifact_id: 'art_src',
+  waveform_artifact_id: 'art_wave',
+  duration_s: 20,
+  meta: {},
+  created_at: '2026-09-14T00:00:00Z',
+  coverage: [{ start_s: 0, end_s: 5 }],
+  analyses: [
+    {
+      id: 'sa_1',
+      start_s: 0,
+      end_s: 5,
+      processor: 'vibevoice',
+      model_id: 'Dubedo/VibeVoice-ASR-HF-NF4',
+      config: {},
+      result: {
+        segments: [{ speaker_id: 'S1', start_s: 0, end_s: 2, text: 'one', overlap: false }],
+      },
+      created_at: '2026-09-14T00:00:00Z',
+    },
+  ],
   speakers: [
-    { id: 'S1', label: 'Speaker 1', duration_s: 18.4 },
-    { id: 'S2', label: 'Speaker 2', duration_s: 3 },
+    { local_id: 'S1', label: 'Speaker 1', duration_s: 2, mapped_voice_id: null },
+    { local_id: 'S2', label: 'Speaker 2', duration_s: 3, mapped_voice_id: 'vp_ford' },
   ],
-  segments: [
-    { speaker_id: 'S1', start_s: 0, end_s: 2, text: 'one', overlap: false },
-    { speaker_id: 'S2', start_s: 3, end_s: 6, text: 'two', overlap: false },
-  ],
-  overlaps: [{ start_s: 2, end_s: 3, speakers: ['S1', 'S2'] }],
+  clips: [],
+}
+
+const PRIMARY: VoiceSource = {
+  id: 'vs_primary',
+  label: 'Westworld S01E01',
+  artifact_id: 'art_src',
+  transcript: 'these violent delights have violent ends',
+  transcript_locked: false,
+  duration_s: 20,
+  keep_intervals: [{ start_s: 0, end_s: 20 }],
+}
+
+const SECOND: VoiceSource = {
+  id: 'vs_second',
+  label: 'take B',
+  artifact_id: 'art_src_b',
+  transcript: 'take b text',
+  transcript_locked: true,
+  duration_s: 9,
+  keep_intervals: [{ start_s: 0, end_s: 9 }],
+}
+
+const ORIGINAL: VoiceArtifact = {
+  id: 'va_original',
+  role: 'reference',
+  kind: 'original',
+  name: null,
+  audio_artifact_id: 'art_src',
+  parent_id: null,
+  source_id: 'vs_primary',
+  keep_intervals: [],
+  approved: true,
+  default: true,
   stale: false,
 }
 
-/** A generated Resemble denoise variant: kept in the API, parked from the default surface. */
-const DENOISE_VARIANT = {
-  id: 'rv_den',
-  voice_profile_id: 'vp1',
-  kind: 'resemble',
-  audio_artifact_id: 'art_den',
-  duration_s: 11.5,
+const CROP: VoiceArtifact = {
+  id: 'va_crop',
+  role: 'experiment',
+  kind: 'crop',
+  name: 'tight crop',
+  audio_artifact_id: 'art_crop',
+  parent_id: 'va_original',
+  source_id: 'vs_primary',
+  keep_intervals: [{ start_s: 0, end_s: 2 }],
+  approved: false,
+  default: false,
   stale: false,
 }
 
-/** An AuK experiment: lineage-bearing, listed while it is still a candidate. */
-function aukCandidate(overrides: Record<string, unknown> = {}) {
+/** Ford's store: the enrolled material, a sibling take, and the crop cut out of the first. */
+function ford(artifacts: VoiceArtifact[] = [ORIGINAL]): Voice {
   return {
-    id: 'rv_auk',
-    voice_profile_id: 'vp1',
-    kind: 'auk',
-    audio_artifact_id: 'art_auk',
-    duration_s: 12,
-    auk_task: 'enhance',
-    instruction: 'Remove noise and reverberation while retaining the speech.',
-    model_variant: 'auk-base',
-    auk_precision: 'bf16',
-    encoder_precision: 'w4a8',
-    seed: 7,
-    settings: null,
-    approved: false,
-    stale: false,
-    ...overrides,
-  }
-}
-
-/** Today's 1:1 voice JSON: one source, variants, one active reference. */
-function voice(overrides: Record<string, unknown> = {}): Voice {
-  return {
-    id: 'vp1',
-    name: 'ata',
+    id: 'vp_ford',
+    name: 'Ford',
     tags: [],
     source_audio_artifact_id: 'art_src',
     original_artifact_id: 'art_src',
     original_format: 'wav',
-    source_transcript: 'hello',
-    keep_intervals: [{ start_s: 0, end_s: 12 }],
-    effective_transcript: 'hello',
-    active_reference_variant_id: 'rv_orig',
-    active_variant: {
-      id: 'rv_orig',
-      voice_profile_id: 'vp1',
-      kind: 'original',
-      audio_artifact_id: 'art_src',
-      duration_s: 12,
-      stale: false,
-    },
+    source_transcript: 'these violent delights have violent ends',
+    keep_intervals: [{ start_s: 0, end_s: 20 }],
+    effective_transcript: 'these violent delights have violent ends',
+    active_reference_variant_id: null,
     variants: [],
-    speaker_analysis: null,
-    duration_s: 12,
-    source_duration_s: 12,
-    effective_duration_s: 12,
+    sources: [PRIMARY, SECOND],
+    artifacts,
+    default_reference_id: 'va_original',
+    duration_s: 20,
+    source_limit: 5,
     latest_take_id: null,
-    created_at: '2026-09-12T00:00:00Z',
-    updated_at: '2026-09-12T00:00:00Z',
-    ...overrides,
-  } as Voice
+    created_at: '2026-09-14T00:00:00Z',
+    updated_at: '2026-09-14T00:00:00Z',
+  }
 }
 
-/** The profile shape t1 emits: many sources, role-carrying artifacts, one optional default. */
-function profileVoice(overrides: Partial<Voice> = {}): Voice {
-  return voice({
-    sources: [
-      {
-        id: 'src_a',
-        label: 'take A',
-        artifact_id: 'art_src',
-        transcript: 'hello',
-        duration_s: 12,
-        keep_intervals: [{ start_s: 2, end_s: 6 }],
-      },
-      {
-        id: 'src_b',
-        label: 'take B',
-        artifact_id: 'art_src_b',
-        transcript: 'hello again',
-        duration_s: 9,
-        keep_intervals: [{ start_s: 0, end_s: 9 }],
-      },
-    ],
-    artifacts: [
-      {
-        id: 'a_exp',
-        role: 'experiment',
-        kind: 'auk',
-        name: 'enhance 1',
-        audio_artifact_id: 'art_exp',
-        source_id: 'src_a',
-        auk_task: 'enhance',
-        instruction: 'Remove noise and reverberation while retaining the speech.',
-        approved: false,
-        default: false,
-        stale: false,
-      },
-      {
-        id: 'a_ref',
-        role: 'reference',
-        kind: 'auk',
-        name: 'enhance 1 approved',
-        audio_artifact_id: 'art_ref',
-        parent_id: 'a_exp',
-        source_id: 'src_a',
-        auk_task: 'enhance',
-        instruction: 'Remove noise and reverberation while retaining the speech.',
-        approved: true,
-        default: true,
-        stale: false,
-      },
-    ],
-    default_reference_id: 'a_ref',
-    ...overrides,
-  })
-}
-
-type Call = { url: string; method: string; body: unknown }
+type Call = { method: string; url: string; body: unknown }
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -207,438 +144,191 @@ function json(body: unknown, status = 200) {
   })
 }
 
-function mockFetch(
-  current: () => Array<Record<string, unknown>>,
-  calls: Call[],
-  runtime: Record<string, unknown> = {},
-) {
-  return vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+function mockLab(initial: Voice = ford()) {
+  const calls: Call[] = []
+  let voice = initial
+  const fetchMock = vi.fn(async (input: RequestInfo, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
-    const body: Record<string, unknown> =
-      typeof init?.body === 'string' ? JSON.parse(init.body) : {}
-    calls.push({ url, method, body })
-    if (url.includes('/reference/audio')) {
-      return new Response(new Uint8Array([82, 73, 70, 70]), { status: 200 })
-    }
-    if (url.includes('/sources')) {
-      return json({ detail: { code: 'not_found', message: 'no such route' } }, 404)
-    }
-    // Promotion of an existing experiment stays; nothing runs a processor to make a new one.
-    if (url.includes('/auk/approve')) {
-      return json(current()[0])
-    }
+    const raw = init?.body ? String(init.body) : null
+    calls.push({
+      method,
+      url,
+      body: init?.body instanceof FormData ? Object.fromEntries(init.body.entries()) : raw ? (JSON.parse(raw) as unknown) : null,
+    })
     if (url.includes('/api/runtime')) {
-      return json({
-        state: 'unloaded',
-        status: 'unloaded',
-        selected: 'breeze-tts2',
-        leftover_parked: true,
-        not_a_pin_swap: true,
-        voicecat_path: true,
-        live_call_active: false,
-        processor: null,
-        ...runtime,
-      })
+      return json(RUNTIME)
     }
     if (url.includes('/api/voices')) {
-      const listed = current()[0]
-      return json(method !== 'GET' ? listed : { items: current() })
+      if (method === 'POST' && url.includes('/crop')) {
+        voice = { ...voice, artifacts: [...(voice.artifacts ?? []), CROP] }
+        return json(voice)
+      }
+      if (method === 'POST' && url.includes('/denoise')) {
+        voice = {
+          ...voice,
+          artifacts: [
+            ...(voice.artifacts ?? []),
+            { ...CROP, id: 'va_denoise', kind: 'resemble', name: 'Resemble' },
+          ],
+        }
+        return json(voice)
+      }
+      if (method === 'PATCH') {
+        const patch = JSON.parse(String(raw)) as { transcript?: string }
+        voice = {
+          ...voice,
+          sources: (voice.sources ?? []).map((item) =>
+            item.id === 'vs_primary' && patch.transcript != null
+              ? { ...item, transcript: patch.transcript, transcript_locked: true }
+              : item,
+          ),
+        }
+        return json(voice)
+      }
+      return json({ items: [voice] })
+    }
+    if (url.includes('/api/sources') && method === 'POST') {
+      return json(MATERIAL)
+    }
+    if (url.includes('/api/sources')) {
+      return json({ items: [MATERIAL] })
     }
     if (url.includes('/api/runs')) {
       return json({ items: [] })
     }
-    if (url.includes('/api/fixtures/steers')) {
+    if (url.includes('/api/fixtures/steer')) {
       return json({ items: [] })
     }
     return json({ detail: 'missing' }, 404)
   })
+  vi.stubGlobal('fetch', fetchMock)
+  return { calls, fetchMock }
 }
 
-function renderWorkbench() {
-  useWorkspace.setState({ selectedVoiceId: 'vp1', editorOpen: true })
+function renderShell() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
-      <VoiceWorkbench />
+      <AppShell />
       <Toaster />
     </QueryClientProvider>,
   )
 }
 
-function renderShell() {
-  useWorkspace.setState({ mode: 'voice-lab', selectedVoiceId: 'vp1', editorOpen: true })
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
-    <QueryClientProvider client={client}>
-      <AppShell />
-    </QueryClientProvider>,
-  )
+/** GENERATE | VOICE LAB is the whole shell; the workbench lives inside the lab. */
+async function openMaterial() {
+  fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
+  fireEvent.click(await screen.findByRole('button', { name: /Westworld S01E01/ }))
+  await screen.findByLabelText('waveform')
 }
 
-function audioSources(container: HTMLElement): string[] {
-  return Array.from(container.querySelectorAll('audio')).map(
-    (node) => node.getAttribute('src') ?? '',
-  )
-}
+describe('workbench capability ledger in the lab shell', () => {
+  beforeEach(() => {
+    useWorkspace.setState({
+      mode: 'generate',
+      selectedVoiceId: null,
+      selectedMaterialId: null,
+      selectedRunId: null,
+      settingsOpen: false,
+    })
+  })
 
-function findWorkbench() {
-  return screen.findByRole('heading', { name: /Voice workbench/ })
-}
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
 
-const assetList = (name: string) => screen.getByRole('list', { name })
-const compareRegion = () => screen.getByRole('region', { name: 'compare' })
-const inspector = () => screen.getByRole('complementary', { name: 'inspector' })
+  it('is entered by choosing material inside Voice Lab, and by nothing else', async () => {
+    mockLab()
+    renderShell()
 
-/** Each render sets the workspace it needs; teardown only restores the real fetch. */
-let calls: Call[] = []
+    // The GENERATE doors that used to open a parallel workbench are gone.
+    expect(screen.queryByRole('button', { name: 'Open workbench' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+    const nav = screen.getByRole('navigation', { name: 'Lab modes' })
+    expect(within(nav).getAllByRole('button')).toHaveLength(2)
 
-beforeEach(() => {
-  calls = []
-  h.regions = []
-  h.plays = []
-  h.handlers = {}
-})
+    await openMaterial()
 
-/** Each render sets the workspace it needs; teardown only restores the real fetch. */
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
+    expect(screen.getByRole('heading', { name: 'Westworld S01E01' })).toBeInTheDocument()
+    expect(screen.queryByText(/Voice workbench/)).toBeNull()
+    // No editor overlay to close, no permanent inspector or compare column.
+    expect(screen.queryByRole('button', { name: 'Done' })).toBeNull()
+    expect(screen.queryByRole('complementary', { name: 'inspector' })).toBeNull()
+    expect(screen.queryByRole('region', { name: 'compare' })).toBeNull()
+  })
 
-describe('parked AuK surface', () => {
-  it('renders no AuK load, generate, precision or intent chrome', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    renderWorkbench()
-    await findWorkbench()
+  it('keeps the waveform, the crop action and the clean transcript on the source bench', async () => {
+    mockLab()
+    renderShell()
+    await openMaterial()
+
+    expect(screen.getByLabelText('waveform')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ANALYZE whole' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Create crop' })).toBeInTheDocument()
+    expect(screen.getByLabelText('source transcript')).toHaveValue(
+      'these violent delights have violent ends',
+    )
+    // The source-local speaker binding the deleted surface kept in its assets column.
+    expect(screen.getByLabelText('Speaker 1 voice')).toBeInTheDocument()
+  })
+
+  it('keeps the processor home on the enrolled source and parks AuK', async () => {
+    const { fetchMock } = mockLab()
+    renderShell()
+    await openMaterial()
+
+    expect(screen.getByRole('button', { name: 'Resemble source' })).toBeEnabled()
     expect(screen.queryByText(/AuK/)).toBeNull()
-    expect(screen.queryByRole('button', { name: /AuK/ })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Generate candidate' })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'diagnostics' })).toBeNull()
-    expect(screen.queryByLabelText(/^instruction$/i)).toBeNull()
-    expect(screen.queryByRole('radio', { name: /bf16|int8/i })).toBeNull()
+    for (const name of ['Load AuK', 'Unload AuK', 'Generate candidate', 'diagnostics']) {
+      expect(screen.queryByRole('button', { name })).toBeNull()
+    }
     for (const intent of ['CLEAN', 'ISOLATE', 'PERFORM', 'EDIT', 'SYNTHESIZE']) {
       expect(screen.queryByRole('button', { name: intent })).toBeNull()
     }
-    for (const task of ['enhance', 'denoise', 'repair', 'volume', 'clone', 'emotion']) {
-      expect(screen.queryByRole('button', { name: task })).toBeNull()
-    }
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/auk'))).toEqual([])
   })
 
-  it('never calls a parked auk route', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice({ variants: [aukCandidate()] })], calls))
-    renderWorkbench()
-    await findWorkbench()
-    await waitFor(() => {
-      expect(calls.some((call) => call.url.includes('/api/runtime/e2'))).toBe(true)
-    })
-    expect(calls.filter((call) => call.url.includes('/auk'))).toEqual([])
-  })
-})
-
-describe('workbench assets', () => {
-  it('lists the profile sources, experiments and references with the ★ default', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [profileVoice()], calls))
-    renderWorkbench()
-    expect(await findWorkbench()).toBeInTheDocument()
-    const sources = assetList('sources')
-    expect(within(sources).getByText('take A')).toBeInTheDocument()
-    expect(within(sources).getByText('take B')).toBeInTheDocument()
-    const experiments = assetList('experiments')
-    expect(within(experiments).getByText('enhance 1')).toBeInTheDocument()
-    const references = assetList('references')
-    expect(within(references).getByText('enhance 1 approved')).toBeInTheDocument()
-    expect(within(references).getByText('★')).toBeInTheDocument()
-    expect(within(experiments).queryByText('enhance 1 approved')).toBeNull()
-  })
-
-  it("derives one source and splits auk variants from today's 1:1 voice", async () => {
-    vi.stubGlobal(
-      'fetch',
-      mockFetch(
-        () => [
-          voice({
-            variants: [
-              aukCandidate(),
-              aukCandidate({ id: 'rv_ok', audio_artifact_id: 'art_ok', approved: true }),
-            ],
-            active_reference_variant_id: 'rv_ok',
-          }),
-        ],
-        calls,
-      ),
-    )
-    renderWorkbench()
-    await findWorkbench()
-    expect(within(assetList('sources')).getByText('source')).toBeInTheDocument()
-    expect(within(assetList('experiments')).getByText('enhance')).toBeInTheDocument()
-    const references = assetList('references')
-    expect(within(references).getByText('enhance')).toBeInTheDocument()
-    expect(within(references).getByText('★')).toBeInTheDocument()
-  })
-
-  it('fails closed when the multi-source route is missing', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    const { container } = renderWorkbench()
-    await findWorkbench()
-    fireEvent.change(screen.getByLabelText('add audio'), {
-      target: { files: [new File(['riff'], 'take.wav', { type: 'audio/wav' })] },
-    })
-    expect(await screen.findByText(/multi-source audio is not available/i)).toBeInTheDocument()
-    await waitFor(() => {
-      expect(
-        calls.some((call) => call.method === 'POST' && call.url.includes('/api/voices/vp1/sources')),
-      ).toBe(true)
-    })
-    expect(audioSources(container).some((src) => src.includes('take'))).toBe(false)
-  })
-
-  it('parks speaker analysis out of the default surface even with a live analysis', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice({ speaker_analysis: ANALYSIS })], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.queryByRole('button', { name: /Analyze speakers/i })).toBeNull()
-    expect(screen.queryByRole('button', { name: /Speaker 1/ })).toBeNull()
-    expect(screen.queryByRole('button', { name: /Use speaker/i })).toBeNull()
-    expect(screen.queryByRole('button', { name: /Play speaker/i })).toBeNull()
-    expect(h.regions.filter((region) => String(region.id ?? '').startsWith('spk-'))).toEqual([])
-    expect(calls.some((call) => call.url.includes('/speakers/'))).toBe(false)
-  })
-
-  it('parks the Resemble denoise cleanup out of the default surface', async () => {
-    const profile = profileVoice()
-    const denoised: VoiceArtifact = {
-      id: 'a_den',
-      role: 'experiment',
-      kind: 'resemble',
-      name: 'Resemble',
-      audio_artifact_id: 'art_den',
-      source_id: 'src_a',
-      approved: false,
-      default: false,
-      stale: false,
-    }
-    vi.stubGlobal(
-      'fetch',
-      mockFetch(
-        () => [
-          {
-            ...profile,
-            artifacts: [...(profile.artifacts ?? []), denoised],
-            variants: [DENOISE_VARIANT],
-            active_variant: DENOISE_VARIANT,
-            active_reference_variant_id: 'rv_den',
-          },
-        ],
-        calls,
-      ),
-    )
-    renderWorkbench()
-    expect(await findWorkbench()).toBeInTheDocument()
-    expect(screen.queryByText('Cleanup')).toBeNull()
-    expect(screen.queryByRole('radio', { name: /denoise|cleanup/i })).toBeNull()
-    expect(screen.queryByText(/^Original$/)).toBeNull()
-    expect(screen.queryByText(/^Denoised/)).toBeNull()
-    expect(screen.queryByText(/resemble/i)).toBeNull()
-    const listed = [...assetList('experiments').querySelectorAll('button')].map(
-      (node) => node.textContent,
-    )
-    expect(listed).toEqual(['enhance 1'])
-  })
-
-  it('shows no leftover chord, qwentts, cosyvoice or stream.fm chrome', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.queryByText(/leftover[- ]parked/i)).toBeNull()
-    expect(screen.queryByText(/not[- ]a[- ]pin[- ]swap/i)).toBeNull()
-    expect(screen.queryByText(/qwentts/i)).toBeNull()
-    expect(screen.queryByText(/cosyvoice/i)).toBeNull()
-    expect(screen.queryByText(/stream\.fm/i)).toBeNull()
-  })
-
-  it('keeps the occupancy chrome on Breeze alone', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.getByText(/GPU is free/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Load Breeze' })).toBeInTheDocument()
-    expect(screen.queryByText(/AuK/)).toBeNull()
-  })
-
-  it('leaves a second source alone instead of cropping the primary one by accident', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [profileVoice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.getByLabelText(/^transcript$/i)).toHaveValue('hello')
-    fireEvent.click(within(assetList('sources')).getByRole('button', { name: 'take B' }))
-    expect(screen.getByLabelText(/^transcript$/i)).toHaveValue('hello again')
-    expect(screen.getByLabelText(/^transcript$/i)).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Keep only' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Exclude' })).toBeDisabled()
-    fireEvent.click(within(assetList('sources')).getByRole('button', { name: 'take A' }))
-    expect(screen.getByLabelText(/^transcript$/i)).toHaveValue('hello')
-    expect(screen.getByLabelText(/^transcript$/i)).toBeEnabled()
-    expect(screen.queryByText(/write the primary source/i)).toBeNull()
-  })
-
-  it('crops the source the voice columns describe, not the first one listed', async () => {
-    // The backend folds the voice transcript into the primary source's row (`_sources_json`).
-    const profile = profileVoice({ source_audio_artifact_id: 'art_src_b' })
-    profile.sources = (profile.sources ?? []).map((item) =>
-      item.id === 'src_b' ? { ...item, transcript: 'take B text' } : item,
-    )
-    vi.stubGlobal('fetch', mockFetch(() => [profile], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.getByLabelText(/^transcript$/i)).toHaveValue('take B text')
-    expect(screen.getByLabelText(/^transcript$/i)).toBeEnabled()
-    fireEvent.click(within(assetList('sources')).getByRole('button', { name: 'take A' }))
-    expect(screen.getByLabelText(/^transcript$/i)).toHaveValue('hello')
-    expect(screen.getByLabelText(/^transcript$/i)).toBeDisabled()
-  })
-})
-
-describe('workbench instrument', () => {
-  it('keeps the crop controls, the transcript and the waveform instrument', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    expect(screen.getByRole('button', { name: 'Keep only' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Exclude' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Reset to original' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /play selection/i })).toBeInTheDocument()
-    expect(screen.getByLabelText(/^transcript$/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Transcribe from audio/ })).toBeInTheDocument()
-  })
-
-  it('paints the exclusion overlay for the gaps in the keep', async () => {
-    vi.stubGlobal(
-      'fetch',
-      mockFetch(() => [voice({ keep_intervals: [{ start_s: 2, end_s: 6 }] })], calls),
-    )
-    renderWorkbench()
-    await findWorkbench()
-    await waitFor(() => {
-      const exclusions = h.regions.filter((region) => String(region.id ?? '').startsWith('excl-'))
-      expect(exclusions.map((region) => [region.start, region.end])).toEqual([
-        [0, 2],
-        [6, 12],
-      ])
-    })
-  })
-
-  it('loads Breeze without any parked processor in the way', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    const load = screen.getByRole('button', { name: 'Load Breeze' })
-    expect(load).toBeEnabled()
-    fireEvent.click(load)
-    await waitFor(() => {
-      expect(calls.some((call) => call.url.includes('/api/runtime/e2/load'))).toBe(true)
-    })
-  })
-
-  it('blocks Load Breeze while a live call holds the GPU', async () => {
-    vi.stubGlobal(
-      'fetch',
-      mockFetch(() => [voice()], calls, { live_call_active: true, live_call_holder: 'hop' }),
-    )
-    renderWorkbench()
-    await findWorkbench()
-    const load = screen.getByRole('button', { name: 'Load Breeze' })
-    expect(load).toBeDisabled()
-    expect(screen.getByText(/live call is using the mouth/i)).toBeInTheDocument()
-  })
-})
-
-describe('workbench compare', () => {
-  it('auditions the source against the selected experiment and shows its lineage', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice({ variants: [aukCandidate()] })], calls))
-    const { container } = renderWorkbench()
-    await findWorkbench()
-    expect(within(compareRegion()).getByText(/select an experiment/i)).toBeInTheDocument()
-    fireEvent.click(within(assetList('experiments')).getByRole('button', { name: /enhance/ }))
-    const sources = audioSources(container)
-    expect(sources.some((src) => src.includes('/api/artifacts/art_src/audio'))).toBe(true)
-    expect(sources.some((src) => src.includes('/api/artifacts/art_auk/audio'))).toBe(true)
-    expect(within(inspector()).getByText(/seed 7/)).toBeInTheDocument()
-    expect(within(inspector()).getByText(/Remove noise and reverberation/)).toBeInTheDocument()
-  })
-
-  it('drops an experiment from the compare strip without deleting it', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice({ variants: [aukCandidate()] })], calls))
-    const { container } = renderWorkbench()
-    await findWorkbench()
-    fireEvent.click(within(assetList('experiments')).getByRole('button', { name: /enhance/ }))
-    fireEvent.click(within(compareRegion()).getByRole('button', { name: /remove/i }))
-    expect(audioSources(container).some((src) => src.includes('art_auk'))).toBe(false)
-    expect(within(assetList('experiments')).getByText('enhance')).toBeInTheDocument()
-  })
-
-  it('keeps a stale experiment listed and marked', async () => {
-    vi.stubGlobal(
-      'fetch',
-      mockFetch(() => [voice({ variants: [aukCandidate({ stale: true })] })], calls),
-    )
-    renderWorkbench()
-    await findWorkbench()
-    expect(within(assetList('experiments')).getByText(/stale/i)).toBeInTheDocument()
-  })
-
-  it('reports the quiet lineage of a profile reference', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [profileVoice()], calls))
-    renderWorkbench()
-    await findWorkbench()
-    fireEvent.click(within(assetList('references')).getByRole('button', { name: /enhance 1 approved/ }))
-    const lineage = inspector()
-    expect(within(lineage).getByText('reference')).toBeInTheDocument()
-    expect(within(lineage).getByText('a_exp')).toBeInTheDocument()
-    expect(within(lineage).getByText('src_a')).toBeInTheDocument()
-  })
-
-  it('approves an experiment then activates it as the Breeze reference', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice({ variants: [aukCandidate()] })], calls))
-    renderWorkbench()
-    await findWorkbench()
-    fireEvent.click(within(assetList('experiments')).getByRole('button', { name: /enhance/ }))
-    fireEvent.click(within(compareRegion()).getByRole('button', { name: 'Approve' }))
-    await waitFor(() => {
-      const approve = calls.find((call) => call.url.includes('/auk/approve'))
-      expect(approve?.body).toEqual({ variant_id: 'rv_auk' })
-      const activate = calls.find((call) => call.url.includes('/reference/activate'))
-      expect(activate?.body).toEqual({ variant_id: 'rv_auk' })
-    })
-  })
-})
-
-describe('workbench entry', () => {
-  it('opens the workbench from the voices pane instead of an Edit reference overlay', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], calls))
-    useWorkspace.setState({ selectedVoiceId: 'vp1', editorOpen: false })
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    render(
-      <QueryClientProvider client={client}>
-        <VoicesPane />
-      </QueryClientProvider>,
-    )
-    const open = await screen.findByRole('button', { name: 'Open workbench' })
-    expect(screen.queryByRole('button', { name: 'Edit reference' })).toBeNull()
-    fireEvent.click(open)
-    expect(useWorkspace.getState().editorOpen).toBe(true)
-  })
-})
-
-describe('workbench in the lab shell', () => {
-  it('fills the lab while the editor is open and closes on Done', async () => {
-    vi.stubGlobal('fetch', mockFetch(() => [voice()], []))
+  it('cuts a crop child and keeps it beside its parent', async () => {
+    const { calls } = mockLab()
     renderShell()
-    expect(await findWorkbench()).toBeInTheDocument()
-    expect(screen.queryByRole('heading', { name: 'Voices' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
-    await waitFor(() => {
-      expect(screen.queryByRole('heading', { name: /Voice workbench/ })).toBeNull()
-    })
-    expect(screen.getByRole('heading', { name: 'Voices' })).toBeInTheDocument()
+    await openMaterial()
+
+    fireEvent.click(screen.getByRole('button', { name: /S1 0\.00s/ }))
+    fireEvent.change(screen.getByLabelText('Crop name'), { target: { value: 'tight crop' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create crop' }))
+
+    const lineage = await screen.findByRole('list', { name: 'source lineage' })
+    expect(lineage).toHaveTextContent('original → tight crop')
+    // The parent source is still listed: nothing was cut in place.
+    expect(screen.getByRole('button', { name: /Westworld S01E01/ })).toBeInTheDocument()
+    expect(
+      calls.some((call) => call.method === 'POST' && call.url.includes('/sources/vs_primary/crop')),
+    ).toBe(true)
+  })
+
+  it('keeps the selected voice as the store tab, not a second workbench', async () => {
+    mockLab()
+    renderShell()
+    fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Ford/ }))
+    await screen.findByRole('region', { name: 'ORIGINALS' })
+
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    expect(originals).toHaveTextContent('Westworld S01E01')
+    expect(originals).toHaveTextContent('derived from')
+    expect(originals).toHaveTextContent('★')
+    expect(screen.getByRole('region', { name: 'GENERATIONS' })).toHaveTextContent('No takes yet')
+    expect(screen.queryByText(/Voice workbench/)).toBeNull()
+  })
+
+  it('leaves the Breeze loader to the global runtime chrome', async () => {
+    mockLab()
+    renderShell()
+    await openMaterial()
+
+    expect(screen.queryByRole('button', { name: /Load Breeze/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Unload Breeze/ })).toBeNull()
+    expect(await screen.findByTestId('runtime-status')).toBeInTheDocument()
   })
 })

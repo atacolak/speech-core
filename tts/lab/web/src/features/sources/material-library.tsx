@@ -3,15 +3,19 @@ import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   type MediaSource,
+  addSourceArtifact,
   addSourceFile,
   addSourceUrl,
   fetchSources,
   isUnavailable,
 } from '@/features/sources/sources-api'
+import { type RunItem, fetchRuns } from '@/lib/api'
 import { useWorkspace } from '@/state/workspace'
 import { cn } from '@/lib/utils'
 
 const ACCEPT = '.wav,.mp3,.flac,.m4a,.ogg,.aac,.opus,audio/*,video/*'
+
+const INGEST_UNAVAILABLE = 'Source ingest is not available in this lab build yet.'
 
 /** What a source counts as in the lab: material a voice can be cut out of. */
 function MaterialRow({
@@ -54,22 +58,36 @@ export function MaterialLibrary() {
   const selectedMaterialId = useWorkspace((state) => state.selectedMaterialId)
   const selectMaterial = useWorkspace((state) => state.selectMaterial)
   const sources = useQuery({ queryKey: ['sources'], queryFn: fetchSources })
+  const runs = useQuery({ queryKey: ['runs'], queryFn: () => fetchRuns() })
   const [query, setQuery] = useState('')
   const [url, setUrl] = useState('')
+  const [takeId, setTakeId] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const retained = runs.data ?? []
+  const pickedTake = retained.find((run) => run.id === takeId)
   const add = useMutation({
-    mutationFn: (input: { file: File } | { url: string }) =>
-      'file' in input ? addSourceFile(input.file) : addSourceUrl(input.url),
+    mutationFn: (input: { file: File } | { url: string } | { run: RunItem }) => {
+      if ('file' in input) {
+        return addSourceFile(input.file)
+      }
+      if ('url' in input) {
+        return addSourceUrl(input.url)
+      }
+      // One retained take, by its existing artifact: no copy, no history import.
+      return addSourceArtifact({
+        artifactId: input.run.output_artifact_id,
+        runId: input.run.id,
+        title: `take ${input.run.id}`,
+      })
+    },
     onSuccess: (source) => {
       toast.success(`Added ${source.title}`)
       setUrl('')
+      setTakeId(null)
       selectMaterial(source.id)
       void client.invalidateQueries({ queryKey: ['sources'] })
     },
-    onError: (error) =>
-      toast.error(
-        isUnavailable(error) ? 'Source ingest is not available in this lab build yet.' : 'Ingest failed.',
-      ),
+    onError: (error) => toast.error(isUnavailable(error) ? INGEST_UNAVAILABLE : 'Ingest failed.'),
   })
 
   const items = sources.data ?? []
@@ -128,6 +146,47 @@ export function MaterialLibrary() {
           }
         }}
       />
+      {retained.length === 0 ? null : (
+        <div className="flex flex-col gap-1">
+          <h4 className="text-[11px] uppercase tracking-wide text-zinc-500">Retained takes</h4>
+          <ul aria-label="retained takes" className="flex flex-col gap-0.5">
+            {retained.map((run) => (
+              <li key={run.id}>
+                <button
+                  type="button"
+                  aria-pressed={run.id === takeId}
+                  className={cn(
+                    'w-full rounded-md px-2 py-1 text-left text-xs',
+                    run.id === takeId
+                      ? 'bg-zinc-700 text-zinc-50'
+                      : 'text-zinc-300 hover:bg-zinc-800',
+                  )}
+                  onClick={() => setTakeId(run.id)}
+                >
+                  take {run.id}
+                  {run.duration_s == null ? null : (
+                    <span className="ml-2 text-[11px] text-zinc-500">
+                      {run.duration_s.toFixed(1)}s
+                    </span>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            className="self-start rounded-md border border-zinc-500 px-2 py-1 text-xs text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={!pickedTake || add.isPending}
+            onClick={() => {
+              if (pickedTake) {
+                add.mutate({ run: pickedTake })
+              }
+            }}
+          >
+            Add to workbench
+          </button>
+        </div>
+      )}
       {sources.isError ? (
         <p className="text-sm text-red-400">Could not load material.</p>
       ) : items.length === 0 ? (
