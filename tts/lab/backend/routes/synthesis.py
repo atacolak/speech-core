@@ -17,7 +17,14 @@ from tts.lab.backend.models import DualGuidance, parse_guidance
 from tts.lab.backend.routes.voices import get_voice_or_404
 from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.breeze import SynthesisRequest, synthesize_e2
-from tts.lab.backend.services.references import reference_transcript
+from tts.lab.backend.services.candidates import REFERENCE
+from tts.lab.backend.services.references import (
+    CLIP,
+    SOURCE,
+    ReferenceOrigin,
+    clean_ref_text,
+    reference_origin,
+)
 from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.packets import new_id
 
@@ -65,19 +72,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _fill_ref_text(
-    store: Any, voice: dict[str, Any], reference_path: Path, reference_id: str | None
-) -> str:
-    text = reference_transcript(voice, reference_id)
-    if text:
-        return text
+def _asr_reference_text(reference_path: Path) -> str:
+    """Parakeet CPU transcript of the audio this request sends. Empty when unavailable."""
     try:
         from breeze_tts_qual.transcribe import transcribe_audio
 
         result = transcribe_audio(reference_path)
-        text = str(result.get("text") or "").strip()
+        return str(result.get("text") or "").strip()
     except (FileNotFoundError, ImportError, PermissionError):
-        text = ""
+        return ""
     except HTTPException:
         raise
     except Exception as exc:
@@ -85,6 +88,53 @@ def _fill_ref_text(
             status_code=500,
             detail={"code": "transcribe_failed", "message": str(exc)},
         ) from exc
+
+
+def _cache_origin_transcript(
+    store: Any, voice: dict[str, Any], origin: ReferenceOrigin, text: str
+) -> None:
+    """Cache a transcription on the origin row whose audio was transcribed.
+
+    The voice-level columns are the primary origin's transcript pair. Another
+    origin never writes them, and an origin that owns no transcript row keeps
+    its text for this request only.
+    """
+    if origin.is_primary:
+        store.execute(
+            "UPDATE voices SET source_transcript=?, effective_transcript=?, updated_at=? WHERE id=?",
+            (text, text, _now(), voice["id"]),
+        )
+    elif origin.kind == SOURCE and origin.source_id:
+        store.execute(
+            "UPDATE voice_sources SET transcript=? WHERE id=? AND voice_id=?",
+            (text, origin.source_id, voice["id"]),
+        )
+    elif origin.kind == CLIP and origin.clip_id:
+        store.execute("UPDATE clips SET clean_transcript=? WHERE id=?", (text, origin.clip_id))
+    else:
+        return
+    store.commit()
+
+
+def _fill_ref_text(
+    store: Any,
+    voice: dict[str, Any],
+    reference_path: Path,
+    reference_id: str | None,
+    audio_artifact_id: str | None,
+) -> str:
+    """The ref_text Breeze gets: one origin's own clean transcript.
+
+    `audio_artifact_id` is the audio this request sends. A transcription of a
+    non-primary origin is cached on that origin alone — never on the voice's
+    primary transcript columns — and an origin whose clean transcript is unknown
+    is transcribed or fails closed rather than borrowing the primary text.
+    """
+    origin = reference_origin(voice, reference_id, audio_artifact_id)
+    text = clean_ref_text(origin.transcript)
+    if text:
+        return text
+    text = clean_ref_text(_asr_reference_text(reference_path))
     if not text:
         raise HTTPException(
             status_code=422,
@@ -96,11 +146,7 @@ def _fill_ref_text(
                 ),
             },
         )
-    store.execute(
-        "UPDATE voices SET source_transcript=?, effective_transcript=?, updated_at=? WHERE id=?",
-        (text, text, _now(), voice["id"]),
-    )
-    store.commit()
+    _cache_origin_transcript(store, voice, origin, text)
     return text
 
 
@@ -113,13 +159,29 @@ class ResolvedSynthesis:
     settings: GenerationSettings
 
 
-def _reference_audio_id(voice: dict[str, Any], reference_id: str | None) -> str | None:
-    """The audio artifact a selected reference id names, when it is not a legacy variant."""
+def _reference_artifact(voice: dict[str, Any], reference_id: str | None) -> dict[str, Any] | None:
+    """The approved reference artifact `reference_id` names, or None.
+
+    Activation applies this same role test: an experiment and a GENERATION are
+    never references.
+    """
     if not reference_id:
         return None
     target = next(
         (item for item in voice.get("artifacts") or [] if item["id"] == reference_id), None
     )
+    return None if target is None or target.get("role") != REFERENCE else target
+
+
+def _reference_audio_id(voice: dict[str, Any], reference_id: str | None) -> str | None:
+    """The audio artifact a selected reference id names, when it is not a legacy variant.
+
+    A reference artifact, a clip, or a source artifact names its own audio. An
+    experiment, a GENERATION or a foreign id names nothing here.
+    """
+    if not reference_id:
+        return None
+    target = _reference_artifact(voice, reference_id)
     if target is not None:
         return str(target["audio_artifact_id"])
     clip = next(
@@ -130,7 +192,32 @@ def _reference_audio_id(voice: dict[str, Any], reference_id: str | None) -> str 
         ),
         None,
     )
-    return None if clip is None else str(clip["audio_artifact_id"])
+    if clip is not None:
+        return str(clip["audio_artifact_id"])
+    source = next(
+        (
+            item
+            for item in voice.get("sources") or []
+            if str(item.get("artifact_id") or "") == reference_id
+        ),
+        None,
+    )
+    return None if source is None else str(source["artifact_id"])
+
+
+def _require_selectable_reference(voice: dict[str, Any], reference_id: str) -> None:
+    """An explicit request id obeys activation's rule: only a reference may be picked.
+
+    A legacy variant, or anything naming an origin's own audio — an approved
+    reference artifact, a clip, a source — is selectable. A GENERATION's
+    artifact, an experiment or a foreign id is rejected, so it can never become
+    reference audio or ref_text.
+    """
+    if _reference_audio_id(voice, reference_id) is not None:
+        return
+    if any(item["id"] == reference_id for item in voice.get("variants") or []):
+        return
+    raise HTTPException(status_code=404, detail="reference not found")
 
 
 def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthesis:
@@ -147,6 +234,8 @@ def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthe
         processed_variant_is_current,
     )
 
+    if body.reference_variant_id:
+        _require_selectable_reference(voice, body.reference_variant_id)
     source = state.store.get(voice["source_audio_artifact_id"])
     variant = voice.get("active_variant")
     if body.reference_variant_id:
@@ -177,6 +266,7 @@ def resolve_synthesis_request(state: Any, body: SynthesisBody) -> ResolvedSynthe
         voice,
         Path(reference_path),
         selected if selected_audio_id is not None else None,
+        selected_audio_id,
     )
     return ResolvedSynthesis(
         voice=voice,

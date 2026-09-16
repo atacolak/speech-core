@@ -172,11 +172,6 @@ def transcribe_alignment(path: Path | str) -> dict[str, object]:
         return {"text": "", "words": []}
 
 
-def transcribe_reference(path: Path | str) -> str:
-    """Parakeet CPU transcript. Empty on missing tooling or failure; never raises."""
-    return str(transcribe_alignment(path).get("text") or "").strip()
-
-
 class VoiceImportError(ValueError):
     """Operator-facing import failure."""
 

@@ -7,6 +7,8 @@ the Gradio rollback path.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,25 @@ from tts.lab.backend.models import Interval
 from tts.lab.backend.store.cache import processor_cache_key
 
 _EPS = 1e-9
+
+# The origin a request's audio belongs to. `primary` is the voice's own source
+# audio (and every legacy selection derived from it); `unknown` is audio no
+# origin row of the voice owns, which therefore has no transcript of its own.
+PRIMARY = "primary"
+SOURCE = "source"
+CLIP = "clip"
+UNKNOWN = "unknown"
+
+# Breeze conditions on `ref_text`: prose only. The analysis boundary strips
+# diarization markup (`services/sources.py`); a stored top-level transcript may
+# still carry SRT/VTT ranges, and those are dropped at composition, not in place.
+_SPEAKER_MARKUP = re.compile(r"\bspeaker[_\s-]*\w+\s*:", re.IGNORECASE)
+_SRT_RANGE = re.compile(
+    r"[\[(]\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*"
+    r"(?:-->|->|—|–|to)\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*[\])]",
+    re.IGNORECASE,
+)
+_TIMESTAMP = re.compile(r"[\[(]\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*[\])]")
 
 
 def _as_interval(value: Interval) -> Interval:
@@ -190,16 +211,35 @@ def reference_transcript(voice: dict[str, Any], reference_id: str | None) -> str
     `source_id` wins, then a clip's own clean transcript, then the primary
     transcript for a legacy variant or no selection at all.
     """
-    artifacts = voice.get("artifacts") or []
-    target = next((item for item in artifacts if item["id"] == reference_id), None)
-    if target is not None and target.get("source_id"):
-        source = next(
-            (item for item in voice.get("sources") or [] if item["id"] == target["source_id"]),
-            None,
-        )
-        if source is not None:
-            return str(source.get("transcript") or "").strip()
-    clip = next(
+    source = _declared_source(voice, reference_id)
+    if source is not None:
+        return str(source.get("transcript") or "").strip()
+    clip = _declared_clip(voice, reference_id)
+    if clip is not None:
+        return str(clip.get("clean_transcript") or "").strip()
+    return str(voice.get("effective_transcript") or voice.get("source_transcript") or "").strip()
+
+
+def _declared_source(voice: dict[str, Any], reference_id: str | None) -> dict[str, Any] | None:
+    """The `voice_sources` row a selected artifact declares as its origin."""
+    if not reference_id:
+        return None
+    target = next(
+        (item for item in voice.get("artifacts") or [] if item["id"] == reference_id), None
+    )
+    if target is None or not target.get("source_id"):
+        return None
+    return next(
+        (item for item in voice.get("sources") or [] if item["id"] == target["source_id"]),
+        None,
+    )
+
+
+def _declared_clip(voice: dict[str, Any], reference_id: str | None) -> dict[str, Any] | None:
+    """A clip the selection names by its own id or by its audio artifact."""
+    if not reference_id:
+        return None
+    return next(
         (
             item
             for item in voice.get("clips") or []
@@ -207,7 +247,118 @@ def reference_transcript(voice: dict[str, Any], reference_id: str | None) -> str
         ),
         None,
     )
+
+
+def _audio_source(voice: dict[str, Any], audio_artifact_id: str) -> dict[str, Any] | None:
+    """The `voice_sources` row whose own audio is `audio_artifact_id`."""
+    return next(
+        (
+            item
+            for item in voice.get("sources") or []
+            if str(item.get("artifact_id") or "") == audio_artifact_id
+        ),
+        None,
+    )
+
+
+def _audio_clip(voice: dict[str, Any], audio_artifact_id: str) -> dict[str, Any] | None:
+    """The clip whose own audio is `audio_artifact_id`."""
+    return next(
+        (
+            item
+            for item in voice.get("clips") or []
+            if str(item.get("audio_artifact_id") or "") == audio_artifact_id
+        ),
+        None,
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceOrigin:
+    """The origin the selected reference names: its audio and its own transcript.
+
+    `kind` is `primary` for the voice's own source audio (and for a legacy
+    variant or no selection at all), `source` for a `voice_sources` row, `clip`
+    for a `clips` row, and `unknown` when the audio belongs to no origin row of
+    this voice. An `unknown` origin carries no transcript on purpose: one
+    origin's audio is never paired with another origin's text.
+    """
+
+    kind: str
+    audio_artifact_id: str | None
+    transcript: str = ""
+    source_id: str | None = None
+    clip_id: str | None = None
+
+    @property
+    def is_primary(self) -> bool:
+        """True when this audio is the voice's own source audio or derived from it."""
+        return self.kind == PRIMARY
+
+
+def reference_origin(
+    voice: dict[str, Any], reference_id: str | None, audio_artifact_id: str | None = None
+) -> ReferenceOrigin:
+    """The origin a request sends, and that origin's own transcript.
+
+    `audio_artifact_id` is the audio the request actually sends. When it is the
+    voice's own source audio, or a legacy variant / no selection at all, the
+    origin is the primary and its transcript is `reference_transcript`'s ladder.
+    Any other audio must find an origin row that owns it — the row a selected
+    artifact declares, the clip it names, or the `voice_sources` / clip row whose
+    own artifact it is — because one origin's audio is never given another
+    origin's text.
+    """
+    audio = None if audio_artifact_id is None else str(audio_artifact_id)
+    primary_audio = str(voice.get("source_audio_artifact_id") or "")
+    if audio is None or audio == primary_audio:
+        return ReferenceOrigin(
+            PRIMARY,
+            audio or primary_audio or None,
+            reference_transcript(voice, reference_id),
+        )
+    source = _declared_source(voice, reference_id)
+    if source is not None:
+        return _source_origin(voice, source, audio)
+    clip = _declared_clip(voice, reference_id)
     if clip is not None:
-        return str(clip.get("clean_transcript") or "").strip()
-    return str(voice.get("effective_transcript") or voice.get("source_transcript") or "").strip()
+        return _clip_origin(clip, audio)
+    owner = _audio_source(voice, audio)
+    if owner is not None:
+        return _source_origin(voice, owner, audio)
+    owner_clip = _audio_clip(voice, audio)
+    if owner_clip is not None:
+        return _clip_origin(owner_clip, audio)
+    return ReferenceOrigin(UNKNOWN, audio)
+
+
+def _source_origin(
+    voice: dict[str, Any], source: dict[str, Any], audio_artifact_id: str
+) -> ReferenceOrigin:
+    """A `voice_sources` origin. Its own audio is the primary origin's."""
+    text = str(source.get("transcript") or "").strip()
+    if str(source.get("artifact_id") or "") == str(voice.get("source_audio_artifact_id") or ""):
+        return ReferenceOrigin(PRIMARY, audio_artifact_id, text)
+    return ReferenceOrigin(SOURCE, audio_artifact_id, text, source_id=str(source["id"]))
+
+
+def _clip_origin(clip: dict[str, Any], audio_artifact_id: str) -> ReferenceOrigin:
+    return ReferenceOrigin(
+        CLIP,
+        audio_artifact_id,
+        str(clip.get("clean_transcript") or "").strip(),
+        clip_id=str(clip["id"]),
+    )
+
+
+def clean_ref_text(text: str) -> str:
+    """Prose for Breeze: no timestamps, no SRT/VTT ranges, no diarization markup.
+
+    Breeze conditions on `ref_text`, so the composition boundary strips what a
+    stored transcript may carry. The stored row is never rewritten.
+    """
+    stripped = _SRT_RANGE.sub(" ", text)
+    stripped = _TIMESTAMP.sub(" ", stripped)
+    stripped = _SPEAKER_MARKUP.sub(" ", stripped)
+    return " ".join(stripped.split())
 
