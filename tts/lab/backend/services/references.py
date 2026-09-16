@@ -33,19 +33,37 @@ UNKNOWN = "unknown"
 # cue has in either format: an optional bracket (`[00:01.23 --> 00:02.00]`), an
 # optional leading cue number on its own line (SRT numbers every cue), and no
 # bracket at all — a bare `00:00:00,000 --> 00:00:02,000` line is the common
-# form. A lone clock token is not a range: `_TIMESTAMP` only removes a bracketed
-# one, so prose that merely mentions a time is left alone.
+# form. An arrow is the only separator that cannot be prose, so a bare range
+# must be arrow-formed; `to` and the dashes stay inside a bracket, which is where
+# hand-written cue markup lives (`[00:00 to 00:02]`). A lone clock token is not a
+# range either: `_TIMESTAMP` only removes a bracketed one, and `_LONE_CLOCK`
+# only a bare one carrying seconds or a fraction — `3:30 pm` survives.
 _CLOCK = r"\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?"
 _CUE_INDEX = r"(?:^[ \t]*\d{1,9}[ \t]*\r?\n[ \t]*)?"
+_ARROW = r"(?:-->|->|\u2192)"
+_BRACKET_SEPARATOR = r"(?:-->|->|\u2192|\u2014|\u2013|to)"
 _SRT_RANGE = re.compile(
-    _CUE_INDEX + r"[\[(]?\s*" + _CLOCK + r"\s*(?:-->|->|—|–|to)\s*" + _CLOCK + r"\s*[\])]?",
+    _CUE_INDEX
+    + r"(?:"
+    + r"[\[(]?\s*" + _CLOCK + r"\s*" + _ARROW + r"\s*" + _CLOCK + r"\s*[\])]?"
+    + r"|"
+    + r"[\[(]\s*" + _CLOCK + r"\s*" + _BRACKET_SEPARATOR + r"\s*" + _CLOCK + r"\s*[\])]?"
+    + r")",
     re.IGNORECASE | re.MULTILINE,
 )
 _TIMESTAMP = re.compile(r"[\[(]\s*" + _CLOCK + r"\s*[\])]")
-# `SPEAKER_00:` and the short `S0:` the decoder also emits.
-_SPEAKER_MARKUP = re.compile(r"\b(?:speaker[_\s-]*\w+|s\d+)\s*:", re.IGNORECASE)
-# The WebVTT signature line. Only a header at the very start of the text is one.
-_WEBVTT_HEADER = re.compile(r"\AWEBVTT\b[^\n]*\r?\n?", re.IGNORECASE)
+# A clock with seconds or a fraction cannot be prose, so a bare one is a stray
+# cue fragment. A bare `H:MM` can be a time of day (`4:15`, `3:30 pm`).
+_LONE_CLOCK = re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?\b|\b\d{1,2}:\d{2}[.,]\d{1,3}\b")
+# `SPEAKER_00:` anywhere, and the short `S0:` the decoder emits at a cue start.
+# The short form is a whole token at the head of a line: `the s3: bucket policy`
+# is prose, and the previous loose match ate it.
+_SPEAKER_MARKUP = re.compile(
+    r"\b(?:speaker[_\s-]*\w+)\s*:|^[ \t]*s\d+\s*:", re.IGNORECASE | re.MULTILINE
+)
+# The WebVTT signature line. Only a header at the very start of the text is one,
+# and a BOM or a leading blank line is still the start.
+_WEBVTT_HEADER = re.compile(r"\A\ufeff?[ \t\r\n]*WEBVTT\b[^\n]*\r?\n?", re.IGNORECASE)
 
 
 def _as_interval(value: Interval) -> Interval:
@@ -367,12 +385,14 @@ def clean_ref_text(text: str) -> str:
 
     Breeze conditions on `ref_text`, so the composition boundary strips what a
     stored transcript may carry: the WebVTT signature, every cue range with its
-    cue number, a bracketed clock token, and diarization markup. The stored row
-    is never rewritten.
+    cue number, a bracketed clock token, a bare clock carrying seconds or a
+    fraction, and diarization markup. A bare `H:MM` stays because prose says
+    `3:30 pm` and `we open from 9:00 to 5:00`. The stored row is never rewritten.
     """
     stripped = _WEBVTT_HEADER.sub(" ", text)
     stripped = _SRT_RANGE.sub(" ", stripped)
     stripped = _TIMESTAMP.sub(" ", stripped)
+    stripped = _LONE_CLOCK.sub(" ", stripped)
     stripped = _SPEAKER_MARKUP.sub(" ", stripped)
     return " ".join(stripped.split())
 

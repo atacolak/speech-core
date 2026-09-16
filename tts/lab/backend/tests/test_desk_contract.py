@@ -71,6 +71,37 @@ class DeskContract(unittest.TestCase):
                 return body
         self.fail(body)
 
+    def _set_transcript(self, voice_id: str, text: str) -> None:
+        """Store a transcript the way the product's editor lets it arrive."""
+        patched = self.client.patch(
+            f"/api/voices/{voice_id}",
+            json={"source_transcript": text, "effective_transcript": text},
+        )
+        self.assertEqual(patched.status_code, 200, patched.text)
+
+    def _spoken(self) -> None:
+        """One leftover hop turn over the loaded fake worker."""
+        pcm = self.client.post(
+            "/internal/leftover/v1/audio/speech",
+            json={
+                "input": "hello there",
+                "voice": "ryan",
+                "response_format": "pcm",
+                "stream": True,
+            },
+        )
+        self.assertEqual(pcm.status_code, 200, pcm.text)
+
+    def _last_synth_request(self) -> dict:
+        calls = [
+            call
+            for handle in self.factory.handles
+            for call in handle.rpc_calls
+            if call.get("cmd") == "synthesize"
+        ]
+        self.assertTrue(calls, "no synthesize call reached the worker")
+        return calls[-1]["request"]
+
     def test_runtime_load_alias_and_engine(self) -> None:
         body = self.client.get("/api/runtime").json()
         self.assertEqual(body["engine"], "breeze-tts2")
@@ -130,6 +161,44 @@ class DeskContract(unittest.TestCase):
         ]
         self.assertEqual(len(synth_calls), 1)
         self.assertEqual(synth_calls[0]["request"]["voice_profile_id"], created["id"])
+
+    def test_leftover_hop_sends_prose_only_reference_text(self) -> None:
+        """The mouth and the lab do not disagree about what prose is."""
+        created = self._create_voice()
+        srt = (
+            "1\n00:00:00,000 --> 00:00:02,000\nfirst line of prose\n\n"
+            "2\n00:00:02,000 --> 00:00:04,500\nsecond line of prose\n"
+        )
+        self._set_transcript(created["id"], srt)
+        self.client.post("/api/talker/voice", json={"voice_id": created["id"]})
+        self._wait_ready()
+
+        self._spoken()
+
+        request = self._last_synth_request()
+        self.assertEqual(request["reference_text"], "first line of prose second line of prose")
+        self.assertNotIn("-->", request["reference_text"])
+        self.assertTrue(
+            {"text", "steer", "voice_profile_id", "reference_audio", "reference_text", "generation"}
+            <= set(request),
+            sorted(request),
+        )
+        self.assertEqual(request["voice_profile_id"], created["id"])
+        self.assertEqual(request["text"], "hello there")
+        self.assertTrue(str(request["reference_audio"]).endswith(".wav"), request["reference_audio"])
+
+    def test_leftover_hop_never_sends_an_empty_reference_text(self) -> None:
+        """The talker path has no ASR ladder, so cue-only text falls back to raw."""
+        created = self._create_voice()
+        only_a_range = "00:00:00,000 --> 00:00:02,000"
+        self._set_transcript(created["id"], only_a_range)
+        self.client.post("/api/talker/voice", json={"voice_id": created["id"]})
+        self._wait_ready()
+
+        self._spoken()
+
+        request = self._last_synth_request()
+        self.assertEqual(request["reference_text"], only_a_range)
 
     def test_leftover_hop_streams_first_bytes_before_synth_finishes(self) -> None:
         import time

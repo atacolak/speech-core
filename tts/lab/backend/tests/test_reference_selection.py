@@ -75,13 +75,57 @@ FORMAT_FIXTURES: tuple[tuple[str, str, str], ...] = (
     ("paren_bracket", f"(00:01.23) {PROSE}", PROSE),
     ("speaker_00", f"SPEAKER_00: {SPOKEN}", SPOKEN),
     ("speaker_short", f"S0: {SPOKEN}", SPOKEN),
+    (
+        "lone_clock_with_seconds_and_milliseconds",
+        "00:00:01,000\nthe train arrived\n\n01:02:03,500\nand we walked uphill",
+        "the train arrived and we walked uphill",
+    ),
+    ("lone_clock_with_fraction", f"00:00:01.500 {PROSE}", PROSE),
+    ("lone_clock_with_seconds", f"01:02:03 {PROSE}", PROSE),
+    ("bracketed_to_range", f"[00:00 to 00:02] {PROSE}", PROSE),
+    ("bracketed_em_dash_range", f"[00:00 \u2014 00:02] {PROSE}", PROSE),
+    (
+        "vtt_with_bom",
+        "\ufeffWEBVTT\n\n00:00:00.000 --> 00:00:02.000\narrived by train\n\n"
+        "00:00:02.000 --> 00:00:04.500\nand walked uphill\n",
+        PROSE,
+    ),
+    (
+        "vtt_with_leading_blank_line",
+        "\nWEBVTT\n\n00:00:00.000 --> 00:00:02.000\narrived by train\n\n"
+        "00:00:02.000 --> 00:00:04.500\nand walked uphill\n",
+        PROSE,
+    ),
     ("clean_control", PROSE, PROSE),
 )
 
+# Prose the sanitiser must hand back byte-for-byte. Direction B: the operator's
+# own words are not timestamp material, and deleting them diverges the picker
+# quote from the sent `ref_text` by real words — silently. `9:00 to 5:00` and
+# `the s3: bucket policy` are the shapes an over-eager pass ate before.
+PROSE_SURVIVALS: tuple[str, ...] = (
+    "it started at 3:30 pm",
+    "note: bring water",
+    "chapter 3: the river",
+    "the ratio was 1:2",
+    "speaker one said",
+    "we met at 08:30, then walked",
+    "he arrived at 4:15 and left at 5:45",
+    "at 10:00 we stopped for lunch",
+    "we open from 9:00 to 5:00 every weekday",
+    "the shift runs 6:00 to 14:00 on the floor",
+    "the 9:00 \u2014 5:00 shift",
+    "the s3: bucket policy",
+    "The Talker: a subtitle",
+)
+
 # The invariant, not the regex: Breeze gets prose. A clock-like token of any
-# width, a range arrow, or diarization markup reaching ref_text is the bug.
+# width (`\d{1,2}:\d{2}` already covers the seconds and fraction forms), a range
+# arrow, a dash cue separator, the WebVTT token, or diarization markup reaching
+# ref_text is the bug.
 _CLOCK_LIKE = re.compile(r"\d{1,2}:\d{2}")
 _SPEAKER_LIKE = re.compile(r"SPEAKER_\d+|S\d+\s*:")
+_CUE_ARTIFACTS = ("-->", "->", "\u2192", "\u2014", "\u2013", "WEBVTT")
 
 
 def _wav(path: Path, *, freq: float = 440.0) -> Path:
@@ -437,7 +481,7 @@ class ReferenceResolutionTest(unittest.TestCase):
 
     def _assert_prose_only(self, label: str, text: str) -> None:
         """The Breeze-facing invariant: a range, a clock or markup never survives."""
-        for needle in ("-->", "->"):
+        for needle in _CUE_ARTIFACTS:
             self.assertNotIn(needle, text, f"{label}: {needle!r} in {text!r}")
         self.assertIsNone(_CLOCK_LIKE.search(text), f"{label}: clock token in {text!r}")
         self.assertIsNone(_SPEAKER_LIKE.search(text), f"{label}: markup in {text!r}")
@@ -505,6 +549,35 @@ class ReferenceResolutionTest(unittest.TestCase):
                     self.assertEqual(resolved.artifact.id, artifact_id)
                     self._assert_prose_only(f"{origin}[{name}]", resolved.reference_text)
                     self.assertEqual(resolved.reference_text, expected)
+                    self.assertEqual(self._stored_transcript_rows(clip["id"]), before)
+
+    def test_legitimate_prose_survives_sanitising(self) -> None:
+        for sample in PROSE_SURVIVALS:
+            with self.subTest(prose=sample):
+                self.assertEqual(clean_ref_text(sample), sample)
+
+    def test_prose_with_times_survives_every_origin_path(self) -> None:
+        """Direction B at the product surface: the shown quote is what is sent."""
+        clip = self._clip_fixture()
+        clip_reference = self._reference(
+            clip["id"], audio=clip["audio_artifact_id"], source=None
+        )
+        origin_paths = (
+            ("primary", self.first_reference),
+            ("voice_sources", self.second_reference),
+            ("clip", clip_reference),
+        )
+        for sample in PROSE_SURVIVALS:
+            for origin, reference in origin_paths:
+                with self.subTest(prose=sample, origin=origin):
+                    self._write_transcript(origin, sample, clip["id"])
+                    activated = self._activate(reference)
+                    self.assertEqual(activated.status_code, 200, activated.text)
+                    before = self._stored_transcript_rows(clip["id"])
+
+                    resolved = resolve_synthesis_request(self.state, self._body())
+
+                    self.assertEqual(resolved.reference_text, sample)
                     self.assertEqual(self._stored_transcript_rows(clip["id"]), before)
 
     def test_run_record_keeps_the_reference_transcript_the_request_sent(self) -> None:

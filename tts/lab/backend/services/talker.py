@@ -15,6 +15,7 @@ from tts.lab.backend.models import DualGuidance, Interval, parse_guidance
 from tts.lab.backend.routes.voices import get_voice_or_404
 from tts.lab.backend.runtime.types import RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.references import (
+    clean_ref_text,
     materialize_keep_wav,
     processed_variant_is_current,
 )
@@ -94,7 +95,13 @@ def _talker_request(
         if not dest.is_file():
             materialize_keep_wav(source.path, keep, dest)
         reference_path = dest
-    reference_text = str(voice.get("effective_transcript") or voice.get("source_transcript") or "").strip()
+    raw_reference_text = str(
+        voice.get("effective_transcript") or voice.get("source_transcript") or ""
+    ).strip()
+    # The mouth and the lab agree on what prose is. Unlike synthesis there is no
+    # ASR ladder here, so a transcript that is nothing but cue markup falls back
+    # to the raw text instead of sending Breeze an empty reference.
+    reference_text = clean_ref_text(raw_reference_text) or raw_reference_text
     if not reference_text:
         raise RuntimeError("clone needs a transcript of the reference audio")
     settings = _settings_from_generation(voice.get("generation"))
