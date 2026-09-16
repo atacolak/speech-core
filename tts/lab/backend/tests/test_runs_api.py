@@ -39,15 +39,18 @@ class RunsApi(unittest.TestCase):
         self.client.close()
         self.tmp.cleanup()
 
-    def test_retrieve_run_restores_request_snapshot(self) -> None:
+    def _voice(self) -> dict:
         wav = self.root / "ref.wav"
         write_wav(wav, 24000, 0.1 * np.sin(2 * np.pi * 330 * np.arange(6000) / 24000))
         with wav.open("rb") as handle:
-            voice = self.client.post(
+            return self.client.post(
                 "/api/voices",
                 data={"name": "ata", "transcript": "fixture"},
                 files={"audio": ("ref.wav", handle, "audio/wav")},
             ).json()
+
+    def test_retrieve_run_restores_request_snapshot(self) -> None:
+        voice = self._voice()
         snapshot = {
             "text": "i found the issue. the worker is holding the old session open.",
             "steer": "calm and matter-of-fact.",
@@ -66,6 +69,23 @@ class RunsApi(unittest.TestCase):
         self.assertEqual(body["request_snapshot"]["generation"]["seed"], 9)
         listed = self.client.get("/api/runs")
         self.assertEqual(len(listed.json()["items"]), 1)
+
+    def test_one_shot_snapshot_has_no_produced_prefix_fields(self) -> None:
+        voice = self._voice()
+        created = self.client.post(
+            "/api/synthesize",
+            json={
+                "text": "One shot line.",
+                "steer": "calm",
+                "voice_profile_id": voice["id"],
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        body = self.client.get(f"/api/runs/{created.json()['id']}").json()
+        snapshot = body["request_snapshot"]
+        for key in ("produced_text", "segments_planned", "segments_completed", "stopped"):
+            self.assertNotIn(key, snapshot)
+        self.assertEqual(snapshot["text"], "One shot line.")
 
 
 if __name__ == "__main__":

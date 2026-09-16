@@ -157,6 +157,8 @@ def record_synthesis_run(
     body: SynthesisBody,
     resolved: ResolvedSynthesis,
     result: Any,
+    *,
+    produced: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist the produced audio as a run and return the route response."""
     voice = resolved.voice
@@ -174,6 +176,8 @@ def record_synthesis_run(
         or {"guidance": {"mode": "single", "cfg": settings.cfg_scale}, "seed": settings.seed},
         "synthesis_text": body.synthesis_text,
     }
+    if produced is not None:
+        snapshot.update(produced)
     created = _now()
     state.store.execute(
         """

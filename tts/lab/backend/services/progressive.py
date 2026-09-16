@@ -80,6 +80,16 @@ class GenerateStreams:
                 self._active_id = None
 
 
+def produced_snapshot(segments: list[str], *, completed: int, stopped: bool) -> dict[str, Any]:
+    """The exact produced prefix of a streamed take, for the run request snapshot."""
+    return {
+        "produced_text": " ".join(segments[:completed]),
+        "segments_planned": len(segments),
+        "segments_completed": completed,
+        "stopped": stopped,
+    }
+
+
 def _payload(body: Any, resolved: Any, segment: str) -> dict[str, Any]:
     """The resident-worker request shape, with the enrolled reference every time."""
     return {
@@ -108,13 +118,17 @@ def iter_generate_pcm(
     started = time.monotonic()
     first_audio_s: float | None = None
     pcm = bytearray()
+    completed = 0
+    stopped = False
     try:
         for segment in segments:
             if stream.stop_event.is_set():
+                stopped = True
                 return
             while state.runtime.live_call_remaining_s() > 0:
                 time.sleep(WAIT_S)
                 if stream.stop_event.is_set():
+                    stopped = True
                     return
             try:
                 for chunk in state.runtime.synthesize_stream(
@@ -128,10 +142,21 @@ def iter_generate_pcm(
                     pcm.extend(chunk)
                     yield chunk
             except (StreamCancelled, GenerationCancelled):
+                stopped = True
                 return
+            completed += 1
     finally:
         try:
-            _record_take(state, stream, body, resolved, pcm, started, first_audio_s)
+            _record_take(
+                state,
+                stream,
+                body,
+                resolved,
+                pcm,
+                started,
+                first_audio_s,
+                produced=produced_snapshot(segments, completed=completed, stopped=stopped),
+            )
         finally:
             state.generate_streams.end(stream.id)
 
@@ -144,6 +169,8 @@ def _record_take(
     pcm: bytearray,
     started: float,
     first_audio_s: float | None,
+    *,
+    produced: dict[str, Any],
 ) -> None:
     """One ordinary take for the produced audio. Nothing produced, nothing recorded."""
     raw = bytes(pcm)
@@ -160,5 +187,5 @@ def _record_take(
         wall_s=time.monotonic() - started,
         first_audio_s=first_audio_s,
     )
-    payload = record_synthesis_run(state, body, resolved, result)
+    payload = record_synthesis_run(state, body, resolved, result, produced=produced)
     stream.run_id = str(payload["id"])

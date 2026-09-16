@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +91,11 @@ class GenerateStreamsTest(unittest.TestCase):
     def _runs(self) -> list:
         return self.state.store.execute("SELECT * FROM runs").fetchall()
 
+    def _snapshot(self) -> dict:
+        row = self.state.store.execute("SELECT request_json FROM runs").fetchone()
+        self.assertIsNotNone(row)
+        return json.loads(row["request_json"])
+
     def _latest_take_id(self) -> str | None:
         items = self.client.get("/api/voices").json()["items"]
         return next(item["latest_take_id"] for item in items if item["id"] == self.voice["id"])
@@ -119,6 +125,34 @@ class GenerateStreamsTest(unittest.TestCase):
         self.assertEqual(rows[0]["id"], stream.run_id)
         self.assertEqual(len(self._synth_calls()), 1)
         self.assertGreater(float(rows[0]["duration_s"]), 0)
+
+    def test_completed_run_records_exact_produced_prefix(self) -> None:
+        stream, chunks = self._stream(["One.", "Two."])
+        self.assertGreater(len(b"".join(chunks)), 0)
+        self.assertEqual(
+            self._snapshot(),
+            {
+                **self._snapshot(),
+                "produced_text": "One. Two.",
+                "segments_planned": 2,
+                "segments_completed": 2,
+                "stopped": False,
+            },
+        )
+
+    def test_stop_records_only_completed_segment_text(self) -> None:
+        stream, chunks = self._stream(["One.", "Two.", "Three."])
+        while len(self._synth_calls()) < 2:
+            next(chunks)
+        self.streams.stop(stream.id)
+        b"".join(chunks)
+        snapshot = self._snapshot()
+        self.assertEqual(snapshot["produced_text"], "One.")
+        self.assertEqual(snapshot["segments_completed"], 1)
+        self.assertEqual(snapshot["segments_planned"], 3)
+        self.assertTrue(snapshot["stopped"])
+        self.assertNotIn("Two.", snapshot["produced_text"])
+        self.assertNotIn("Three.", snapshot["produced_text"])
 
     def test_stop_before_audio_keeps_previous_latest_take(self) -> None:
         settled, settled_chunks = self._stream(["One.", "Two."])
