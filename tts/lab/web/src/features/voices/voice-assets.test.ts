@@ -37,6 +37,7 @@ function legacyVoice(overrides: Record<string, unknown> = {}): Voice {
     duration_s: 12,
     source_duration_s: 12,
     effective_duration_s: 4,
+    latest_take_id: null,
     created_at: '2026-09-12T00:00:00Z',
     updated_at: '2026-09-12T00:00:00Z',
     ...overrides,

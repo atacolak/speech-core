@@ -15,6 +15,7 @@ const VOICE: Voice = {
   keep_intervals: [{ start_s: 0, end_s: 8 }],
   effective_transcript: 'these violent delights have violent ends',
   active_reference_variant_id: 'rv_ford',
+  latest_take_id: null,
   active_variant: {
     id: 'rv_ford',
     voice_profile_id: 'vp_ford',
