@@ -156,6 +156,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE voices ADD COLUMN generation_json TEXT")
     if "take_limit" not in voice_cols:
         conn.execute("ALTER TABLE voices ADD COLUMN take_limit INTEGER NOT NULL DEFAULT 5")
+    if "source_limit" not in voice_cols:
+        conn.execute("ALTER TABLE voices ADD COLUMN source_limit INTEGER NOT NULL DEFAULT 5")
     if "source_words_json" not in voice_cols:
         conn.execute("ALTER TABLE voices ADD COLUMN source_words_json TEXT")
     if "transcript_locked" not in voice_cols:
@@ -170,6 +172,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     run_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
     if "alignment_json" not in run_cols:
         conn.execute("ALTER TABLE runs ADD COLUMN alignment_json TEXT")
+
+    source_cols = {row[1] for row in conn.execute("PRAGMA table_info(voice_sources)")}
+    if "transcript_locked" not in source_cols:
+        conn.execute(
+            "ALTER TABLE voice_sources ADD COLUMN transcript_locked INTEGER NOT NULL DEFAULT 0"
+        )
 
     variant_cols = {row[1] for row in conn.execute("PRAGMA table_info(reference_variants)")}
     for column, ddl in (

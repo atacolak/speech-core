@@ -16,23 +16,41 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from tts.lab.backend.models import Interval, MediaSourceKind
-from tts.lab.backend.services.references import materialize_keep_wav
+from tts.lab.backend.services.candidates import (
+    EXPERIMENT,
+    ORIGINAL_KIND,
+    REFERENCE,
+    record_voice_artifact,
+)
+from tts.lab.backend.services.references import materialize_keep_wav, normalize_keep_intervals
 from tts.lab.backend.services.speakers import (
     MODEL_ID as VIBEVOICE_MODEL_ID,
     PROCESSOR as VIBEVOICE_PROCESSOR,
     PROCESSOR_CONFIG as VIBEVOICE_CONFIG,
     analyze_audio,
 )
+from tts.lab.backend.services.voices import add_voice_source, source_count, voice_source_limit
 from tts.lab.backend.store.artifacts import ArtifactStore
+from tts.lab.backend.store.cache import processor_cache_key
 from tts.packets import new_id
 
 _EPS = 1e-9
+# A crop is a lineage child, never a source: its kind names the operation.
+CROP_KIND = "crop"
 # Diarization markup the decoder sometimes prefixes a turn with. Breeze gets prose.
 _SPEAKER_MARKUP = re.compile(r"\bspeaker[_\s-]*\w+\s*:", re.IGNORECASE)
 
 
 class OverlappingRanges(ValueError):
     """Selected clip ranges that are not disjoint. Overlap is never separated."""
+
+
+class SourceLimitReached(ValueError):
+    """The voice already holds `source_limit` sources. Nothing was written."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"voice source limit reached ({limit})")
+        self.limit = int(limit)
 
 
 def _now() -> str:
@@ -46,6 +64,95 @@ def _load(json_text: str | None, fallback: Any) -> Any:
         return json.loads(json_text)
     except json.JSONDecodeError:
         return fallback
+
+
+def source_artifact_id(store: ArtifactStore, voice_id: str, source_id: str) -> str:
+    """The immutable audio artifact one enrolled source owns."""
+    row = store.execute(
+        "SELECT artifact_id FROM voice_sources WHERE id = ? AND voice_id = ?",
+        (source_id, voice_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError(source_id)
+    return str(row["artifact_id"])
+
+
+def ensure_source_original_artifact(store: ArtifactStore, voice_id: str, source_id: str) -> str:
+    """The lineage root of one voice source: its one `original` reference artifact.
+
+    Idempotent, and never the operator's selection: the row's audio is the
+    immutable source artifact, so crop and processor children point their
+    `parent_id` at it instead of at a `voice_sources` row.
+    """
+    existing = store.execute(
+        """
+        SELECT id FROM voice_artifacts
+        WHERE voice_id = ? AND source_id = ? AND kind = ?
+        ORDER BY rowid ASC
+        """,
+        (voice_id, source_id, ORIGINAL_KIND),
+    ).fetchone()
+    if existing is not None:
+        return str(existing["id"])
+    artifact_id = new_id("va")
+    record_voice_artifact(
+        store,
+        voice_id,
+        artifact_id=artifact_id,
+        role=REFERENCE,
+        kind=ORIGINAL_KIND,
+        name="Original",
+        audio_artifact_id=source_artifact_id(store, voice_id, source_id),
+        source_id=source_id,
+    )
+    return artifact_id
+
+
+def crop_source_child(
+    store: ArtifactStore,
+    voice_id: str,
+    source_id: str,
+    intervals: Sequence[Interval],
+    *,
+    name: str,
+) -> str:
+    """Cut one crop of a source into a lineage child of that source's ORIGINAL.
+
+    The source's audio, keep and rows are never touched: the child is a new
+    object under a new `voice_artifacts` row whose `source_id` is the source and
+    whose `parent_id` is the source's lineage root.
+    """
+    artifact = store.get(source_artifact_id(store, voice_id, source_id))
+    duration = float(artifact.duration_s or 0.0)
+    if duration <= 0:
+        raise ValueError("source audio is empty")
+    keep = normalize_keep_intervals(list(intervals), duration)
+    tmp = store.root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    dest = tmp / f"crop-{new_id('crop')}.wav"
+    materialize_keep_wav(artifact.path, keep, dest)
+    try:
+        audio = store.import_audio(dest)
+    finally:
+        dest.unlink(missing_ok=True)
+    parent_id = ensure_source_original_artifact(store, voice_id, source_id)
+    store.pin(audio.id, reason=f"voice:{voice_id}:crop")
+    artifact_id = new_id("va")
+    record_voice_artifact(
+        store,
+        voice_id,
+        artifact_id=artifact_id,
+        role=EXPERIMENT,
+        kind=CROP_KIND,
+        name=name or "Crop",
+        audio_artifact_id=audio.id,
+        parent_id=parent_id,
+        source_id=source_id,
+        keep_intervals=keep,
+        processor_cache_key=processor_cache_key(CROP_KIND, artifact.sha256, keep, None),
+    )
+    store.commit()
+    return artifact_id
 
 
 def create_media_source(
@@ -389,7 +496,12 @@ def clean_transcript(segments: Iterable[dict[str, Any]]) -> str:
 def extract_clip(
     store: ArtifactStore, source_id: str, speaker_local_id: str, ranges: Iterable[Interval]
 ) -> dict[str, Any]:
-    """Crop the selected turns for one speaker and attach the clip to its voice."""
+    """Crop the selected turns for one speaker and attach the clip to its voice.
+
+    A mapped speaker also enrols the clip: one immutable voice source plus its
+    ORIGINAL lineage root. The voice's source cap is checked before any audio is
+    materialized, so a rejected enrolment writes nothing at all.
+    """
     source = source_row(store, source_id)
     duration_s = source_duration_s(store, source_id)
     ordered = select_ranges(ranges, duration_s)
@@ -399,7 +511,14 @@ def extract_clip(
     ).fetchone()
     if speaker is None:
         raise LookupError(speaker_local_id)
+    voice_id = None if speaker["mapped_voice_id"] is None else str(speaker["mapped_voice_id"])
+    limit = None
+    if voice_id is not None:
+        limit = voice_source_limit(store, voice_id)
+        if source_count(store, voice_id) >= limit:
+            raise SourceLimitReached(limit)
     segments = selected_segments(store, source_id, ordered)
+    transcript = clean_transcript(segments)
     tmp = store.root / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     crop = tmp / f"clip-{new_id('cl')}.wav"
@@ -420,15 +539,32 @@ def extract_clip(
             clip_id,
             source_id,
             speaker_local_id,
-            speaker["mapped_voice_id"],
+            voice_id,
             json.dumps([iv.model_dump() for iv in ordered]),
             json.dumps(segments),
             audio.id,
-            clean_transcript(segments),
+            transcript,
             _now(),
         ),
     )
     store.pin(audio.id, reason=f"clip:{clip_id}")
     store.commit()
     row = clip_rows(store, "clips.id = ?", (clip_id,))[0]
-    return clip_json(row)
+    clip = clip_json(row)
+    clip["voice_source_id"] = None
+    clip["voice_artifact_id"] = None
+    if voice_id is None:
+        return clip
+    whole_clip = [Interval(start_s=0.0, end_s=max(float(audio.duration_s or 0.0), 1e-3))]
+    enrolled = add_voice_source(
+        store,
+        voice_id,
+        artifact_id=audio.id,
+        label=str(source["title"]),
+        transcript=transcript,
+        keep=whole_clip,
+    )
+    clip["voice_source_id"] = enrolled
+    clip["voice_artifact_id"] = ensure_source_original_artifact(store, voice_id, enrolled)
+    store.commit()
+    return clip

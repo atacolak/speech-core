@@ -16,6 +16,7 @@ from tts.lab.backend.runtime.processors import ProcessorLease
 from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy
 from tts.lab.backend.services.candidates import (
     EXPERIMENT,
+    ORIGINAL_KIND,
     REFERENCE,
     auk_processor_config,
     auk_provenance_from_row,
@@ -45,10 +46,15 @@ from tts.lab.backend.services.speakers import (
     keep_for_speaker,
     words_for_speaker,
 )
-from tts.lab.backend.services.sources import clips_for_voice
+from tts.lab.backend.services.sources import (
+    clips_for_voice,
+    crop_source_child,
+    ensure_source_original_artifact,
+)
 from tts.lab.backend.services.voices import (
     VoiceImportError,
     import_voice_from_path,
+    patch_voice_source,
     primary_source_row,
     source_rows,
     sync_primary_source,
@@ -140,6 +146,13 @@ def _sources_json(store, row: Any) -> list[dict[str, Any]]:
             "transcript": source["transcript"],
             "duration_s": float(artifact.duration_s or 0.0),
             "keep_intervals": json.loads(source["keep_intervals_json"] or "[]"),
+            # The lock is the source row's own: the voice's legacy 1:1 lock
+            # freezes its effective transcript, not this source's provenance.
+            "transcript_locked": bool(
+                source["transcript_locked"]
+                if "transcript_locked" in source.keys() and source["transcript_locked"] is not None
+                else 0
+            ),
         }
         if source["id"] == primary_id:
             item["transcript"] = row["source_transcript"]
@@ -184,7 +197,7 @@ def _artifacts_json(store, row: Any, sources: list[dict[str, Any]]) -> list[dict
             item["processor_config"] = auk_processor_config(item)
         item.pop("parent_variant_id", None)
         source = by_source.get(art["source_id"]) or primary
-        if source is not None:
+        if source is not None and item["kind"] != ORIGINAL_KIND:
             artifact_id = str(source["artifact_id"])
             if artifact_id not in shas:
                 shas[artifact_id] = store.get(artifact_id).sha256
@@ -254,6 +267,7 @@ def _voice_row(store, row: Any) -> dict[str, Any]:
         "notes": row["notes"] if "notes" in row.keys() else None,
         "generation": _voice_generation(row),
         "take_limit": _voice_take_limit(row),
+        "source_limit": _voice_source_limit(row),
         "latest_take_id": _latest_take_id(store, row),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -279,6 +293,16 @@ def _voice_take_limit(row: Any) -> int:
         return 5
     try:
         value = int(row["take_limit"])
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(50, value))
+
+
+def _voice_source_limit(row: Any) -> int:
+    if "source_limit" not in row.keys() or row["source_limit"] is None:
+        return 5
+    try:
+        value = int(row["source_limit"])
     except (TypeError, ValueError):
         return 5
     return max(1, min(50, value))
@@ -358,6 +382,7 @@ class VoicePatch(BaseModel):
     notes: str | None = None
     generation: dict[str, Any] | None = None
     take_limit: int | None = Field(default=None, ge=1, le=50)
+    source_limit: int | None = Field(default=None, ge=1, le=50)
 
 
 class IntervalBody(BaseModel):
@@ -383,6 +408,22 @@ class ActivateBody(BaseModel):
 class UseSpeakerBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     speaker_id: str
+
+
+class SourcePatch(BaseModel):
+    """One enrolled source's operator-owned fields. Manual, never inferred."""
+
+    model_config = ConfigDict(extra="forbid")
+    transcript: str | None = None
+    label: str | None = None
+
+
+class CropBody(BaseModel):
+    """Non-empty intervals in source-timeline seconds, cut from the source artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+    intervals: list[Interval] = Field(min_length=1)
+    name: str = ""
 
 
 def _desk_voice_item(item: dict[str, Any]) -> dict[str, str]:
@@ -481,6 +522,11 @@ def patch_voice(request: Request, voice_id: str, body: VoicePatch) -> dict[str, 
     notes = body.notes if body.notes is not None else current.get("notes")
     generation = body.generation if body.generation is not None else current.get("generation")
     take_limit = body.take_limit if body.take_limit is not None else int(current.get("take_limit") or 5)
+    source_limit = (
+        body.source_limit
+        if body.source_limit is not None
+        else int(current.get("source_limit") or 5)
+    )
     keep = current["keep_intervals"]
     locked = bool(current.get("transcript_locked"))
     if body.effective_transcript is not None:
@@ -497,7 +543,7 @@ def patch_voice(request: Request, voice_id: str, body: VoicePatch) -> dict[str, 
         """
         UPDATE voices SET name=?, tags_json=?, source_transcript=?,
             keep_intervals_json=?, effective_transcript=?, notes=?,
-            generation_json=?, take_limit=?, transcript_locked=?, updated_at=?
+            generation_json=?, take_limit=?, source_limit=?, transcript_locked=?, updated_at=?
         WHERE id=?
         """,
         (
@@ -509,6 +555,7 @@ def patch_voice(request: Request, voice_id: str, body: VoicePatch) -> dict[str, 
             notes,
             json.dumps(generation) if generation else None,
             int(take_limit),
+            int(source_limit),
             1 if locked else 0,
             _now(),
             voice_id,
@@ -561,6 +608,51 @@ def _patch_keep(store, voice_id: str, keep: list[Interval], *, reset: bool = Fal
     )
     sync_primary_source(store, voice_id)
     store.commit()
+    return get_voice_or_404(store, voice_id)
+
+
+@router.patch("/api/voices/{voice_id}/sources/{source_id}")
+def patch_source(
+    request: Request, voice_id: str, source_id: str, body: SourcePatch
+) -> dict[str, Any]:
+    """Write one enrolled source: a manual transcript locks that source alone.
+
+    The voice's legacy 1:1 columns describe its primary source, so only a write
+    to that source mirrors them.
+    """
+    store = request.app.state.lab.store
+    get_voice_or_404(store, voice_id)
+    if body.transcript is None and body.label is None:
+        raise HTTPException(status_code=422, detail="transcript or label is required")
+    label = None if body.label is None else body.label.strip()
+    if label == "":
+        raise HTTPException(status_code=422, detail="source label is required")
+    try:
+        patch_voice_source(
+            store, voice_id, source_id, transcript=body.transcript, label=label
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=f"source not found: {source_id}") from exc
+    return get_voice_or_404(store, voice_id)
+
+
+@router.post("/api/voices/{voice_id}/sources/{source_id}/crop")
+def crop_source(
+    request: Request, voice_id: str, source_id: str, body: CropBody
+) -> dict[str, Any]:
+    """Cut intervals out of one source as a lineage child. The source stays put."""
+    store = request.app.state.lab.store
+    get_voice_or_404(store, voice_id)
+    try:
+        crop_source_child(
+            store, voice_id, source_id, body.intervals, name=body.name.strip()
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=f"source not found: {source_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail={"code": "invalid_range", "message": str(exc)}
+        ) from exc
     return get_voice_or_404(store, voice_id)
 
 
@@ -740,18 +832,27 @@ def use_speaker(request: Request, voice_id: str, body: UseSpeakerBody) -> dict[s
     return _patch_keep(store, voice_id, keep)
 
 
-@router.post("/api/voices/{voice_id}/reference/denoise")
-def denoise_reference(request: Request, voice_id: str) -> dict[str, Any]:
-    """Resemble denoise-only cleanup of the current keep. Never `enhance()`."""
-    state = request.app.state.lab
+def _denoise_voice_source(
+    state: Any, voice_id: str, source_id: str, *, mirror_variant: bool
+) -> dict[str, Any]:
+    """Resemble denoise-only cleanup of ONE enrolled source's keep. Never `enhance()`.
+
+    The source's own audio, keep and rows are never touched: the cleaned audio
+    lands as an experiment child of that source's ORIGINAL artifact. The legacy
+    voice's 1:1 `reference_variants` mirror is written only for the primary
+    source, which is the one those columns describe.
+    """
     store = state.store
     voice = get_voice_or_404(store, voice_id)
-    artifact = store.get(voice["source_audio_artifact_id"])
-    keep = [Interval.model_validate(item) for item in voice["keep_intervals"]]
+    source = next((item for item in voice["sources"] if item["id"] == source_id), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail=f"source not found: {source_id}")
+    artifact = store.get(str(source["artifact_id"]))
+    keep = [Interval.model_validate(item) for item in source["keep_intervals"]]
     tmp = store.root / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    src = tmp / f"{voice_id}-denoise-src.wav"
-    dest = tmp / f"{voice_id}-resemble.wav"
+    src = tmp / f"{source_id}-denoise-src.wav"
+    dest = tmp / f"{source_id}-resemble.wav"
     materialize_keep_wav(artifact.path, keep, src)
     try:
         with ProcessorLease(state.runtime).acquire(RESEMBLE_PROCESSOR):
@@ -789,60 +890,85 @@ def denoise_reference(request: Request, voice_id: str) -> dict[str, Any]:
             },
         ) from exc
     processed = store.import_audio(dest)
+    parent_id = ensure_source_original_artifact(store, voice_id, source_id)
     store.pin(processed.id, reason=f"voice:{voice_id}:{RESEMBLE_PROCESSOR}")
     cache_key = processor_cache_key(RESEMBLE_PROCESSOR, artifact.sha256, keep, RESEMBLE_CONFIG)
-    existing = next(
-        (item for item in voice["variants"] if item["kind"] == RESEMBLE_PROCESSOR),
-        None,
-    )
-    duration = float(processed.duration_s or 0.0)
-    if existing is None:
-        variant_id = new_id("rv")
-        store.execute(
-            """
-            INSERT INTO reference_variants (
-                id, voice_id, kind, audio_artifact_id, processor_config_json,
-                processor_cache_key, duration_s, pinned, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                variant_id,
-                voice_id,
-                RESEMBLE_PROCESSOR,
-                processed.id,
-                json.dumps(RESEMBLE_CONFIG),
-                cache_key,
-                duration,
-                0,
-                _now(),
-            ),
+    artifact_id = new_id("va")
+    if mirror_variant:
+        existing = next(
+            (item for item in voice["variants"] if item["kind"] == RESEMBLE_PROCESSOR),
+            None,
         )
-    else:
-        variant_id = str(existing["id"])
-        store.execute(
-            """
-            UPDATE reference_variants
-            SET audio_artifact_id=?, processor_config_json=?, processor_cache_key=?, duration_s=?
-            WHERE id=?
-            """,
-            (processed.id, json.dumps(RESEMBLE_CONFIG), cache_key, duration, existing["id"]),
-        )
-    source = primary_source_row(store, voice_id, legacy_artifact_id=voice["source_audio_artifact_id"])
+        duration = float(processed.duration_s or 0.0)
+        if existing is None:
+            artifact_id = new_id("rv")
+            store.execute(
+                """
+                INSERT INTO reference_variants (
+                    id, voice_id, kind, audio_artifact_id, processor_config_json,
+                    processor_cache_key, duration_s, pinned, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    voice_id,
+                    RESEMBLE_PROCESSOR,
+                    processed.id,
+                    json.dumps(RESEMBLE_CONFIG),
+                    cache_key,
+                    duration,
+                    0,
+                    _now(),
+                ),
+            )
+        else:
+            artifact_id = str(existing["id"])
+            store.execute(
+                """
+                UPDATE reference_variants
+                SET audio_artifact_id=?, processor_config_json=?, processor_cache_key=?, duration_s=?
+                WHERE id=?
+                """,
+                (processed.id, json.dumps(RESEMBLE_CONFIG), cache_key, duration, existing["id"]),
+            )
     record_voice_artifact(
         store,
         voice_id,
-        artifact_id=variant_id,
+        artifact_id=artifact_id,
         role=EXPERIMENT,
         kind=RESEMBLE_PROCESSOR,
         name="Resemble",
         audio_artifact_id=processed.id,
-        source_id=None if source is None else str(source["id"]),
+        parent_id=parent_id,
+        source_id=source_id,
         keep_intervals=keep,
         processor_config=RESEMBLE_CONFIG,
         processor_cache_key=cache_key,
     )
     store.commit()
     return get_voice_or_404(store, voice_id)
+
+
+@router.post("/api/voices/{voice_id}/sources/{source_id}/denoise")
+def denoise_voice_source(request: Request, voice_id: str, source_id: str) -> dict[str, Any]:
+    """Resemble cleanup of ONE enrolled source; the source's audio stays put."""
+    return _denoise_voice_source(request.app.state.lab, voice_id, source_id, mirror_variant=False)
+
+
+@router.post("/api/voices/{voice_id}/reference/denoise")
+def denoise_reference(request: Request, voice_id: str) -> dict[str, Any]:
+    """Legacy 1:1 route: clean the voice's primary source and mirror its variant."""
+    state = request.app.state.lab
+    store = state.store
+    voice = get_voice_or_404(store, voice_id)
+    source = primary_source_row(
+        store, voice_id, legacy_artifact_id=voice["source_audio_artifact_id"]
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail=f"voice has no source: {voice_id}")
+    return _denoise_voice_source(
+        state, voice_id, str(source["id"]), mirror_variant=True
+    )
 
 
 @router.get("/api/voices/{voice_id}/reference/audio")

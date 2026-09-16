@@ -45,11 +45,28 @@ def primary_source_row(store: ArtifactStore, voice_id: str, legacy_artifact_id: 
     return rows[0]
 
 
-def _source_label(store: ArtifactStore, voice_id: str) -> str:
-    count = store.execute(
+def source_count(store: ArtifactStore, voice_id: str) -> int:
+    """Rows already enrolled on the voice. Ingest into the library never counts."""
+    row = store.execute(
         "SELECT COUNT(*) AS n FROM voice_sources WHERE voice_id = ?", (voice_id,)
     ).fetchone()
-    return f"Source {int(count['n']) + 1}"
+    return 0 if row is None else int(row["n"])
+
+
+def voice_source_limit(store: ArtifactStore, voice_id: str) -> int:
+    """The voice's `source_limit`, clamped to the same 1–50 window as take_limit."""
+    row = store.execute("SELECT source_limit FROM voices WHERE id = ?", (voice_id,)).fetchone()
+    if row is None or "source_limit" not in row.keys() or row["source_limit"] is None:
+        return 5
+    try:
+        value = int(row["source_limit"])
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(50, value))
+
+
+def _source_label(store: ArtifactStore, voice_id: str) -> str:
+    return f"Source {source_count(store, voice_id) + 1}"
 
 
 def _insert_source(
@@ -157,6 +174,59 @@ def sync_primary_source(store: ArtifactStore, voice_id: str) -> None:
     )
 
 
+def patch_voice_source(
+    store: ArtifactStore,
+    voice_id: str,
+    source_id: str,
+    *,
+    transcript: str | None = None,
+    label: str | None = None,
+) -> None:
+    """Write one enrolled source row. A manual transcript locks that source alone.
+
+    The voice's 1:1 columns describe its primary source, so only a write to that
+    source mirrors them; every other source is its own truth.
+    """
+    source = store.execute(
+        "SELECT * FROM voice_sources WHERE id = ? AND voice_id = ?", (source_id, voice_id)
+    ).fetchone()
+    if source is None:
+        raise LookupError(f"source not found: {source_id} on {voice_id}")
+    voice = store.execute(
+        "SELECT source_artifact_id FROM voices WHERE id = ?", (voice_id,)
+    ).fetchone()
+    if voice is None:
+        raise LookupError(f"voice not found: {voice_id}")
+    primary = primary_source_row(
+        store, voice_id, legacy_artifact_id=str(voice["source_artifact_id"])
+    )
+    is_primary = primary is not None and str(primary["id"]) == source_id
+    locked = int(source["transcript_locked"] or 0)
+    if transcript is not None:
+        locked = 1
+    store.execute(
+        "UPDATE voice_sources SET label=?, transcript=?, transcript_locked=? WHERE id = ?",
+        (
+            str(source["label"]) if label is None else label,
+            str(source["transcript"] or "") if transcript is None else transcript,
+            locked,
+            source_id,
+        ),
+    )
+    if is_primary and transcript is not None:
+        store.execute(
+            """
+            UPDATE voices SET source_transcript=?, effective_transcript=?, transcript_locked=?,
+                updated_at=?
+            WHERE id = ?
+            """,
+            (transcript, transcript, locked, _now(), voice_id),
+        )
+    else:
+        store.execute("UPDATE voices SET updated_at=? WHERE id=?", (_now(), voice_id))
+    store.commit()
+
+
 def transcribe_alignment(path: Path | str) -> dict[str, object]:
     """Parakeet CPU transcript + word times. Empty on missing tooling; never raises."""
     try:
@@ -221,10 +291,8 @@ def import_voice_from_path(
         )
         supplied = (transcript or "").strip()
         words: list[object] = []
-        locked = 0
         if supplied:
             transcript = supplied
-            locked = 1
         else:
             aligned = transcribe_alignment(working.path)
             transcript = str(aligned.get("text") or "").strip()
@@ -260,7 +328,9 @@ def import_voice_from_path(
                 created,
                 created,
                 json.dumps(words) if words else None,
-                locked,
+                # An import records a source's origin; the lock is written by a
+                # per-source edit and mirrored here for the primary source only.
+                0,
             ),
         )
         store.execute(

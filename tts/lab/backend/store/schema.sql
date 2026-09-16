@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS voices (
     notes TEXT,
     generation_json TEXT,
     take_limit INTEGER NOT NULL DEFAULT 5,
+    source_limit INTEGER NOT NULL DEFAULT 5,
     source_words_json TEXT,
     transcript_locked INTEGER NOT NULL DEFAULT 0,
     speaker_analysis_id TEXT,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS voice_sources (
     transcript TEXT NOT NULL DEFAULT '',
     words_json TEXT,
     keep_intervals_json TEXT NOT NULL DEFAULT '[]',
+    transcript_locked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (voice_id) REFERENCES voices(id),
     FOREIGN KEY (artifact_id) REFERENCES artifacts(id)

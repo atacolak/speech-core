@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -78,17 +79,34 @@ def store_duration(root: Path, artifact_id: str) -> float:
 class _SourceCase(unittest.TestCase):
     """Source + voice plumbing shared by the source-lab tests."""
 
+    def _engine(self) -> Any | None:
+        """The app's engine. The source bench is CPU-only: no engine by default."""
+        return None
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.client = TestClient(create_app(root=self.root, leftover_parked=True))
+        self.client = TestClient(
+            create_app(root=self.root, engine=self._engine(), leftover_parked=True)
+        )
+
+    @property
+    def store(self) -> Any:
+        return self.client.app.state.lab.store
 
     def tearDown(self) -> None:
         self.client.close()
         self.tmp.cleanup()
 
-    def _source(self, *, seconds: float = 7.0, title: str | None = None, name: str = "ww-01.wav") -> dict:
-        wav = _wav(self.root / name, seconds=seconds)
+    def _source(
+        self,
+        *,
+        seconds: float = 7.0,
+        title: str | None = None,
+        name: str = "ww-01.wav",
+        freq: float = 440.0,
+    ) -> dict:
+        wav = _wav(self.root / name, seconds=seconds, freq=freq)
         data = {} if title is None else {"title": title}
         with wav.open("rb") as handle:
             response = self.client.post(
@@ -412,6 +430,47 @@ class SourceLabExtract(_SourceCase):
         )
 
 
+class SourceLabLimits(_SourceCase):
+    """The voice's source cap: the same 1-50 window as its take cap."""
+
+    def test_a_voice_accepts_a_source_limit_between_one_and_fifty(self) -> None:
+        voice = self._voice("ford")
+
+        for limit in (1, 50):
+            patched = self.client.patch(
+                f"/api/voices/{voice['id']}", json={"source_limit": limit}
+            )
+            self.assertEqual(patched.status_code, 200, patched.text)
+            self.assertEqual(patched.json()["source_limit"], limit)
+
+        self.assertEqual(self.client.get(f"/api/voices/{voice['id']}").json()["source_limit"], 50)
+
+    def test_a_source_limit_outside_one_to_fifty_is_rejected(self) -> None:
+        voice = self._voice("ford")
+
+        for limit in (0, 51):
+            response = self.client.patch(
+                f"/api/voices/{voice['id']}", json={"source_limit": limit}
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+
+        self.assertEqual(self.client.get(f"/api/voices/{voice['id']}").json()["source_limit"], 5)
+
+    def test_the_source_limit_survives_a_reopen(self) -> None:
+        voice = self._voice("ford")
+        patched = self.client.patch(f"/api/voices/{voice['id']}", json={"source_limit": 2})
+        self.assertEqual(patched.status_code, 200, patched.text)
+        self.client.close()
+
+        self.client = TestClient(create_app(root=self.root, leftover_parked=True))
+
+        self.assertEqual(self.client.get(f"/api/voices/{voice['id']}").json()["source_limit"], 2)
+        conn = connect(self.root)
+        self.addCleanup(conn.close)
+        row = conn.execute("SELECT source_limit FROM voices WHERE id = ?", (voice["id"],)).fetchone()
+        self.assertEqual(row["source_limit"], 2)
+
+
 class SourceLabLegacy(unittest.TestCase):
     """An operator's frozen 1:1 lab.sqlite3 gains the source tables untouched."""
 
@@ -431,6 +490,14 @@ class SourceLabLegacy(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["artifact_id"], "a_src1")
+        # Both new columns land on an operator's frozen db with their defaults.
+        self.assertEqual(sources[0]["transcript_locked"], 0)
+        self.assertEqual(
+            conn.execute("SELECT source_limit FROM voices WHERE id = 'vp_1'").fetchone()[
+                "source_limit"
+            ],
+            5,
+        )
 
         reopened = connect(root)
         self.addCleanup(reopened.close)

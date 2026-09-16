@@ -6,6 +6,7 @@ not on the voicecat path.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
@@ -21,6 +22,7 @@ from tts.lab.backend.services.resemble import ProcessorUnavailable
 from tts.wav import is_riff_wav
 from tts.lab.backend.services.sources import (
     OverlappingRanges,
+    SourceLimitReached,
     analyze_range,
     coverage,
     create_media_source,
@@ -64,6 +66,16 @@ class ExtractBody(BaseModel):
     ranges: list[Interval] = Field(min_length=1)
 
 
+class FromArtifactBody(BaseModel):
+    """One retained take/artifact: the operator names it explicitly."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    run_id: str | None = None
+    title: str = ""
+
+
 def source_or_404(store: ArtifactStore, source_id: str) -> Any:
     try:
         return source_row(store, source_id)
@@ -86,6 +98,21 @@ def _parsed_meta(meta: str) -> dict[str, Any]:
             status_code=422, detail={"code": "invalid_meta", "message": str(exc)}
         ) from exc
     return parsed
+
+
+def _retained_peaks(store: ArtifactStore, artifact: Any) -> Path | None:
+    """The one artifact a retained ingest generates: the waveform peaks.
+
+    Non-wav content (a converted container, say) registers without peaks, exactly
+    like an upload that arrives without a waveform.
+    """
+    if not is_riff_wav(artifact.path):
+        return None
+    tmp = store.root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    peaks = tmp / f"peaks-{new_id('up')}.json"
+    write_peaks(artifact.path, peaks)
+    return peaks
 
 
 def _analyze_interval(body: AnalyzeBody, duration_s: float) -> Interval:
@@ -167,6 +194,59 @@ async def create_source(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         upload.unlink(missing_ok=True)
+        if peaks is not None:
+            peaks.unlink(missing_ok=True)
+    return source_detail(store, source_id)
+
+
+@router.post("/api/sources/from-artifact")
+def create_source_from_artifact(request: Request, body: FromArtifactBody) -> dict[str, Any]:
+    """Register one retained take/artifact as a material.
+
+    The audio is never copied: the source points at the object the run already
+    owns, and only its peaks artifact is new. Nothing is enrolled onto a voice
+    and no other run is imported.
+    """
+    store = request.app.state.lab.store
+    try:
+        artifact = store.get(body.artifact_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"artifact not found: {body.artifact_id}"
+        ) from exc
+    meta: dict[str, Any] = {"artifact_id": artifact.id}
+    if body.run_id is not None:
+        run = store.execute(
+            "SELECT output_artifact_id FROM runs WHERE id = ?", (body.run_id,)
+        ).fetchone()
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {body.run_id}")
+        if str(run["output_artifact_id"]) != artifact.id:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "artifact_run_mismatch",
+                    "message": f"run {body.run_id} does not own artifact {artifact.id}",
+                },
+            )
+        meta["run_id"] = body.run_id
+    title = body.title.strip() or (f"take {body.run_id}" if body.run_id else artifact.id)
+    peaks: Path | None = None
+    try:
+        peaks = _retained_peaks(store, artifact)
+        source_id = create_media_source(
+            store,
+            kind="file",
+            origin=f"artifact:{artifact.id}",
+            title=title,
+            audio_path=artifact.path,
+            waveform_path=peaks,
+            duration_s=artifact.duration_s,
+            meta=meta,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
         if peaks is not None:
             peaks.unlink(missing_ok=True)
     return source_detail(store, source_id)
@@ -265,6 +345,11 @@ def extract_source_clip(request: Request, source_id: str, body: ExtractBody) -> 
     source_or_404(store, source_id)
     try:
         return extract_clip(store, source_id, body.speaker_local_id, body.ranges)
+    except SourceLimitReached as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "source_limit_reached", "message": str(exc)},
+        ) from exc
     except OverlappingRanges as exc:
         raise HTTPException(
             status_code=422, detail={"code": "overlapping_ranges", "message": str(exc)}
