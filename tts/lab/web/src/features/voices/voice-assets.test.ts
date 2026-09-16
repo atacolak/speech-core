@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { Voice } from '@/lib/api'
-import { voiceAssets } from '@/features/voices/voice-assets'
+import type { RunItem, Voice, VoiceArtifact, VoiceSource } from '@/lib/api'
+import { voiceAssets, voiceGenerations } from '@/features/voices/voice-assets'
 
 /** An AuK experiment: lineage-bearing, an experiment until the operator approves it. */
 function aukArtifact(overrides: Record<string, unknown> = {}) {
@@ -99,6 +99,93 @@ function profileVoice(overrides: Record<string, unknown> = {}): Voice {
   })
 }
 
+function artifact(overrides: Partial<VoiceArtifact> & { id: string }): VoiceArtifact {
+  return {
+    role: 'experiment',
+    kind: 'crop',
+    audio_artifact_id: `art_${overrides.id}`,
+    parent_id: null,
+    source_id: null,
+    approved: false,
+    default: false,
+    stale: false,
+    ...overrides,
+  }
+}
+
+const SOURCE_A: VoiceSource = {
+  id: 'src_a',
+  label: 'source take A',
+  artifact_id: 'art_src_a',
+  transcript: 'these violent delights have violent ends',
+  duration_s: 12,
+  keep_intervals: [{ start_s: 0, end_s: 8 }],
+}
+
+/**
+ * One enrolled source, its crop, and what the crop rendered. The payload lists
+ * the grandchildren first, so nesting has to follow parent ids.
+ */
+function lineageVoice(overrides: Record<string, unknown> = {}): Voice {
+  return profileVoice({
+    active_reference_variant_id: null,
+    sources: [SOURCE_A],
+    artifacts: [
+      artifact({
+        id: 'a_ref',
+        role: 'reference',
+        kind: 'auk',
+        name: 'enhance 1 approved',
+        audio_artifact_id: 'art_ref',
+        parent_id: 'a_crop',
+        source_id: 'src_a',
+        approved: true,
+        default: true,
+      }),
+      artifact({
+        id: 'a_res',
+        kind: 'resemble',
+        name: 'Resemble denoise',
+        audio_artifact_id: 'art_den',
+        parent_id: 'a_crop',
+        source_id: 'src_a',
+      }),
+      artifact({
+        id: 'a_crop',
+        kind: 'crop',
+        name: 'Crop 0.0–8.0s',
+        audio_artifact_id: 'art_crop',
+        parent_id: 'a_orig_a',
+        source_id: 'src_a',
+        keep_intervals: [{ start_s: 0, end_s: 8 }],
+      }),
+      artifact({
+        id: 'a_orig_a',
+        role: 'reference',
+        kind: 'original',
+        name: 'Original',
+        audio_artifact_id: 'art_src_a',
+        source_id: 'src_a',
+        approved: true,
+      }),
+    ],
+    default_reference_id: 'a_ref',
+    ...overrides,
+  })
+}
+
+const RUN: RunItem = {
+  id: 'run_1',
+  voice_id: 'vp1',
+  output_artifact_id: 'art_take',
+  latency_ms: 900,
+  first_audio_ms: 120,
+  duration_s: 6,
+  rating: null,
+  tags: [],
+  created_at: '2026-09-14T00:00:00Z',
+}
+
 describe('voice assets', () => {
   it('derives one source from the legacy single-source voice', () => {
     const assets = voiceAssets(legacyVoice())
@@ -106,34 +193,6 @@ describe('voice assets', () => {
     expect(assets.sources[0]?.artifact_id).toBe('art_src')
     expect(assets.sources[0]?.keep_intervals).toEqual([{ start_s: 2, end_s: 6 }])
     expect(assets.sources[0]?.duration_s).toBe(12)
-  })
-
-  it('splits auk variants into experiments and approved auk variants into references', () => {
-    const assets = voiceAssets(
-      legacyVoice({
-        variants: [
-          aukArtifact(),
-          aukArtifact({ id: 'rv_auk_ok', audio_artifact_id: 'art_ok', approved: true }),
-        ],
-        active_reference_variant_id: 'rv_auk_ok',
-      }),
-    )
-    expect(assets.experiments.map((item) => item.id)).toEqual(['rv_auk'])
-    expect(assets.references.map((item) => item.id)).toEqual(['rv_auk_ok'])
-    expect(assets.defaultReferenceId).toBe('rv_auk_ok')
-  })
-
-  it('parks a resemble variant out of both asset lists', () => {
-    const assets = voiceAssets(
-      legacyVoice({
-        variants: [
-          aukArtifact(),
-          { id: 'rv_den', kind: 'resemble', audio_artifact_id: 'art_den', duration_s: 11.5 },
-        ],
-      }),
-    )
-    const ids = [...assets.experiments, ...assets.references].map((item) => item.id)
-    expect(ids).toEqual(['rv_auk'])
   })
 
   it('names the only source of a legacy voice as the primary', () => {
@@ -145,50 +204,172 @@ describe('voice assets', () => {
     expect(voiceAssets(voice).primarySourceId).toBe('src_b')
   })
 
-  it('parks a resemble artifact out of both asset lists', () => {
+  it('reads the multi-source profile shape as its own sources', () => {
+    const assets = voiceAssets(profileVoice())
+    expect(assets.sources.map((item) => item.label)).toEqual(['take A', 'take B'])
+  })
+
+  it('lists one row per source, with the source audio the lab kept', () => {
+    const assets = voiceAssets(lineageVoice())
+    expect(assets.originals.map((row) => row.id)).toEqual([
+      'src_a',
+      // The `original` artifact is the source's own lineage root: it renders as the source row.
+      'a_ref',
+      'a_res',
+      'a_crop',
+    ])
+    expect(assets.roots.map((row) => row.id)).toEqual(['src_a'])
+    expect(assets.originals[0]?.audioArtifactId).toBe('art_src_a')
+    expect(assets.originals[0]?.label).toBe('source take A')
+    expect(assets.originals[0]?.transcript).toBe('these violent delights have violent ends')
+  })
+
+  it('nests every derived original under the parent its id names', () => {
+    const assets = voiceAssets(lineageVoice())
+    expect(assets.childrenByParent.get('src_a')?.map((row) => row.id)).toEqual(['a_crop'])
+    // The payload lists a_ref and a_res first; their parent is still the crop.
+    expect(assets.childrenByParent.get('a_crop')?.map((row) => row.id)).toEqual(['a_ref', 'a_res'])
+    expect(assets.childrenByParent.get('a_ref')).toBeUndefined()
+  })
+
+  it('labels a derived row with the parent it came from, resolved by id', () => {
+    const assets = voiceAssets(lineageVoice())
+    const crop = assets.childrenByParent.get('src_a')?.[0]
+    expect(crop?.derivedFrom).toBe('source take A')
+    const approved = assets.childrenByParent.get('a_crop')?.[0]
+    expect(approved?.derivedFrom).toBe('Crop 0.0–8.0s')
+  })
+
+  it('keeps every kind of artifact as an original, Resemble included', () => {
     const voice = profileVoice()
     voice.artifacts = [
       ...(voice.artifacts ?? []),
-      {
-        id: 'a_den',
-        role: 'experiment',
-        kind: 'resemble',
-        name: 'Resemble',
-        audio_artifact_id: 'art_den',
-        source_id: 'src_a',
-        approved: false,
-        default: false,
-        stale: false,
-      },
+      artifact({ id: 'a_den', kind: 'resemble', name: 'Resemble', source_id: 'src_a' }),
+      artifact({ id: 'a_vibe', kind: 'vibevoice', name: 'VibeVoice', source_id: 'src_a' }),
     ]
     const assets = voiceAssets(voice)
-    const ids = [...assets.experiments, ...assets.references].map((item) => item.id)
-    expect(ids).toEqual(['a_exp', 'a_ref'])
+    expect(assets.originals.map((row) => row.id)).toEqual([
+      'src_a',
+      'src_b',
+      'a_exp',
+      'a_ref',
+      'a_den',
+      'a_vibe',
+    ])
+  })
+
+  it('keeps a legacy resemble variant in the tree instead of parking it', () => {
+    const assets = voiceAssets(
+      legacyVoice({
+        variants: [
+          aukArtifact(),
+          { id: 'rv_den', kind: 'resemble', audio_artifact_id: 'art_den', duration_s: 11.5 },
+        ],
+      }),
+    )
+    // Parentless legacy variants rendered from the voice hang off its primary source.
+    expect(assets.childrenByParent.get('art_src')?.map((row) => row.id)).toEqual([
+      'rv_auk',
+      'rv_den',
+    ])
+    // The retiring VoiceWorkbench projection still parks every non-AuK kind (Task 10 deletes it).
+    expect(assets.experiments.map((item) => item.id)).toEqual(['rv_auk'])
+    expect(assets.references).toEqual([])
+  })
+
+  it('reads a legacy original variant as the source selection, not a child', () => {
+    const assets = voiceAssets(
+      legacyVoice({
+        active_reference_variant_id: 'rv_ford',
+        variants: [
+          {
+            id: 'rv_ford',
+            voice_profile_id: 'vp1',
+            kind: 'original',
+            audio_artifact_id: 'art_src',
+            duration_s: 4,
+          },
+        ],
+      }),
+    )
+    expect(assets.originals.map((row) => row.id)).toEqual(['art_src'])
+    expect(assets.originals[0]?.reference).toBe(true)
+  })
+
+  it('rests the star on the one stored reference', () => {
+    const assets = voiceAssets(lineageVoice())
+    expect(assets.defaultReferenceId).toBe('a_ref')
+    expect(assets.originals.filter((row) => row.reference).map((row) => row.id)).toEqual(['a_ref'])
+  })
+
+  it('falls back to the artifact default flag when the profile carries no default id', () => {
+    expect(voiceAssets(profileVoice({ default_reference_id: null })).defaultReferenceId).toBe('a_ref')
+  })
+
+  it('ignores a default id that names something other than a reference', () => {
+    const voice = lineageVoice({ default_reference_id: 'a_crop' })
+    voice.artifacts = (voice.artifacts ?? []).map((item) => ({ ...item, default: false }))
+    const assets = voiceAssets(voice)
+    expect(assets.defaultReferenceId).toBeNull()
+    expect(assets.originals.some((row) => row.reference)).toBe(false)
   })
 
   it('reports no default when the legacy voice has no approved reference', () => {
     const assets = voiceAssets(legacyVoice({ variants: [aukArtifact()] }))
-    expect(assets.references).toEqual([])
+    expect(assets.originals.some((row) => row.reference)).toBe(false)
     expect(assets.defaultReferenceId).toBeNull()
   })
 
-  it('reads the multi-source profile shape as its own lists', () => {
-    const assets = voiceAssets(profileVoice())
-    expect(assets.sources.map((item) => item.label)).toEqual(['take A', 'take B'])
-    expect(assets.experiments.map((item) => item.id)).toEqual(['a_exp'])
-    expect(assets.references.map((item) => item.id)).toEqual(['a_ref'])
-    expect(assets.experiments[0]?.source_id).toBe('src_a')
-    expect(assets.references[0]?.parent_id).toBe('a_exp')
+  it('parks a resemble artifact out of the retiring workbench lists', () => {
+    const voice = profileVoice()
+    voice.artifacts = [
+      ...(voice.artifacts ?? []),
+      artifact({ id: 'a_den', kind: 'resemble', name: 'Resemble', source_id: 'src_a' }),
+    ]
+    const assets = voiceAssets(voice)
+    expect([...assets.experiments, ...assets.references].map((item) => item.id)).toEqual([
+      'a_exp',
+      'a_ref',
+    ])
   })
 
-  it('falls back to the artifact default flag when the profile carries no default id', () => {
-    const assets = voiceAssets(profileVoice({ default_reference_id: null }))
-    expect(assets.defaultReferenceId).toBe('a_ref')
+  it('keeps runs out of the originals tree', () => {
+    const assets = voiceAssets(lineageVoice())
+    expect(assets.originals.map((row) => row.id)).not.toContain('run_1')
+    expect(assets.originals.map((row) => row.audioArtifactId)).not.toContain('art_take')
+  })
+})
+
+describe('voice generations', () => {
+  it('names each Breeze take by its run, with the audio it produced', () => {
+    expect(voiceGenerations([RUN])).toEqual([
+      {
+        id: 'run_1',
+        label: 'take run_1',
+        audioArtifactId: 'art_take',
+        durationS: 6,
+        firstAudioMs: 120,
+        createdAt: '2026-09-14T00:00:00Z',
+      },
+    ])
   })
 
-  it('ignores a default id that names no reference', () => {
-    const voice = profileVoice({ default_reference_id: 'a_exp' })
-    voice.artifacts = (voice.artifacts ?? []).map((item) => ({ ...item, default: false }))
-    expect(voiceAssets(voice).defaultReferenceId).toBeNull()
+  it('carries no reference marker for a take to wear', () => {
+    expect(Object.keys(voiceGenerations([RUN])[0] ?? {})).not.toContain('reference')
+  })
+
+  it('reads a run the lab left open without inventing a length or a date', () => {
+    expect(
+      voiceGenerations([{ ...RUN, duration_s: null, first_audio_ms: null, created_at: undefined }]),
+    ).toEqual([
+      {
+        id: 'run_1',
+        label: 'take run_1',
+        audioArtifactId: 'art_take',
+        durationS: null,
+        firstAudioMs: null,
+        createdAt: null,
+      },
+    ])
   })
 })

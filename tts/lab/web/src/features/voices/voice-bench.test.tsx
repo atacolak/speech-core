@@ -2,50 +2,93 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { VoiceBench } from '@/features/voices/voice-bench'
-import type { Voice } from '@/lib/api'
+import type { Voice, VoiceArtifact } from '@/lib/api'
 
+/** The whole store in one profile: an enrolled source, its crop, and what the crop rendered. */
 const VOICE: Voice = {
   id: 'vp_ford',
   name: 'Ford',
   tags: [],
-  source_audio_artifact_id: 'art_ford_ref',
-  original_artifact_id: 'art_ford_src',
+  source_audio_artifact_id: 'art_src_a',
+  original_artifact_id: 'art_ford_original',
   original_format: 'wav',
-  source_transcript: '',
+  source_transcript: 'these violent delights have violent ends',
   keep_intervals: [{ start_s: 0, end_s: 8 }],
   effective_transcript: 'these violent delights have violent ends',
-  active_reference_variant_id: 'rv_ford',
-  latest_take_id: null,
-  active_variant: {
-    id: 'rv_ford',
-    voice_profile_id: 'vp_ford',
-    kind: 'original',
-    audio_artifact_id: 'art_ford_ref',
-    duration_s: 8,
-  },
-  variants: [
-    {
-      id: 'rv_den',
-      voice_profile_id: 'vp_ford',
-      kind: 'resemble',
-      audio_artifact_id: 'art_ford_den',
-      duration_s: 8,
-      stale: false,
-    },
-    {
-      id: 'rv_enh',
-      voice_profile_id: 'vp_ford',
-      kind: 'resemble',
-      audio_artifact_id: 'art_ford_enh',
-      duration_s: 8,
-      stale: false,
-    },
-  ],
+  active_reference_variant_id: null,
+  variants: [],
   sources: [
-    { id: 'vs_1', label: 'westworld_clip_01', artifact_id: 'art_clip_01', duration_s: 8 },
-    { id: 'vs_2', label: 'westworld_clip_02', artifact_id: 'art_clip_02', duration_s: 4 },
+    {
+      id: 'src_a',
+      label: 'source take A',
+      artifact_id: 'art_src_a',
+      transcript: 'these violent delights have violent ends',
+      duration_s: 12,
+      keep_intervals: [{ start_s: 0, end_s: 8 }],
+    },
+    {
+      id: 'src_b',
+      label: 'source take B',
+      artifact_id: 'art_src_b',
+      transcript: 'hello again',
+      duration_s: 9,
+      keep_intervals: [{ start_s: 0, end_s: 9 }],
+    },
   ],
-  duration_s: 8,
+  artifacts: [
+    {
+      id: 'a_ref',
+      role: 'reference',
+      kind: 'auk',
+      name: 'enhance 1 approved',
+      audio_artifact_id: 'art_ref',
+      parent_id: 'a_crop',
+      source_id: 'src_a',
+      approved: true,
+      default: true,
+      stale: false,
+    },
+    {
+      id: 'a_res',
+      role: 'experiment',
+      kind: 'resemble',
+      name: 'Resemble denoise',
+      audio_artifact_id: 'art_den',
+      parent_id: 'a_crop',
+      source_id: 'src_a',
+      approved: false,
+      default: false,
+      stale: false,
+    },
+    {
+      id: 'a_crop',
+      role: 'experiment',
+      kind: 'crop',
+      name: 'Crop 0.0–8.0s',
+      audio_artifact_id: 'art_crop',
+      parent_id: 'a_orig_a',
+      source_id: 'src_a',
+      keep_intervals: [{ start_s: 0, end_s: 8 }],
+      approved: false,
+      default: false,
+      stale: false,
+    },
+    {
+      id: 'a_orig_a',
+      role: 'reference',
+      kind: 'original',
+      name: 'Original',
+      audio_artifact_id: 'art_src_a',
+      parent_id: null,
+      source_id: 'src_a',
+      approved: true,
+      default: false,
+      stale: false,
+    },
+  ],
+  default_reference_id: 'a_ref',
+  duration_s: 12,
+  latest_take_id: 'run_1',
   created_at: '2026-09-14T00:00:00Z',
   updated_at: '2026-09-14T00:00:00Z',
 }
@@ -87,27 +130,17 @@ function renderBench(voice: Voice | undefined) {
   )
 }
 
-/** The backend adds `clips` to the voice profile; the shared Voice type has not caught up. */
-const CLIPS = [
-  {
-    id: 'clip_1',
-    source_id: 'src_ww',
-    speaker_local_id: 'S1',
-    voice_id: 'vp_ford',
-    ranges: [{ start_s: 2, end_s: 5 }],
-    segments: [],
-    audio_artifact_id: 'art_clip_a',
-    clean_transcript: 'these violent delights',
-    created_at: '2026-09-14T00:00:00Z',
-    source_title: 'Westworld S01E01',
-    source_kind: 'file' as const,
-  },
-]
+function audioSources(scope: HTMLElement) {
+  return Array.from(scope.querySelectorAll('audio')).map((node) => node.getAttribute('src') ?? '')
+}
 
-const VOICE_WITH_CLIPS = { ...VOICE, clips: CLIPS } as Voice
-
-function audioSources(container: HTMLElement) {
-  return Array.from(container.querySelectorAll('audio')).map((node) => node.getAttribute('src') ?? '')
+/** The `<li>` a labelled original lives in, so depth and order can be read off it. */
+function rowFor(scope: HTMLElement, label: RegExp): HTMLElement {
+  const row = within(scope).getByText(label).closest('li')
+  if (!(row instanceof HTMLElement)) {
+    throw new Error(`${label} is not in a row`)
+  }
+  return row
 }
 
 describe('voice bench', () => {
@@ -115,100 +148,116 @@ describe('voice bench', () => {
     vi.unstubAllGlobals()
   })
 
-  it('names the four voice sections for the selected voice', async () => {
+  it('names ORIGINALS and GENERATIONS and none of the four old piles', async () => {
     stubLab([RUN])
     renderBench(VOICE)
-    expect(await screen.findByRole('heading', { name: 'TAKES' })).toBeInTheDocument()
-    for (const heading of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES', 'TAKES']) {
-      expect(screen.getByRole('heading', { name: heading })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'ORIGINALS' })).toBeInTheDocument()
+    for (const old of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES', 'TAKES']) {
+      expect(screen.queryByRole('heading', { name: old })).toBeNull()
     }
-    expect(within(screen.getByRole('region', { name: 'TAKES' })).getByText(/take run_1/i)).toBeInTheDocument()
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    const generations = screen.getByRole('region', { name: 'GENERATIONS' })
+    expect(await within(generations).findByText(/take run_1/i)).toBeInTheDocument()
+    expect(within(originals).queryByText(/take run_1/i)).toBeNull()
   })
 
-
-  it('lists the clips that fed the voice, not the original media', () => {
-    stubLab()
+  it('nests each derived original under the parent its id names', async () => {
+    stubLab([RUN])
     renderBench(VOICE)
-    const material = screen.getByRole('region', { name: 'SOURCE MATERIAL' })
-    expect(within(material).getByText('westworld_clip_01')).toBeInTheDocument()
-    expect(within(material).getByText('westworld_clip_02')).toBeInTheDocument()
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    await within(screen.getByRole('region', { name: 'GENERATIONS' })).findByText(/take run_1/i)
+
+    expect(rowFor(originals, /^source take A$/).dataset.depth).toBe('0')
+    const crop = rowFor(originals, /^Crop 0\.0–8\.0s$/)
+    const approved = rowFor(originals, /enhance 1 approved/)
+    const denoised = rowFor(originals, /Resemble denoise/)
+    expect(crop.dataset.depth).toBe('1')
+    expect(approved.dataset.depth).toBe('2')
+    expect(denoised.dataset.depth).toBe('2')
+
+    // The payload lists the approved child first; the tree still follows parent ids.
+    expect(crop.compareDocumentPosition(approved) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(crop).getByText('derived from source take A')).toBeInTheDocument()
+    expect(within(approved).getByText('derived from Crop 0.0–8.0s')).toBeInTheDocument()
+    expect(within(denoised).getByText('derived from Crop 0.0–8.0s')).toBeInTheDocument()
+    // A root that derived from nothing carries no lineage text.
+    expect(within(rowFor(originals, /^source take B$/)).queryByText(/derived from/i)).toBeNull()
+    // An artifact the lab declares no length for shows no length at all.
+    expect(within(originals).queryByText('—')).toBeNull()
   })
 
-  it('prefers the clips the backend attaches to the profile', () => {
-    stubLab()
-    renderBench(VOICE_WITH_CLIPS)
-    const material = screen.getByRole('region', { name: 'SOURCE MATERIAL' })
-    expect(within(material).getByText('Westworld S01E01')).toBeInTheDocument()
-    expect(within(material).getByText('3.00s')).toBeInTheDocument()
-    // The profile's own sources are the fallback, not a second list.
-    expect(within(material).queryByText('westworld_clip_01')).toBeNull()
-  })
-
-  it('plays the crop, not a stale derivative, as the reference', () => {
-    stubLab()
-    renderBench({
-      ...VOICE,
-      active_reference_variant_id: 'rv_den',
-      active_variant: {
-        id: 'rv_den',
-        voice_profile_id: 'vp_ford',
-        kind: 'resemble',
-        audio_artifact_id: 'art_ford_den',
-        duration_s: 8,
-        stale: true,
-      },
-    })
-    const references = screen.getByRole('region', { name: 'REFERENCES' })
-    expect(within(references).getByText(/denoised/)).toBeInTheDocument()
-    expect(within(references).getByText(/stale/)).toBeInTheDocument()
-    const sources = audioSources(references)
-    expect(sources.some((src) => src.includes('art_ford_den'))).toBe(false)
-    expect(sources.some((src) => src.includes('art_ford_ref'))).toBe(true)
-  })
-
-  it('never invents a length for an artifact the backend leaves open', () => {
-    stubLab()
-    renderBench({
-      ...VOICE,
-      artifacts: [
-        {
-          id: 'va_ref',
-          role: 'reference',
-          kind: 'resemble',
-          name: 'Resemble take',
-          audio_artifact_id: 'art_va_ref',
-        },
-      ],
-    })
-    const references = screen.getByRole('region', { name: 'REFERENCES' })
-    expect(within(references).getByText(/Resemble take/)).toBeInTheDocument()
-    expect(within(references).queryByText(/—/)).toBeNull()
-    // The profile's active variant still knows its length.
-    expect(within(references).queryByText(/denoised/)).toBeNull()
-  })
-
-  it('shows the approved reference and its derivatives', () => {
-    stubLab()
+  it('marks the stored reference with the star and never a generation', async () => {
+    stubLab([RUN])
     renderBench(VOICE)
-    const references = screen.getByRole('region', { name: 'REFERENCES' })
-    expect(within(references).getByText(/original/)).toBeInTheDocument()
-    const derivatives = screen.getByRole('region', { name: 'DERIVATIVES' })
-    expect(within(derivatives).getAllByText(/denoised/)).toHaveLength(2)
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    const generations = screen.getByRole('region', { name: 'GENERATIONS' })
+    await within(generations).findByText(/take run_1/i)
+
+    expect(within(originals).getAllByText('★')).toHaveLength(1)
+    expect(within(rowFor(originals, /enhance 1 approved/)).getByText('★')).toBeInTheDocument()
+    expect(within(generations).queryByText('★')).toBeNull()
+  })
+
+  it('surfaces the parent and its derived child side by side', async () => {
+    stubLab([RUN])
+    renderBench(VOICE)
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    const generations = screen.getByRole('region', { name: 'GENERATIONS' })
+    await within(generations).findByText(/take run_1/i)
+
+    const sources = audioSources(originals)
+    expect(sources.some((src) => src.includes('art_src_a'))).toBe(true)
+    expect(sources.some((src) => src.includes('art_crop'))).toBe(true)
+    expect(sources.some((src) => src.includes('art_ref'))).toBe(true)
+    expect(audioSources(generations).some((src) => src.includes('art_take'))).toBe(true)
+    expect(sources.some((src) => src.includes('art_take'))).toBe(false)
+  })
+
+  it('summarizes the source behind an original with its transcript', async () => {
+    stubLab([RUN])
+    renderBench(VOICE)
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    await within(screen.getByRole('region', { name: 'GENERATIONS' })).findByText(/take run_1/i)
+
+    expect(within(originals).getByText(/these violent delights have violent ends/)).toBeInTheDocument()
+    expect(within(originals).getByText(/hello again/)).toBeInTheDocument()
   })
 
   it('stays quiet with nothing selected instead of a permanent compare panel', () => {
     stubLab()
     const { container } = renderBench(undefined)
-    expect(screen.queryByRole('region', { name: 'compare' })).toBeNull()
     expect(screen.queryByText(/compare/i)).toBeNull()
-    expect(screen.queryByRole('heading', { name: 'REFERENCES' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'ORIGINALS' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'GENERATIONS' })).toBeNull()
     expect(container.firstChild).toBeNull()
   })
 
+  it('never lets a derived row wear the star unless the lab stored it', async () => {
+    stubLab([RUN])
+    const artifacts = VOICE.artifacts as VoiceArtifact[]
+    const stale: VoiceArtifact = {
+      ...(artifacts.find((item) => item.id === 'a_ref') as VoiceArtifact),
+      id: 'a_stale',
+      name: 'stale render',
+      audio_artifact_id: 'art_stale',
+      default: false,
+      stale: true,
+    }
+    renderBench({ ...VOICE, artifacts: [...artifacts, stale] })
+    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    await screen.findByRole('heading', { name: 'GENERATIONS' })
 
-  it('carries no AuK chrome', () => {
-    stubLab()
+    const row = rowFor(originals, /stale render/)
+    expect(row.dataset.depth).toBe('2')
+    expect(within(row).getByText(/· stale/)).toBeInTheDocument()
+    expect(within(row).queryByText('★')).toBeNull()
+    expect(within(originals).getAllByText('★')).toHaveLength(1)
+  })
+
+  it('carries no AuK chrome', async () => {
+    stubLab([RUN])
     renderBench(VOICE)
+    await within(screen.getByRole('region', { name: 'GENERATIONS' })).findByText(/take run_1/i)
     expect(screen.queryByRole('button', { name: /auk/i })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Load AuK' })).toBeNull()
     expect(screen.queryByRole('radio', { name: /bf16|int8/i })).toBeNull()

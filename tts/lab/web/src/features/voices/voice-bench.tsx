@@ -1,46 +1,26 @@
 import { useQuery } from '@tanstack/react-query'
 import { AudioBar } from '@/components/audio-bar'
-import {
-  type Voice,
-  type VoiceArtifact,
-  artifactAudioUrl,
-  fetchRuns,
-  isCroppedReference,
-  sourceDurationS,
-  effectiveDurationS,
-} from '@/lib/api'
+import { type Voice, artifactAudioUrl, fetchRuns } from '@/lib/api'
 import { formatClock, formatMs, formatSeconds } from '@/lib/format'
-import { voiceClips } from '@/features/sources/sources-api'
+import {
+  type GenerationRow,
+  type OriginalRow,
+  voiceAssets,
+  voiceGenerations,
+} from '@/features/voices/voice-assets'
 
-/** Reference kinds are internal processor names; the bench names the outcome.
- *  Kept in step with `REFERENCE_WORDS` in lib/api.ts until that map is exported. */
-const KIND_WORDS: Record<string, string> = {
-  original: 'original',
-  resemble: 'denoised',
-  auk: 'candidate',
-}
+/** Each level of lineage steps in, so a child reads as belonging to the row above it. */
+const INDENT_PX = 12
 
-function kindWord(kind: string): string {
-  return KIND_WORDS[kind] ?? kind
-}
-
-/** A row in the bench. Voice variants know their length; backend artifacts do not. */
-type BenchArtifact = VoiceArtifact & { duration_s?: number }
-
-function BenchSection({
+function VoiceSection({
   title,
   hint,
-  empty,
   children,
 }: {
   title: string
-  hint?: string
-  empty: boolean
+  hint: string
   children?: React.ReactNode
 }) {
-  if (empty) {
-    return null
-  }
   return (
     <section
       aria-label={title}
@@ -48,189 +28,125 @@ function BenchSection({
       role="region"
     >
       <h3 className="text-xs font-medium uppercase tracking-wide text-zinc-400">{title}</h3>
-      {hint ? <p className="mt-1 text-[11px] text-zinc-500">{hint}</p> : null}
+      <p className="mt-1 text-[11px] text-zinc-500">{hint}</p>
       {children}
     </section>
   )
 }
 
-
-/** Approved reference material, with the ★ default in front. */
-function referencesOf(voice: Voice): BenchArtifact[] {
-  const artifacts = voice.artifacts ?? []
-  const approved = artifacts.filter((item) => item.role === 'reference')
-  if (approved.length > 0) {
-    const wanted = voice.default_reference_id ?? null
-    return [...approved].sort((left, right) => {
-      const star = Number(right.id === wanted) - Number(left.id === wanted)
-      return star !== 0 ? star : Number(Boolean(right.default)) - Number(Boolean(left.default))
-    })
-  }
-  const variant = voice.active_variant
-  const playable = variant && !variant.stale ? variant : null
-  if (!playable && !voice.source_audio_artifact_id) {
-    return []
-  }
-  return [
-    {
-      id: playable?.id ?? voice.active_reference_variant_id ?? voice.source_audio_artifact_id,
-      role: 'reference',
-      kind: variant?.kind ?? 'original',
-      // A stale variant was rendered from material that has since changed: play the crop, as the pane does.
-      audio_artifact_id: playable?.audio_artifact_id ?? voice.source_audio_artifact_id,
-      duration_s: playable?.duration_s ?? effectiveDurationS(voice),
-      stale: Boolean(variant?.stale),
-      default: true,
-    },
-  ]
+/** One ORIGINALS row: its own audio, what it was derived from, and what came out of it. */
+function OriginalRowView({
+  row,
+  childrenByParent,
+  depth,
+}: {
+  row: OriginalRow
+  childrenByParent: Map<string, OriginalRow[]>
+  depth: number
+}) {
+  const children = childrenByParent.get(row.id) ?? []
+  return (
+    <li
+      className="flex flex-col gap-1"
+      data-depth={depth}
+      style={{ marginLeft: depth * INDENT_PX }}
+    >
+      <span className="text-xs text-zinc-200">
+        {row.reference ? <span className="mr-1 text-amber-300">★</span> : null}
+        <span>{row.label}</span>
+        {row.durationS == null ? null : ` · ${formatSeconds(row.durationS)}`}
+        {row.stale ? <span className="text-amber-200"> · stale</span> : null}
+        {row.derivedFrom ? <span className="text-zinc-500"> derived from {row.derivedFrom}</span> : null}
+      </span>
+      {row.transcript ? <p className="text-[11px] italic text-zinc-500">{row.transcript}</p> : null}
+      <AudioBar src={artifactAudioUrl(row.audioArtifactId)} label="" />
+      {children.length === 0 ? null : (
+        <ul className="flex flex-col gap-2">
+          {children.map((child) => (
+            <OriginalRowView
+              childrenByParent={childrenByParent}
+              depth={depth + 1}
+              key={child.id}
+              row={child}
+            />
+          ))}
+        </ul>
+      )}
+    </li>
+  )
 }
 
-/** Resemble denoise/enhance and any other post-extraction processor output. */
-function derivativesOf(voice: Voice): BenchArtifact[] {
-  const artifacts = voice.artifacts ?? []
-  const fromArtifacts = artifacts.filter(
-    (artifact) => artifact.role !== 'reference' && artifact.kind !== 'original',
+/** One GENERATIONS row: Breeze's own audio and what it cost. A take never wears the ★. */
+function GenerationRowView({ row }: { row: GenerationRow }) {
+  return (
+    <li className="flex flex-col gap-1">
+      <span className="text-xs text-zinc-200">
+        <span>{row.label}</span>
+        {` · ${formatSeconds(row.durationS)}`}
+        {` · ${formatMs(row.firstAudioMs)} first audio`}
+        {row.createdAt ? (
+          <span className="text-zinc-500"> · {formatClock(row.createdAt)}</span>
+        ) : null}
+      </span>
+      <AudioBar src={artifactAudioUrl(row.audioArtifactId)} label="" />
+    </li>
   )
-  if (fromArtifacts.length > 0) {
-    return fromArtifacts
-  }
-  return (voice.variants ?? [])
-    .filter((variant) => variant.kind !== 'original')
-    .map((variant) => ({
-      id: variant.id,
-      role: 'experiment' as const,
-      kind: variant.kind,
-      audio_artifact_id: variant.audio_artifact_id,
-      duration_s: variant.duration_s,
-      stale: variant.stale,
-    }))
 }
 
 /**
- * VOICE BENCH — what a voice owns. Quiet by default: is read, to pick one.
- * `source material` here is the clips that fed the voice, not the original media.
+ * VOICE BENCH — the selected voice's store. ORIGINALS is what the voice is made
+ * of, lineage included; GENERATIONS is what Breeze produced from it. Read, to pick one.
  */
-export function VoiceBench({
-  voice,
-  omitTakes = false,
-}: {
-  voice: Voice | undefined
-  omitTakes?: boolean
-}) {
+export function VoiceBench({ voice }: { voice: Voice | undefined }) {
   const runs = useQuery({
     queryKey: ['runs', voice?.id],
     queryFn: () => fetchRuns(voice?.id),
-    enabled: Boolean(voice) && !omitTakes,
+    enabled: Boolean(voice),
   })
 
   if (!voice) {
     return null
   }
 
-
-  const references = referencesOf(voice)
-  const clips = voiceClips(voice)
-  const material =
-    clips.length > 0
-      ? clips.map((clip) => ({
-          id: clip.id,
-          label: clip.source_title ?? clip.id,
-          duration_s: clip.ranges.reduce((total, range) => total + (range.end_s - range.start_s), 0),
-        }))
-      : (voice.sources ?? []).map((item) => ({
-          id: item.id,
-          label: item.label || item.id,
-          duration_s: item.duration_s ?? 0,
-        }))
-  const derivatives = derivativesOf(voice)
-  const takes = runs.data ?? []
+  const assets = voiceAssets(voice)
+  const generations = voiceGenerations(runs.data ?? [])
 
   return (
     <div className="flex flex-col gap-2">
-      {omitTakes ? null : (
-        <h2 className="text-sm font-semibold text-zinc-50">Voice bench · {voice.name}</h2>
-      )}
-      <BenchSection
-        title="REFERENCES"
-        hint="Approved material Breeze may generate against. ★ is the active reference."
-        empty={references.length === 0}
+      <h2 className="text-sm font-semibold text-zinc-50">Voice store · {voice.name}</h2>
+      <VoiceSection
+        title="ORIGINALS"
+        hint="The voice's own material and everything derived from it. ★ is the reference Breeze may use."
       >
-        <ul className="mt-2 flex flex-col gap-2">
-          {references.map((artifact) => (
-            <li className="flex flex-col gap-1" key={artifact.id}>
-              <span className="text-xs text-zinc-200">
-                {artifact.default || artifact.id === voice.default_reference_id ? '★ ' : ''}
-                {artifact.name ?? kindWord(artifact.kind)}
-                {artifact.duration_s == null ? null : ` · ${formatSeconds(artifact.duration_s)}`}
-                {artifact.default && isCroppedReference(voice) ? (
-                  <span className="text-zinc-500"> of {formatSeconds(sourceDurationS(voice))}</span>
-                ) : null}
-                {artifact.stale ? <span className="text-amber-200"> · stale</span> : null}
-              </span>
-              <AudioBar src={artifactAudioUrl(artifact.audio_artifact_id)} label="" />
-            </li>
-          ))}
-        </ul>
-      </BenchSection>
-
-      <BenchSection
-        title="SOURCE MATERIAL"
-        hint="Clips cropped out of sources. One voice may collect clips from many sources."
-        empty={material.length === 0}
-      >
-        <ul className="mt-2 flex flex-col gap-1">
-          {material.map((clip) => (
-            <li className="flex items-center justify-between gap-2 text-xs text-zinc-200" key={clip.id}>
-              <span className="truncate">{clip.label}</span>
-              <span className="shrink-0 text-zinc-500">{formatSeconds(clip.duration_s)}</span>
-            </li>
-          ))}
-        </ul>
-      </BenchSection>
-
-      <BenchSection
-        title="DERIVATIVES"
-        hint="A processed render of a reference or a clip. Reversible: the reference stays."
-        empty={derivatives.length === 0}
-      >
-        <ul className="mt-2 flex flex-col gap-2">
-          {derivatives.map((artifact) => (
-            <li className="flex flex-col gap-1" key={artifact.id}>
-              <span
-                className={
-                  artifact.stale ? 'text-xs text-amber-200' : 'text-xs text-zinc-200'
-                }
-              >
-                {artifact.name ?? kindWord(artifact.kind)}
-                {artifact.duration_s == null ? null : ` · ${formatSeconds(artifact.duration_s)}`}
-              </span>
-              <AudioBar src={artifactAudioUrl(artifact.audio_artifact_id)} label="" />
-            </li>
-          ))}
-        </ul>
-      </BenchSection>
-      {omitTakes ? null : (
-        <BenchSection
-          title="TAKES"
-          hint="Breeze generated audio recorded against this voice."
-          empty={takes.length === 0}
-        >
+        {assets.roots.length === 0 ? (
+          <p className="mt-2 text-xs text-zinc-500">No originals yet.</p>
+        ) : (
           <ul className="mt-2 flex flex-col gap-2">
-            {takes.map((take) => (
-              <li className="flex flex-col gap-1" key={take.id}>
-                <span className="text-xs text-zinc-200">
-                  take {take.id} · {formatSeconds(take.duration_s)} · {formatMs(take.first_audio_ms)}{' '}
-                  first audio
-                  {take.created_at ? (
-                    <span className="text-zinc-500"> · {formatClock(take.created_at)}</span>
-                  ) : null}
-                </span>
-                <AudioBar src={artifactAudioUrl(take.output_artifact_id)} label="" />
-              </li>
+            {assets.roots.map((row) => (
+              <OriginalRowView
+                childrenByParent={assets.childrenByParent}
+                depth={0}
+                key={row.id}
+                row={row}
+              />
             ))}
           </ul>
-        </BenchSection>
-      )}
+        )}
+      </VoiceSection>
+      <VoiceSection
+        title="GENERATIONS"
+        hint="Breeze takes recorded against this voice. A generation is never a reference."
+      >
+        {generations.length === 0 ? (
+          <p className="mt-2 text-xs text-zinc-500">No takes yet.</p>
+        ) : (
+          <ul className="mt-2 flex flex-col gap-2">
+            {generations.map((row) => (
+              <GenerationRowView key={row.id} row={row} />
+            ))}
+          </ul>
+        )}
+      </VoiceSection>
     </div>
   )
 }
