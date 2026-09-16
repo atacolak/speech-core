@@ -1,10 +1,13 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import type { Mock } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { AppShell } from '@/components/app-shell'
 import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
 import { DEFAULT_GENERATION } from '@/lib/generation'
+import { ALIGNED_TITLE, ESTIMATED_TITLE } from '@/lib/spoken-alignment'
 import { useWorkspace } from '@/state/workspace'
 
 const RUNTIME = { state: 'ready', live_call_active: false }
@@ -28,28 +31,65 @@ const VOICES = [
   },
 ]
 
-const RUNS = [
-  {
-    id: 'run_a',
-    voice_id: 'vp1',
-    output_artifact_id: 'art_a',
-    latency_ms: 800,
-    first_audio_ms: 210,
-    duration_s: 1,
-    rating: null,
-    tags: [],
-  },
-  {
-    id: 'run_b',
-    voice_id: 'vp2',
-    output_artifact_id: 'art_b',
-    latency_ms: 900,
-    first_audio_ms: 240,
-    duration_s: 2,
-    rating: null,
-    tags: [],
-  },
+const SAY = 'one verylongword three'
+
+/** Deliberately uneven Parakeet cadence: the second word only starts at 4.5 s. */
+const ALIGNED_WORDS = [
+  { text: 'one', start_s: 0, end_s: 4.4 },
+  { text: 'verylongword', start_s: 4.5, end_s: 5.0 },
+  { text: 'three', start_s: 5.1, end_s: 6.0 },
 ]
+
+const RUN_A = {
+  id: 'run_a',
+  voice_id: 'vp1',
+  output_artifact_id: 'art_a',
+  latency_ms: 800,
+  first_audio_ms: 210,
+  duration_s: 6,
+  rating: null,
+  tags: [],
+  request_snapshot: { text: SAY, produced_text: SAY, stopped: false },
+  alignment: { status: 'ready', text: SAY, words: ALIGNED_WORDS },
+}
+
+const RUN_B = {
+  id: 'run_b',
+  voice_id: 'vp2',
+  output_artifact_id: 'art_b',
+  latency_ms: 900,
+  first_audio_ms: 240,
+  duration_s: 2,
+  rating: null,
+  tags: [],
+}
+
+/** The newest take before Parakeet has heard it. */
+const RUN_A_PENDING = { ...RUN_A, alignment: { status: 'pending' } }
+
+/** An older aligned take: the only measured speech rate that may back a fallback. */
+const RUN_PRIOR = {
+  id: 'run_prior',
+  voice_id: 'vp1',
+  output_artifact_id: 'art_prior',
+  latency_ms: 700,
+  first_audio_ms: 180,
+  duration_s: 2,
+  rating: null,
+  tags: [],
+  request_snapshot: { text: 'four five six', produced_text: 'four five six', stopped: false },
+  alignment: {
+    status: 'ready',
+    text: 'four five six',
+    words: [
+      { text: 'four', start_s: 0, end_s: 1 },
+      { text: 'five', start_s: 1, end_s: 1.5 },
+      { text: 'six', start_s: 1.5, end_s: 2 },
+    ],
+  },
+}
+
+const RUNS = [RUN_A, RUN_B]
 
 type Started = { when: number; offset: number }
 
@@ -151,6 +191,8 @@ type Lab = {
   fetchMock: Mock
   push: (bytes: Uint8Array) => void
   close: () => void
+  /** Swap the `/api/runs` payload so polling can be watched across a flip. */
+  setRuns: (items: unknown[]) => void
 }
 
 /**
@@ -162,6 +204,7 @@ type Lab = {
 function stubLab(): Lab {
   let controller: ReadableStreamDefaultController<Uint8Array> | null = null
   let closed = false
+  let runs: unknown[] = RUNS
   const body = new ReadableStream<Uint8Array>({
     start(next) {
       controller = next
@@ -177,7 +220,7 @@ function stubLab(): Lab {
       return json({ items: VOICES })
     }
     if (url.includes('/api/runs')) {
-      return json({ items: RUNS })
+      return json({ items: runs })
     }
     if (url.includes('/api/fixtures/steer')) {
       return json({ items: [] })
@@ -192,7 +235,7 @@ function stubLab(): Lab {
       return json({ id: 'gen_1', stopped: true })
     }
     if (url.includes('/api/artifacts/art_a/audio')) {
-      return new Response(wav(1), { status: 200 })
+      return new Response(wav(6), { status: 200 })
     }
     if (url.includes('/api/artifacts/art_b/audio')) {
       return new Response(wav(2), { status: 200 })
@@ -216,15 +259,18 @@ function stubLab(): Lab {
         // Already closed by the reader.
       }
     },
+    setRuns: (items) => {
+      runs = items
+    },
   }
 }
 
-function renderPane(node: ReactElement) {
+function renderPane(node: ReactElement, text = 'hello world') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   useWorkspace.setState({
     selectedVoiceId: 'vp1',
     selectedRunId: null,
-    text: 'hello world',
+    text,
     steer: 'dry',
     // Deliberately not the stored profile: hydration is what must fix it.
     generation: { ...DEFAULT_GENERATION, cfg: 4 },
@@ -243,13 +289,50 @@ function postBody(fetchMock: Mock, fragment: string) {
   }
 }
 
+/** Manual animation frames: the player's clock is driven, never polled. */
+let frames = new Map<number, FrameRequestCallback>()
+let nextFrameId = 0
+
+function tick() {
+  const pending = frames.entries().next().value
+  if (pending === undefined) {
+    return
+  }
+  frames.delete(pending[0])
+  act(() => {
+    pending[1](performance.now())
+  })
+}
+
+function audio() {
+  const context = FakeAudioContext.contexts.at(-1)
+  if (context === undefined) {
+    throw new Error('no AudioContext was created')
+  }
+  return context
+}
+
+function waveSlider() {
+  return screen.getByRole('slider', { name: 'Waveform' })
+}
+
 describe('GENERATE take player', () => {
   let lab: Lab
 
   beforeEach(() => {
     FakeAudioContext.contexts.length = 0
     FakeAudioContext.sources.length = 0
+    frames = new Map()
+    nextFrameId = 0
     vi.stubGlobal('AudioContext', FakeAudioContext)
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      nextFrameId += 1
+      frames.set(nextFrameId, callback)
+      return nextFrameId
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      frames.delete(id)
+    })
     lab = stubLab()
   })
 
@@ -266,14 +349,14 @@ describe('GENERATE take player', () => {
     await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
 
     act(() => lab.push(pcmChunk(1)))
-    await waitFor(() => expect(screen.getByRole('slider', { name: 'Seek' }).getAttribute('max')).toBe('1'))
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('1'))
     // Autoplay is the only way a 1 s take is not silent.
     expect(FakeAudioContext.sources.map((source) => source.started)).toEqual([[{ when: 0, offset: 0 }]])
     expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument()
 
     // Later PCM grows the same buffer instead of a second player.
     act(() => lab.push(pcmChunk(1)))
-    await waitFor(() => expect(screen.getByRole('slider', { name: 'Seek' }).getAttribute('max')).toBe('2'))
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('2'))
     expect(screen.getAllByLabelText('Waveform')).toHaveLength(1)
     expect(FakeAudioContext.sources).toHaveLength(1)
     expect(document.querySelector('audio')).toBeNull()
@@ -342,5 +425,108 @@ describe('GENERATE take player', () => {
       'href',
       expect.stringContaining('art_b'),
     )
+  })
+
+  it('highlights the aligned Say word at the audible playhead', async () => {
+    renderPane(<SynthesisPane />, SAY)
+    await screen.findByLabelText('Waveform')
+    expect(screen.getByLabelText('Say')).toHaveValue(SAY)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Play' }))
+    // Two seconds into a take whose second word only begins at 4.5 s: a
+    // proportional estimator would light "verylongword", so only the real
+    // Parakeet interval can put the mark on "one".
+    audio().currentTime = 2
+    tick()
+
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuenow')).toBe('2'))
+    const mark = await screen.findByTitle(ALIGNED_TITLE)
+    expect(mark.tagName).toBe('MARK')
+    expect(mark.textContent).toBe('one')
+    expect(mark.getAttribute('title')).toContain('Parakeet')
+    expect(mark.closest('[aria-hidden="true"]')).not.toBeNull()
+    expect(document.querySelectorAll('mark')).toHaveLength(1)
+  })
+
+  it('labels prior-rate fallback and renders no fallback without a rate', async () => {
+    lab.setRuns([RUN_A_PENDING, RUN_PRIOR])
+    const view = renderPane(<SynthesisPane />, SAY)
+    await screen.findByLabelText('Waveform')
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Play' }))
+    // 5.5 measured characters per second puts the estimate on the second word
+    // where the real alignment puts it on the first: the two are not the same claim.
+    audio().currentTime = 2
+    tick()
+
+    const mark = await screen.findByTitle(ESTIMATED_TITLE)
+    expect(mark.textContent).toBe('verylongword')
+    expect(mark.getAttribute('title')).toContain('error may span the whole take')
+
+    // No aligned take has ever measured a rate for this voice: invent nothing.
+    view.unmount()
+    lab.setRuns([RUN_A_PENDING])
+    renderPane(<SynthesisPane />, SAY)
+    await screen.findByLabelText('Waveform')
+    fireEvent.click(await screen.findByRole('button', { name: 'Play' }))
+    audio().currentTime = 2
+    tick()
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuenow')).toBe('2'))
+    expect(document.querySelector('mark')).toBeNull()
+  })
+
+  it('refetches only while latest alignment is pending', async () => {
+    lab.setRuns([RUN_A_PENDING])
+    renderPane(<SynthesisPane />, SAY)
+    const runsCalls = () => callsTo(lab.fetchMock, '/api/runs').length
+    await waitFor(() => expect(runsCalls()).toBeGreaterThanOrEqual(2), { timeout: 3000 })
+
+    lab.setRuns([RUN_A])
+    await waitFor(() => expect(runsCalls()).toBeGreaterThanOrEqual(3), { timeout: 3000 })
+    const settled = runsCalls()
+    // Well past the pane's one-second alignment poll: a settled take stays quiet.
+    await act(async () => {
+      await delay(1400)
+    })
+    expect(runsCalls()).toBe(settled)
+  })
+
+  it('transport never posts Stop and stream keeps appending', async () => {
+    renderPane(<SynthesisPane />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+    await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
+    act(() => lab.push(pcmChunk(1)))
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('1'))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Pause' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back 5 seconds' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Forward 5 seconds' }))
+
+    expect(callsTo(lab.fetchMock, '/stop')).toHaveLength(0)
+    act(() => lab.push(pcmChunk(1)))
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('2'))
+    expect(callsTo(lab.fetchMock, '/stop')).toHaveLength(0)
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeInTheDocument()
+  })
+
+  it('renders darker joined GENERATE chrome', async () => {
+    useWorkspace.setState({ settingsOpen: true })
+    renderPane(<AppShell />)
+    const panels = await waitFor(() => {
+      // Panels keep their size on the outer element and their skin on the inner one.
+      const found = document.querySelectorAll('[data-panel] > div')
+      expect(found).toHaveLength(3)
+      return found
+    })
+    expect(panels[1]).toHaveClass('bg-zinc-900')
+    expect(panels[0]).toHaveClass('bg-zinc-800')
+    expect(panels[2]).toHaveClass('bg-zinc-800')
+
+    const say = await screen.findByLabelText('Say')
+    expect(say.closest('section')).toHaveClass('bg-zinc-900')
+    expect(say).toHaveClass('bg-zinc-950/40', 'border-zinc-800')
+    expect(say).not.toHaveClass('bg-zinc-950')
+    expect(screen.getByLabelText('Delivery')).toHaveClass('bg-zinc-950/40', 'border-zinc-800')
+    act(() => useWorkspace.setState({ settingsOpen: false }))
   })
 })

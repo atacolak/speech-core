@@ -22,7 +22,7 @@ export function AppShell() {
             <VoicesPane />
           </Panel>
           <Separator className="w-1 bg-zinc-500" />
-          <Panel className="bg-zinc-800" defaultSize="48" id="synthesis" minSize="24">
+          <Panel className="bg-zinc-900" defaultSize="48" id="synthesis" minSize="24">
             <SynthesisPane />
           </Panel>
           {settingsOpen ? (

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Sparkles } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { TakePlayer } from '@/components/take-player'
 import {
@@ -16,11 +17,89 @@ import {
   planSteer,
   stopGenerate,
 } from '@/lib/api'
+import type { RunItem } from '@/lib/api'
 import { formatMs, formatSeconds } from '@/lib/format'
 import { toGenerationBody } from '@/lib/generation'
 import { decodePcmWav, PcmTimeline } from '@/lib/pcm-timeline'
+import { highlightAt } from '@/lib/spoken-alignment'
+import type { Highlight } from '@/lib/spoken-alignment'
 import { cn } from '@/lib/utils'
 import { useWorkspace } from '@/state/workspace'
+
+/** Post-take metadata refresh only: alignment settles long before the next take. */
+const ALIGNMENT_POLL_MS = 1000
+
+/**
+ * Only a take Parakeet is still hearing needs the run query kept warm. Runs
+ * arrive newest first, so without a selected pointer the newest row is the take
+ * the GENERATE column is showing.
+ */
+function alignmentPending(
+  runs: RunItem[] | undefined,
+  latestTakeId: string | null | undefined,
+): boolean {
+  const rows = runs ?? []
+  const observed = latestTakeId == null ? rows[0] : rows.find((run) => run.id === latestTakeId)
+  return observed?.alignment?.status === 'pending'
+}
+
+/**
+ * The newest ready-aligned take's measured character rate, excluding the take
+ * being played. It is the only evidence a not-yet-aligned take may borrow.
+ */
+function priorAlignedCharsPerSecond(
+  runs: RunItem[],
+  playedRunId: string | undefined,
+): number | null {
+  for (const run of runs) {
+    if (run.id === playedRunId) {
+      continue
+    }
+    const words = run.alignment?.status === 'ready' ? (run.alignment.words ?? []) : []
+    if (words.length === 0) {
+      continue
+    }
+    const characters = words.reduce((total, word) => total + word.text.length, 0)
+    const span = words[words.length - 1].end_s - words[0].start_s
+    if (characters > 0 && span > 0) {
+      return characters / span
+    }
+  }
+  return null
+}
+
+/**
+ * Say with one word washed and titled, mirrored over the textarea so the words
+ * on screen are the words the audio is at. Unmatched Say words are untouched.
+ */
+function mirroredSay(say: string, highlight: Highlight | null): ReactNode[] {
+  const nodes: ReactNode[] = []
+  let wordIndex = 0
+  for (const part of say.split(/(\s+)/)) {
+    if (part.length === 0) {
+      continue
+    }
+    if (/^\s+$/u.test(part)) {
+      nodes.push(part)
+      continue
+    }
+    nodes.push(
+      wordIndex === highlight?.wordIndex ? (
+        <mark
+          className="rounded-sm bg-zinc-100/15 text-transparent"
+          key={wordIndex}
+          title={highlight.title}
+        >
+          {part}
+        </mark>
+      ) : (
+        part
+      ),
+    )
+    wordIndex += 1
+  }
+  return nodes
+}
 
 export function SynthesisPane() {
   const client = useQueryClient()
@@ -36,6 +115,8 @@ export function SynthesisPane() {
   const [takeSeq, setTakeSeq] = useState(0)
   const [streamId, setStreamId] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
+  // Coarse parent state: the player reports only when the audible position moves.
+  const [playheadS, setPlayheadS] = useState(0)
   // The timeline is appended to in place, so a duration read is what re-renders
   // the player after every chunk.
   const [, setDurationS] = useState(0)
@@ -45,13 +126,15 @@ export function SynthesisPane() {
   const streamedVoiceRef = useRef<string | null>(null)
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: fetchRuntime, refetchInterval: 2000 })
   const voices = useQuery({ queryKey: ['voices'], queryFn: fetchVoices })
+  const selected = voices.data?.find((voice) => voice.id === selectedVoiceId)
   const runs = useQuery({
     queryKey: ['runs', selectedVoiceId],
     queryFn: () => fetchRuns(selectedVoiceId),
     enabled: Boolean(selectedVoiceId),
+    refetchInterval: (query) =>
+      alignmentPending(query.state.data, selected?.latest_take_id) ? ALIGNMENT_POLL_MS : false,
   })
   const fixtures = useQuery({ queryKey: ['steer-fixtures'], queryFn: fetchSteerFixtures })
-  const selected = voices.data?.find((voice) => voice.id === selectedVoiceId)
   const load = useMutation({
     mutationFn: loadE2,
     onSuccess: () => void client.invalidateQueries({ queryKey: ['runtime'] }),
@@ -67,6 +150,15 @@ export function SynthesisPane() {
 
   const liveCall = Boolean(runtime.data?.live_call_active)
   const latestRun = (runs.data ?? []).find((run) => run.id === selected?.latest_take_id)
+  const alignment = latestRun?.alignment ?? null
+  const priorRate = useMemo(
+    () => priorAlignedCharsPerSecond(runs.data ?? [], latestRun?.id),
+    [runs.data, latestRun?.id],
+  )
+  const highlight = useMemo(
+    () => highlightAt(playheadS, text, alignment, priorRate),
+    [alignment, playheadS, priorRate, text],
+  )
 
   // The knobs follow the selected profile, not whether any drawer is mounted.
   useEffect(() => {
@@ -78,6 +170,7 @@ export function SynthesisPane() {
     streamedVoiceRef.current = null
     setTimeline(null)
     setAutoplay(false)
+    setPlayheadS(0)
   }, [selectedVoiceId])
 
   // Restore the voice's latest ordinary take from the server's pointer.
@@ -123,6 +216,7 @@ export function SynthesisPane() {
     setAutoplay(true)
     setTakeSeq((seq) => seq + 1)
     setTimeline(null)
+    setPlayheadS(0)
     try {
       const stream = await openGenerateStream({
         text,
@@ -172,15 +266,30 @@ export function SynthesisPane() {
   }
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-zinc-800 p-4">
-      <label className="text-xs font-medium uppercase tracking-wide text-zinc-400">
-        Say
-        <textarea
-          className="mt-1 min-h-70 w-full rounded-md border border-zinc-600 bg-zinc-950 px-3 py-2 text-sm leading-6 text-zinc-100"
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-        />
-      </label>
+    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-zinc-900 p-4">
+      <div>
+        <label
+          className="text-xs font-medium uppercase tracking-wide text-zinc-400"
+          htmlFor="say-text"
+        >
+          Say
+        </label>
+        <div className="relative mt-1">
+          <textarea
+            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm leading-6 text-zinc-100"
+            id="say-text"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+          />
+          {/* The spoken word is drawn by the real text, so this layer stays silent. */}
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-sm leading-6 text-transparent"
+          >
+            {mirroredSay(text, highlight)}
+          </div>
+        </div>
+      </div>
       <div>
         <div className="mb-1 flex items-center justify-between">
           <span className="text-xs font-medium uppercase tracking-wide text-zinc-400">Delivery</span>
@@ -197,7 +306,7 @@ export function SynthesisPane() {
         </div>
         <textarea
           aria-label="Delivery"
-          className="min-h-20 w-full rounded-md border border-zinc-600 bg-zinc-950 px-3 py-2 text-sm text-zinc-100"
+          className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
           value={steer}
           onChange={(event) => setSteer(event.target.value)}
         />
@@ -205,7 +314,7 @@ export function SynthesisPane() {
           <details className="mt-2 text-xs text-zinc-400">
             <summary className="cursor-pointer">Fixtures</summary>
             <select
-              className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1 text-sm text-zinc-100"
+              className="mt-1 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-2 py-1 text-sm text-zinc-100"
               defaultValue=""
               onChange={(event) => {
                 const fixture = fixtures.data?.find((item) => item.id === event.target.value)
@@ -246,9 +355,15 @@ export function SynthesisPane() {
         ) : null}
       </div>
       {timeline ? (
-        <TakePlayer key={takeSeq} timeline={timeline} autoplay={autoplay} live={generating} />
+        <TakePlayer
+          key={takeSeq}
+          timeline={timeline}
+          autoplay={autoplay}
+          live={generating}
+          onPlayheadChange={setPlayheadS}
+        />
       ) : null}
-      <div className="mt-auto rounded-md border border-zinc-600 bg-zinc-900 p-3">
+      <div className="mt-auto rounded-md border border-zinc-800 bg-zinc-950/40 p-3">
         <p className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-400">Latest take</p>
         {latestRun ? (
           <>
