@@ -107,6 +107,9 @@ export function TakePlayer({
   const startedAtContextRef = useRef(0)
   const windowStartRef = useRef(0)
   const reportedRef = useRef(Number.NaN)
+  const scheduledDurationRef = useRef(0)
+  const scheduledEndContextRef = useRef<number | null>(null)
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set())
   const [playing, setPlaying] = useState(false)
   const [windowStartS, setWindowStartS] = useState(0)
 
@@ -133,12 +136,12 @@ export function TakePlayer({
   }
 
   function retireSource(): void {
-    const source = sourceRef.current
     sourceRef.current = null
-    if (source !== null) {
+    for (const source of sourcesRef.current) {
       source.onended = null
       source.stop()
     }
+    sourcesRef.current.clear()
   }
 
   /** Move the playhead to `seconds`, dragging the visible window with it. */
@@ -206,6 +209,49 @@ export function TakePlayer({
     frameRef.current = requestAnimationFrame(onFrame)
   }
 
+  const scheduleTail = useCallback((fromS: number) => {
+    const current = timelineRef.current
+    if (current === null || current.length === 0) {
+      return
+    }
+    const audio = ensureContext()
+    const clamped = Math.min(Math.max(fromS, 0), current.durationS)
+    const samples = current.toFloat32()
+    const startIndex = Math.min(Math.floor(clamped * current.sampleRate), samples.length)
+    const tail = samples.subarray(startIndex)
+    if (tail.length === 0) {
+      return
+    }
+    const buffer = audio.createBuffer(1, tail.length, current.sampleRate)
+    buffer.getChannelData(0).set(tail)
+    const when = Math.max(audio.currentTime, scheduledEndContextRef.current ?? audio.currentTime)
+    const next = audio.createBufferSource()
+    next.buffer = buffer
+    next.connect(audio.destination)
+    next.onended = () => {
+      sourcesRef.current.delete(next)
+      if (sourceRef.current === next) {
+        sourceRef.current = Array.from(sourcesRef.current).at(-1) ?? null
+      }
+      if (sourcesRef.current.size !== 0 || !playingRef.current) {
+        return
+      }
+      playheadRef.current = Math.min(current.durationS, scheduledDurationRef.current)
+      stopFrames()
+      if (liveRef.current) {
+        paint()
+        return
+      }
+      playingRef.current = false
+      setPlaying(false)
+      paint()
+    }
+    sourcesRef.current.add(next)
+    sourceRef.current = next
+    scheduledDurationRef.current = current.durationS
+    scheduledEndContextRef.current = when + buffer.duration
+    next.start(when)
+  }, [])
   const startFrom = useCallback((offset: number) => {
     const current = timelineRef.current
     if (current === null || current.length === 0) {
@@ -222,11 +268,11 @@ export function TakePlayer({
     next.buffer = buffer
     next.connect(audio.destination)
     next.onended = () => {
-      if (sourceRef.current !== next) {
-        return
+      sourcesRef.current.delete(next)
+      if (sourceRef.current === next) {
+        sourceRef.current = Array.from(sourcesRef.current).at(-1) ?? null
       }
-      sourceRef.current = null
-      if (!playingRef.current) {
+      if (sourcesRef.current.size !== 0 || !playingRef.current) {
         return
       }
       const latest = timelineRef.current
@@ -234,6 +280,10 @@ export function TakePlayer({
       playheadRef.current = from
       stopFrames()
       if (latest !== null && latest.durationS > soundedTo + EPSILON_S) {
+        if (liveRef.current) {
+          scheduleTail(soundedTo)
+          return
+        }
         // PCM that landed while this buffer played: finish the take it started.
         startFrom(soundedTo)
         return
@@ -249,16 +299,19 @@ export function TakePlayer({
       paint()
     }
     retireSource()
+    sourcesRef.current.add(next)
     sourceRef.current = next
     playingRef.current = true
     setPlaying(true)
     startedFromRef.current = clamped
     startedAtContextRef.current = audio.currentTime
+    scheduledDurationRef.current = current.durationS
+    scheduledEndContextRef.current = startedAtContextRef.current + (current.durationS - clamped)
     next.start(audio.currentTime, clamped)
     advanceTo(clamped)
     paint()
     scheduleFrame()
-  }, [])
+  }, [scheduleTail])
 
   /** Park the playhead on the clock, then keep the visible page where it is. */
   function pause(): void {
@@ -348,18 +401,18 @@ export function TakePlayer({
     startFrom(0)
   }, [autoplay, length, startFrom])
 
-  // A live stream that outran the buffer keeps its place and rolls on with the
-  // next chunk; nothing starts while a source is still active.
+  // A live append extends the scheduled source chain on the audio clock.
   useEffect(() => {
-    if (!live || sourceRef.current !== null || !playingRef.current) {
+    if (!live || !playingRef.current) {
       return
     }
     const current = timelineRef.current
-    if (current === null || current.durationS <= playheadRef.current + EPSILON_S) {
+    const scheduledDuration = scheduledDurationRef.current
+    if (current === null || current.durationS <= scheduledDuration + EPSILON_S) {
       return
     }
-    startFrom(playheadRef.current)
-  }, [live, length, startFrom])
+    scheduleTail(scheduledDuration)
+  }, [live, length, scheduleTail])
 
   // An append lengthens the take behind the playhead; it never moves it.
   useEffect(() => {

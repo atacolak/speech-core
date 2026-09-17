@@ -224,7 +224,7 @@ describe('TakePlayer', () => {
 
     timeline.appendS16(pcm(4000, 5000, 6000, 7000))
     view.rerender(<TakePlayer timeline={timeline} autoplay live label="Take" />)
-    expect(FakeAudioContext.sources).toHaveLength(1)
+    expect(FakeAudioContext.sources).toHaveLength(2)
     expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument()
   })
 
@@ -270,7 +270,7 @@ describe('TakePlayer', () => {
     view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
     expect(waveValue()).toBe('3')
     expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
-    expect(FakeAudioContext.sources).toHaveLength(1)
+    expect(FakeAudioContext.sources).toHaveLength(2)
 
     tick()
     expect(waveValue()).toBe('3')
@@ -497,8 +497,37 @@ describe('TakePlayer', () => {
     timeline.appendS16(silence(1))
     view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
     expect(FakeAudioContext.sources).toHaveLength(2)
-    expect(lastStart()).toEqual({ when: 0, offset: 1 })
+    expect(lastStart()).toEqual({ when: 1, offset: 0 })
     expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument()
+  })
+  it('schedules a live append at the current buffer end while playing', () => {
+    const timeline = growingTake(1)
+    const view = render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    fireEvent.click(playButton())
+    audio().currentTime = 0.25
+
+    timeline.appendS16(silence(1))
+    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+
+    expect(FakeAudioContext.sources).toHaveLength(2)
+    expect(lastStart()?.when).toBe(1)
+    expect(lastStart()?.when).toBeGreaterThan(audio().currentTime)
+  })
+
+  it('stops after a scheduled live tail when the stream ends', () => {
+    const timeline = growingTake(1)
+    const view = render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    fireEvent.click(playButton())
+
+    timeline.appendS16(silence(1))
+    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
+
+    act(() => {
+      FakeAudioContext.sources[0].finish()
+      FakeAudioContext.sources[1].finish()
+    })
+    expect(playButton()).toBeInTheDocument()
   })
 
   it('finishes PCM that arrived before the source buffer ended', () => {
