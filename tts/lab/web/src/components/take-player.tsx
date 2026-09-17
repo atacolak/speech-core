@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Pause, Play, SkipBack, SkipForward } from 'lucide-react'
-import type { PointerEvent as ReactPointerEvent, ReactElement } from 'react'
+import type {
+  PointerEvent as ReactPointerEvent,
+  ReactElement,
+  WheelEvent as ReactWheelEvent,
+} from 'react'
 import type { PcmTimeline } from '@/lib/pcm-timeline'
 import { followPlayhead, waveWindow, windowFraction } from '@/lib/wave-window'
 import type { WaveWindow } from '@/lib/wave-window'
@@ -95,7 +99,7 @@ export function TakePlayer({
   const timelineRef = useRef<PcmTimeline | null>(timeline)
   const liveRef = useRef(live)
   const onPlayheadChangeRef = useRef(onPlayheadChange)
-  const draggingRef = useRef(false)
+  const draggingRef = useRef<{ x: number; startS: number; moved: boolean } | null>(null)
   const autoplayedRef = useRef(false)
   const playingRef = useRef(false)
   const playheadRef = useRef(0)
@@ -299,6 +303,42 @@ export function TakePlayer({
     const fraction = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1)
     seek(shown.startS + fraction * shown.visibleS)
   }
+  function panFromPointer(event: ReactPointerEvent<HTMLCanvasElement>): void {
+    const drag = draggingRef.current
+    const rect = event.currentTarget.getBoundingClientRect()
+    const current = timelineRef.current
+    if (drag === null || rect.width <= 0 || current === null) {
+      return
+    }
+    const shown = waveWindow(current.durationS, drag.startS)
+    if (!shown.scrollable) {
+      return
+    }
+    const dx = event.clientX - drag.x
+    if (Math.abs(dx) < 4) {
+      return
+    }
+    drag.moved = true
+    const next = waveWindow(current.durationS, drag.startS - (dx / rect.width) * shown.visibleS)
+    windowStartRef.current = next.startS
+    setWindowStartS(next.startS)
+  }
+  function panFromWheel(event: ReactWheelEvent<HTMLCanvasElement>): void {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const current = timelineRef.current
+    const shown = waveWindow(current?.durationS ?? 0, windowStartRef.current)
+    if (rect.width <= 0 || current === null || !shown.scrollable) {
+      return
+    }
+    const delta = event.deltaX !== 0 ? event.deltaX : event.deltaY
+    if (delta === 0) {
+      return
+    }
+    event.preventDefault()
+    const next = waveWindow(current.durationS, shown.startS + (delta / rect.width) * shown.visibleS)
+    windowStartRef.current = next.startS
+    setWindowStartS(next.startS)
+  }
 
   useEffect(() => {
     if (!autoplay || autoplayedRef.current || length === 0) {
@@ -356,27 +396,27 @@ export function TakePlayer({
         className="h-32 w-full cursor-pointer rounded-md bg-zinc-950"
         height={WAVE_HEIGHT}
         onPointerDown={(event) => {
-          draggingRef.current = true
-          seekFromPointer(event)
+          draggingRef.current = { x: event.clientX, startS: windowStartRef.current, moved: false }
         }}
-        onPointerLeave={() => {
-          draggingRef.current = false
-        }}
-        onPointerMove={(event) => {
-          if (draggingRef.current) {
+        onPointerMove={panFromPointer}
+        onPointerUp={(event) => {
+          const drag = draggingRef.current
+          draggingRef.current = null
+          if (drag !== null && !drag.moved) {
             seekFromPointer(event)
           }
         }}
-        onPointerUp={() => {
-          draggingRef.current = false
+        onPointerCancel={() => {
+          draggingRef.current = null
         }}
+        onWheel={panFromWheel}
         role="slider"
         width={WAVE_WIDTH}
       />
       {visible.scrollable ? (
         <input
           aria-label="Window"
-          className="h-1 w-full appearance-none bg-zinc-700 [&::-webkit-slider-thumb]:h-2 [&::-webkit-slider-thumb]:w-2 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-zinc-400"
+          className="h-0.5 w-full appearance-none bg-zinc-800/70 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-zinc-500 [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-zinc-500"
           max={visible.maxStartS}
           min={0}
           onChange={(event) => {

@@ -352,7 +352,10 @@ describe('TakePlayer', () => {
     // Wave, then the optional Window scroll, then the transport.
     const scroll = windowSlider()
     expect(scroll.className).toContain('appearance-none')
-    expect(scroll.className).toContain('h-1')
+    expect(scroll.className).toContain('h-0.5')
+    expect(scroll.className).toContain('bg-zinc-800/70')
+    expect(scroll.className).toContain('[&::-webkit-slider-thumb]:w-4')
+    expect(scroll.className).not.toContain('h-1')
     expect(scroll.className).not.toContain('accent-zinc-200')
     const order = [wave, scroll, playButton()]
     expect(order[0].compareDocumentPosition(order[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -400,12 +403,41 @@ describe('TakePlayer', () => {
     wave.getBoundingClientRect = () =>
       ({ left: 0, top: 0, width: 200, height: WAVE_HEIGHT }) as DOMRect
     fireEvent.pointerDown(wave, { clientX: 100 })
+    fireEvent.pointerUp(wave, { clientX: 100 })
 
     // Half of the eight-second window is five seconds past its start.
     expect(waveValue()).toBe('13')
     expect(FakeAudioContext.sources).toHaveLength(2)
     expect(lastStart()).toEqual({ when: 0, offset: 13 })
     expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument()
+  })
+  it('pans the window when the waveform is dragged without seeking', () => {
+    const timeline = growingTake(13)
+    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    const wave = waveSlider()
+    wave.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 200, height: WAVE_HEIGHT }) as DOMRect
+
+    fireEvent.pointerDown(wave, { clientX: 120 })
+    fireEvent.pointerMove(wave, { clientX: 40 })
+    fireEvent.pointerUp(wave, { clientX: 40 })
+
+    expect(windowSlider()).toHaveValue('3')
+    expect(waveValue()).toBe('0')
+    expect(FakeAudioContext.sources).toHaveLength(0)
+  })
+  it('pans the window when the waveform is wheeled without seeking', () => {
+    const timeline = growingTake(13)
+    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    const wave = waveSlider()
+    wave.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 200, height: WAVE_HEIGHT }) as DOMRect
+
+    fireEvent.wheel(wave, { deltaX: 40 })
+
+    expect(windowSlider()).toHaveValue('2')
+    expect(waveValue()).toBe('0')
+    expect(FakeAudioContext.sources).toHaveLength(0)
   })
 
   it('pauses and skips within already-produced audio', () => {
