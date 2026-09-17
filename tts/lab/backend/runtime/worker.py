@@ -663,6 +663,48 @@ class FakeWorkerHandle:
         self.killed = True
         self._alive = False
 
+class ScriptedWorkerHandle(FakeWorkerHandle):
+    """In-process double that streams caller-supplied pcm frames.
+
+    `on_frame(index)` runs after the cancel check and before the frame is
+    delivered — the same gap in which a real Stop lands a frame in the take
+    buffer after the flush window has been latched.
+    """
+
+    def __init__(
+        self,
+        *,
+        frames: list[bytes] | None = None,
+        on_frame: Callable[[int], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.frames: list[bytes] = list(frames or [])
+        self.on_frame = on_frame
+        self.delivered = 0
+
+    def iter_synthesize(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        on_progress: Any | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> Iterator[bytes]:
+        reply = self.rpc(payload, timeout, on_progress=on_progress)
+        if not reply.get("ok"):
+            raise RuntimeError(str(reply.get("message") or "synthesize failed"))
+        self.cancel_requested = False
+        try:
+            for index, frame in enumerate(self.frames):
+                self._check_cancel(should_cancel)
+                if self.on_frame is not None:
+                    self.on_frame(index)
+                self.delivered += 1
+                yield frame
+        except GeneratorExit:
+            self.cancel_requested = True
+            raise
+
 
 class FakeAukWorkerHandle:
     """In-process AuK worker double. Never touches CUDA, weights or torch."""

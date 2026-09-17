@@ -4,13 +4,20 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO))
 
-from tts.lab.backend.runtime.worker import decode_rpc_line, read_rpc_reply
+from tts.lab.backend.runtime.worker import (
+    ScriptedWorkerHandle,
+    StreamCancelled,
+    decode_rpc_line,
+    read_rpc_reply,
+)
 
 
 class FakeStdout:
@@ -97,6 +104,52 @@ class WorkerRpc(unittest.TestCase):
         reply = read_rpc_reply(stdout, timeout=1.0, request_id="b")
         self.assertEqual(reply["result"]["duration_s"], 0.5)
         self.assertEqual(reply["id"], "b")
+
+
+class ScriptedWorkerHandleTest(unittest.TestCase):
+    """The double mirrors the subprocess reader: cancel is checked before a
+    frame is delivered, so a cancel that lands during delivery is too late."""
+
+    def _handle(self, frames: list[bytes], on_frame=None) -> ScriptedWorkerHandle:
+        handle = ScriptedWorkerHandle(frames=frames, on_frame=on_frame)
+        handle.start()
+        return handle
+
+    def _payload(self) -> dict:
+        dest = Path(tempfile.mkdtemp(prefix="scripted-")) / "take.wav"
+        return {"cmd": "synthesize", "id": "s1", "request": {"output_path": str(dest)}}
+
+    def test_delivers_every_scripted_frame_in_order(self) -> None:
+        handle = self._handle([b"\x01\x00", b"\x02\x00"])
+        frames = list(handle.iter_synthesize(self._payload(), 1.0))
+        self.assertEqual(frames, [b"\x01\x00", b"\x02\x00"])
+        self.assertEqual(handle.delivered, 2)
+
+    def test_cancel_before_a_frame_drops_it(self) -> None:
+        cancelled = threading.Event()
+        handle = self._handle([b"\x01\x00", b"\x02\x00"])
+        stream = handle.iter_synthesize(
+            self._payload(), 1.0, should_cancel=cancelled.is_set
+        )
+        self.assertEqual(next(stream), b"\x01\x00")
+        cancelled.set()
+        with self.assertRaises(StreamCancelled):
+            next(stream)
+        self.assertEqual(handle.delivered, 1)
+
+    def test_cancel_during_delivery_still_delivers_that_frame(self) -> None:
+        cancelled = threading.Event()
+        handle = self._handle(
+            [b"\x01\x00", b"\x02\x00", b"\x03\x00"],
+            on_frame=lambda index: cancelled.set() if index == 1 else None,
+        )
+        stream = handle.iter_synthesize(
+            self._payload(), 1.0, should_cancel=cancelled.is_set
+        )
+        self.assertEqual([next(stream), next(stream)], [b"\x01\x00", b"\x02\x00"])
+        with self.assertRaises(StreamCancelled):
+            next(stream)
+        self.assertEqual(handle.delivered, 2)
 
 
 if __name__ == "__main__":
