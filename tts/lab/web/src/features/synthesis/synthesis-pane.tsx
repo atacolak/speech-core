@@ -86,7 +86,7 @@ function mirroredSay(say: string, highlight: Highlight | null): ReactNode[] {
     nodes.push(
       wordIndex === highlight?.wordIndex ? (
         <mark
-          className="rounded-sm bg-zinc-100/15 text-transparent"
+          className="rounded-sm bg-[rgba(56,189,248,0.18)] text-transparent shadow-[0_0_0_1px_rgba(56,189,248,0.85)]"
           key={wordIndex}
           title={highlight.title}
         >
@@ -276,15 +276,19 @@ export function SynthesisPane() {
         </label>
         <div className="relative mt-1">
           <textarea
-            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm leading-6 text-zinc-100"
+            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[17px] leading-6 text-zinc-100"
             id="say-text"
+            spellCheck={false}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
             value={text}
             onChange={(event) => setText(event.target.value)}
           />
           {/* The spoken word is drawn by the real text, so this layer stays silent. */}
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-sm leading-6 text-transparent"
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-[17px] leading-6 text-transparent"
           >
             {mirroredSay(text, highlight)}
           </div>
@@ -306,7 +310,11 @@ export function SynthesisPane() {
         </div>
         <textarea
           aria-label="Delivery"
-          className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
+          className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[17px] leading-6 text-zinc-100"
+          spellCheck={false}
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
           value={steer}
           onChange={(event) => setSteer(event.target.value)}
         />

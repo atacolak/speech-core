@@ -427,6 +427,21 @@ describe('GENERATE take player', () => {
     )
   })
 
+  it('sets 17px Say and Delivery without dictionary marks', async () => {
+    renderPane(<SynthesisPane />)
+    const say = await screen.findByLabelText('Say')
+    const delivery = screen.getByLabelText('Delivery')
+    for (const node of [say, delivery]) {
+      expect(node).toHaveClass('text-[17px]')
+      expect(node).toHaveAttribute('spellcheck', 'false')
+      expect(node).toHaveAttribute('autocomplete', 'off')
+      expect(node).toHaveAttribute('autocorrect', 'off')
+      expect(node).toHaveAttribute('autocapitalize', 'off')
+    }
+    const mirror = say.parentElement?.querySelector('[aria-hidden="true"]')
+    expect(mirror).toHaveClass('text-[17px]')
+  })
+
   it('highlights the aligned Say word at the audible playhead', async () => {
     renderPane(<SynthesisPane />, SAY)
     await screen.findByLabelText('Waveform')
@@ -446,6 +461,10 @@ describe('GENERATE take player', () => {
     expect(mark.getAttribute('title')).toContain('Parakeet')
     expect(mark.closest('[aria-hidden="true"]')).not.toBeNull()
     expect(document.querySelectorAll('mark')).toHaveLength(1)
+    // A blue wash plus a 1px ring: the mark is the spoken word, not a cursor block.
+    expect(mark.className).toMatch(/38bdf8|sky-400|56,\s*189,\s*248/)
+    expect(mark.className).toContain('shadow-[0_0_0_1px')
+    expect(mark).not.toHaveClass('bg-zinc-100/15')
   })
 
   it('labels prior-rate fallback and renders no fallback without a rate', async () => {
