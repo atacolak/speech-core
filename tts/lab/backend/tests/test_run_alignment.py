@@ -179,12 +179,12 @@ class RunAlignmentTest(unittest.TestCase):
                 self.fail(f"alignment stayed pending: {response.text}")
             time.sleep(0.02)
 
-    def test_run_returns_pending_then_cached_cpu_words(self) -> None:
+    def test_one_shot_run_returns_pending_then_cached_cpu_words(self) -> None:
         aligner = FakeAlignment(held=True)
         with patch(ALIGN_TARGET, new=aligner):
             try:
                 response = self.client.post(
-                    "/api/generate/stream", json=self._body("One short line.")
+                    "/api/synthesize", json=self._body("One short line.")
                 )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertGreater(len(response.content), 0)
@@ -205,6 +205,20 @@ class RunAlignmentTest(unittest.TestCase):
         # Reads of the pending row never started a second alignment.
         self.assertEqual(aligner.calls, 1)
         self.assertEqual(aligner.paths, [str(self._output_path(run_id))])
+    def test_streamed_generate_does_not_create_or_schedule_alignment(self) -> None:
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            response = self.client.post(
+                "/api/generate/stream", json=self._body("One short line.")
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertGreater(len(response.content), 0)
+            run_id = self._only_run_id()
+            row = self.state.store.execute(
+                "SELECT alignment_json FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        self.assertIsNone(row["alignment_json"])
+        self.assertEqual(aligner.calls, 0)
 
     def test_pending_alignment_resumes_after_restart(self) -> None:
         from tts.lab.backend.app import create_app
@@ -266,7 +280,7 @@ class RunAlignmentTest(unittest.TestCase):
         aligner = FakeAlignment(result={"text": "", "words": []})
         with patch(ALIGN_TARGET, new=aligner):
             response = self.client.post(
-                "/api/generate/stream", json=self._body("One short line.")
+                "/api/synthesize", json=self._body("One short line.")
             )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertGreater(len(response.content), 0)
@@ -290,7 +304,7 @@ class RunAlignmentTest(unittest.TestCase):
         aligner = FakeAlignment()
         with patch(ALIGN_TARGET, new=aligner):
             response = self.client.post(
-                "/api/generate/stream", json=self._body("One short line.")
+                "/api/synthesize", json=self._body("One short line.")
             )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertGreater(len(response.content), 0)

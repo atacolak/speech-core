@@ -21,28 +21,25 @@ function run(
 }
 
 describe('takeTranscript', () => {
-  it('clips ready alignment words to take duration', () => {
+  it('uses produced_text instead of ready alignment words', () => {
     const result = takeTranscript(run({
-      text: 'One two three four',
-      produced_text: 'One two three four',
+      text: 'Requested words',
+      produced_text: 'Produced words',
       segments_planned: 1,
       segments_completed: 1,
-      stopped: true,
+      stopped: false,
     }, {
       duration_s: 1.0,
       alignment: {
         status: 'ready',
-        text: 'One two three four',
+        text: 'Wrong alignment',
         words: [
-          { text: 'One', start_s: 0, end_s: 0.3 },
-          { text: 'two', start_s: 0.3, end_s: 0.6 },
-          { text: 'three', start_s: 0.6, end_s: 0.9 },
-          { text: 'four', start_s: 1.1, end_s: 1.4 },
+          { text: 'Wrong', start_s: 0, end_s: 0.3 },
+          { text: 'alignment', start_s: 0.3, end_s: 0.6 },
         ],
       },
     }))
-    expect(result.text).toBe('One two three…')
-    expect(result.truncated).toBe(true)
+    expect(result).toEqual({ text: 'Produced words', truncated: false })
   })
 
   it('does not go blank when produced_text is empty but audio exists', () => {
@@ -54,7 +51,7 @@ describe('takeTranscript', () => {
       stopped: true,
     }, { duration_s: 2.3 }))
     expect(result.text.length).toBeGreaterThan(1)
-    expect(result.text.endsWith('…')).toBe(true)
+    expect(result.text.endsWith(' --')).toBe(true)
     expect(result.text.includes('delta')).toBe(false)
     expect(result.truncated).toBe(true)
   })
@@ -70,7 +67,7 @@ describe('takeTranscript', () => {
     expect(result.truncated).toBe(true)
   })
 
-  it('clips produced text when a segment never started', () => {
+  it('marks incomplete produced text with a double dash', () => {
     const result = takeTranscript(
       run({
         text: 'One. Two. Three.',
@@ -80,20 +77,20 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(result).toEqual({ text: 'One. Two.…', truncated: true })
+    expect(result).toEqual({ text: 'One. Two. --', truncated: true })
   })
 
-  it('derives truncation from the segment counts, not the stopped flag', () => {
+  it('marks incomplete takes from segment counts', () => {
     const disconnected = takeTranscript(
       run({
-        text: 'Alpha. Beta. Gamma.',
         produced_text: 'Alpha. Beta.',
+        text: 'Alpha. Beta. Gamma.',
         segments_planned: 3,
         segments_completed: 2,
         stopped: false,
       }),
     )
-    expect(disconnected).toEqual({ text: 'Alpha. Beta.…', truncated: true })
+    expect(disconnected).toEqual({ text: 'Alpha. Beta. --', truncated: true })
 
     const stoppedAfterTheLastSegment = takeTranscript(
       run({
@@ -104,10 +101,10 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta.', truncated: false })
+    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta. --', truncated: true })
   })
 
-  it('does not ellipsis a complete aligned take because the last word ends before duration', () => {
+  it('does not mark a complete take with a double dash', () => {
     const result = takeTranscript(run({
       text: 'One two three',
       produced_text: 'One two three',
@@ -137,7 +134,7 @@ describe('takeTranscript', () => {
       segments_completed: 0,
       stopped: true,
     }, { duration_s: 2.3 }))
-    expect(result.text.endsWith('…')).toBe(true)
+    expect(result.text.endsWith(' --')).toBe(true)
     expect(result.text.includes('epsilon')).toBe(false)
     expect(result.truncated).toBe(true)
   })

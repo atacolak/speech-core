@@ -332,7 +332,7 @@ def record_synthesis_run(
             None,
             json.dumps([]),
             created,
-            json.dumps(pending_alignment()),
+            None if produced is not None else json.dumps(pending_alignment()),
         ),
     )
     if body.voice_profile_id:
@@ -354,8 +354,8 @@ def record_synthesis_run(
         body.voice_profile_id,
         voice_take_limit(state.store, body.voice_profile_id),
     )
-    # The run is durable before the CPU aligner starts; the worker only updates it.
-    state.run_alignments.schedule(state.store, run_id, output.id)
+    if produced is None:
+        state.run_alignments.schedule(state.store, run_id, output.id)
     return {
         "id": run_id,
         "output_artifact_id": output.id,
