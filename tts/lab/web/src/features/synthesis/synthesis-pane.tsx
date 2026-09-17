@@ -271,7 +271,7 @@ export function SynthesisPane() {
         </label>
         <div className="relative mt-1">
           <textarea
-            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[17px] leading-6 text-zinc-100"
+            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
             id="say-text"
             spellCheck={false}
             autoComplete="off"
@@ -283,7 +283,7 @@ export function SynthesisPane() {
           {/* The spoken word is drawn by the real text, so this layer stays silent. */}
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-[17px] leading-6 text-transparent"
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-sm text-transparent"
           >
             {mirroredSay(text, highlight)}
           </div>
@@ -305,7 +305,7 @@ export function SynthesisPane() {
         </div>
         <textarea
           aria-label="Delivery"
-          className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-[17px] leading-6 text-zinc-100"
+          className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
           spellCheck={false}
           autoComplete="off"
           autoCorrect="off"

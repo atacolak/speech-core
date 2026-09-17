@@ -464,19 +464,19 @@ describe('GENERATE take player', () => {
     )
   })
 
-  it('sets 17px Say and Delivery without dictionary marks', async () => {
+  it('sets text-sm Say and Delivery without dictionary marks', async () => {
     renderPane(<SynthesisPane />)
     const say = await screen.findByLabelText('Say')
     const delivery = screen.getByLabelText('Delivery')
     for (const node of [say, delivery]) {
-      expect(node).toHaveClass('text-[17px]')
+      expect(node).toHaveClass('text-sm')
       expect(node).toHaveAttribute('spellcheck', 'false')
       expect(node).toHaveAttribute('autocomplete', 'off')
       expect(node).toHaveAttribute('autocorrect', 'off')
       expect(node).toHaveAttribute('autocapitalize', 'off')
     }
     const mirror = say.parentElement?.querySelector('[aria-hidden="true"]')
-    expect(mirror).toHaveClass('text-[17px]')
+    expect(mirror).toHaveClass('text-sm')
   })
 
   it('highlights the aligned Say word at the audible playhead', async () => {
