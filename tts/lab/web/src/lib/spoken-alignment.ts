@@ -82,17 +82,17 @@ export function highlightAt(
   priorAlignedCharsPerSecond: number | null,
   liveDurationS: number | null = null,
 ): Highlight | null {
+  if (liveDurationS !== null) {
+    const characters = sayCharacterCount(say)
+    const liveRate = liveDurationS > 0 && characters > 0 ? characters / liveDurationS : null
+    return estimateAt(playheadS, say, liveRate, LIVE_ESTIMATED_TITLE)
+  }
   const heard = alignment?.words ?? []
   if (alignment?.status === 'ready' && heard.length > 0) {
     const match = alignSayWords(say, heard).find(
       (word) => playheadS >= word.start_s && playheadS <= word.end_s,
     )
     return match ? { wordIndex: match.wordIndex, mode: 'aligned', title: ALIGNED_TITLE } : null
-  }
-  if (liveDurationS !== null) {
-    const characters = sayCharacterCount(say)
-    const liveRate = liveDurationS > 0 && characters > 0 ? characters / liveDurationS : null
-    return estimateAt(playheadS, say, liveRate, LIVE_ESTIMATED_TITLE)
   }
   return estimateAt(playheadS, say, priorAlignedCharsPerSecond, ESTIMATED_TITLE)
 }

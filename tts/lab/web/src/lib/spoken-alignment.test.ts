@@ -97,6 +97,28 @@ describe('highlightAt', () => {
     expect(highlightAt(0.5, 'one two three', { status: 'pending' }, 6, 0)).toBeNull()
   })
 
+  it('uses the live estimate before a ready alignment from the prior take', () => {
+    expect(
+      highlightAt(
+        0.5,
+        'one two three',
+        {
+          status: 'ready',
+          words: [
+            { text: 'one', start_s: 0, end_s: 0.2 },
+            { text: 'two', start_s: 0.4, end_s: 0.6 },
+          ],
+        },
+        6,
+        10,
+      ),
+    ).toEqual({
+      wordIndex: 0,
+      mode: 'estimated',
+      title: LIVE_ESTIMATED_TITLE,
+    })
+  })
+
   it('returns null when no prior aligned rate exists', () => {
     expect(highlightAt(1, 'one two', { status: 'unavailable' }, null)).toBeNull()
     expect(highlightAt(1, 'one two', { status: 'pending' }, null)).toBeNull()
