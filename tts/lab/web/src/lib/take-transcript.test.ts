@@ -4,7 +4,7 @@ import { takeTranscript } from '@/lib/take-transcript'
 
 function run(
   snapshot: RunItem['request_snapshot'],
-  options: Pick<RunItem, 'duration_s' | 'alignment'> = {},
+  options: Partial<Pick<RunItem, 'duration_s' | 'alignment'>> = {},
 ): RunItem {
   return {
     id: 'run_1',
