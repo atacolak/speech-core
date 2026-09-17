@@ -36,7 +36,7 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
   selectedMaterialId: null,
   selectedRunId: null,
   hydratedVoiceId: null,
-  settingsOpen: true,
+  settingsOpen: false,
   text: "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
   steer: 'fast, dry, technically confident, faintly amused.',
   generation: { ...DEFAULT_GENERATION },
