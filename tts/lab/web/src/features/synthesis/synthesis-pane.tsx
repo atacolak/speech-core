@@ -19,7 +19,6 @@ import {
   stopGenerate,
 } from '@/lib/api'
 import type { RunItem } from '@/lib/api'
-import { formatMs, formatSeconds } from '@/lib/format'
 import { toGenerationBody } from '@/lib/generation'
 import { decodePcmWav, PcmTimeline } from '@/lib/pcm-timeline'
 import { highlightAt } from '@/lib/spoken-alignment'
