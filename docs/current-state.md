@@ -8,6 +8,7 @@ If this file disagrees with code, tests, traces, or installed configuration, tre
 ## one-line summary
 
 `speech-core` is the spoken substrate: voicecat (or a diagnostic mic adapter) sends 16 kHz mono PCM in; nemotron (CPU) transcribes; silero + smart-turn close the turn; leftover mouth daemon (`:8788`) hops to breeze-tts-2 E2 (GPU). the live *call* is sibling voicecat + headed omp TUI, not `speech-out-live-session`.
+the short shared picture of the same system: [`core-picture.md`](core-picture.md).
 
 ## current live path
 

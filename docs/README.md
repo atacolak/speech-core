@@ -22,6 +22,7 @@ blend values.
 
 ## Current implementation
 
+- [`core-picture.md`](core-picture.md) — the short shared picture: ear, mouth, lab, one GPU occupant, leftover hop, reference on every segment, stop vs cancel, take.
 - [`current-state.md`](current-state.md) — live topology, installed defaults, limits, and verification commands. **live mouth is qwentts, not CosyVoice.** live call is sibling voicecat, not `speech-out-live-session`.
 - [`qualification/qwentts-sc-o5i.md`](qualification/qwentts-sc-o5i.md) — live cutover evidence.
 - [`qualification/qwentts-stream-leftover.md`](qualification/qwentts-stream-leftover.md) — pcm-out streams; leftover append is the voicecat hop.
