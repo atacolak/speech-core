@@ -20,31 +20,35 @@ export function takeTranscript(run: RunItem): TakeTranscript {
   const duration = run.duration_s
   const completed = snapshot?.segments_completed
   const planned = snapshot?.segments_planned
-  const partial =
-    snapshot?.stopped === true ||
-    (typeof completed === 'number' && typeof planned === 'number' && completed < planned)
+  const incomplete =
+    typeof completed === 'number' && typeof planned === 'number' && completed < planned
+  const knownShort =
+    incomplete ||
+    (snapshot?.stopped === true && incomplete) ||
+    (snapshot?.stopped === true && (completed == null || planned == null))
 
   const alignment = run.alignment
   if (alignment?.status === 'ready' && alignment.words?.length && typeof duration === 'number') {
     const kept = alignment.words.filter((word) => word.start_s < duration)
     if (kept.length) {
       const text = kept.map((word) => word.text).join(' ')
-      const last = kept[kept.length - 1]
-      const truncated = partial || last.end_s < duration
+      const truncated = kept.length < alignment.words.length || incomplete
       return { text: truncated ? `${text}…` : text, truncated }
     }
   }
 
   const produced = snapshot?.produced_text
-  if (typeof produced === 'string' && produced.length > 0) {
-    return { text: partial ? `${produced}…` : produced, truncated: partial }
+  const requested = snapshot?.text
+  const source = (typeof produced === 'string' && produced.length > 0 ? produced : requested) || ''
+  if (source && (knownShort || incomplete) && typeof duration === 'number' && duration > 0) {
+    return clipEstimatedText(source, duration)
   }
 
-  const requested = snapshot?.text
+  if (typeof produced === 'string' && produced.length > 0) {
+    return { text: incomplete ? `${produced}…` : produced, truncated: incomplete }
+  }
+
   if (typeof requested === 'string' && requested.length > 0) {
-    if (partial) {
-      return clipEstimatedText(requested, duration)
-    }
     return { text: requested, truncated: false }
   }
 

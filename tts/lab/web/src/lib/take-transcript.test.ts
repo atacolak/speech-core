@@ -70,7 +70,7 @@ describe('takeTranscript', () => {
     expect(result.truncated).toBe(true)
   })
 
-  it('shows the exact produced prefix plus an ellipsis when a segment never started', () => {
+  it('clips produced text when a segment never started', () => {
     const result = takeTranscript(
       run({
         text: 'One. Two. Three.',
@@ -80,7 +80,7 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(result).toEqual({ text: 'One. Two.…', truncated: true })
+    expect(result).toEqual({ text: 'One.…', truncated: true })
   })
 
   it('derives truncation from the segment counts, not the stopped flag', () => {
@@ -93,7 +93,7 @@ describe('takeTranscript', () => {
         stopped: false,
       }),
     )
-    expect(disconnected).toEqual({ text: 'Alpha. Beta.…', truncated: true })
+    expect(disconnected).toEqual({ text: 'Alpha.…', truncated: true })
 
     const stoppedAfterTheLastSegment = takeTranscript(
       run({
@@ -104,7 +104,42 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta.…', truncated: true })
+    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta.', truncated: false })
+  })
+
+  it('does not ellipsis a complete aligned take because the last word ends before duration', () => {
+    const result = takeTranscript(run({
+      text: 'One two three',
+      produced_text: 'One two three',
+      segments_planned: 1,
+      segments_completed: 1,
+      stopped: false,
+    }, {
+      duration_s: 1.5,
+      alignment: {
+        status: 'ready',
+        text: 'One two three',
+        words: [
+          { text: 'One', start_s: 0, end_s: 0.3 },
+          { text: 'two', start_s: 0.3, end_s: 0.6 },
+          { text: 'three', start_s: 0.6, end_s: 0.95 },
+        ],
+      },
+    }))
+    expect(result).toEqual({ text: 'One two three', truncated: false })
+  })
+
+  it('clips an overlong produced_text on a stopped short take when alignment is missing', () => {
+    const result = takeTranscript(run({
+      text: 'Alpha beta gamma delta epsilon',
+      produced_text: 'Alpha beta gamma delta epsilon',
+      segments_planned: 3,
+      segments_completed: 0,
+      stopped: true,
+    }, { duration_s: 2.3 }))
+    expect(result.text.endsWith('…')).toBe(true)
+    expect(result.text.includes('epsilon')).toBe(false)
+    expect(result.truncated).toBe(true)
   })
 
   it('falls back to the requested text for an old run with no produced prefix', () => {
