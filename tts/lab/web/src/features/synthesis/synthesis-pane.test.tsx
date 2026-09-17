@@ -584,8 +584,8 @@ describe('GENERATE take player', () => {
       return found
     })
     expect(panels[1]).toHaveClass('bg-zinc-900')
-    expect(panels[0]).toHaveClass('bg-zinc-800')
-    expect(panels[2]).toHaveClass('bg-zinc-800')
+    expect(panels[0]).toHaveClass('bg-zinc-850')
+    expect(panels[2]).toHaveClass('bg-zinc-850')
 
     const say = await screen.findByLabelText('Say')
     expect(say.closest('section')).toHaveClass('bg-zinc-900')

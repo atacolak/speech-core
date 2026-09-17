@@ -109,7 +109,7 @@ export function InspectorPane() {
   }, [generation, voice?.id])
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-zinc-800 p-4">
+    <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-zinc-850 p-4">
       <h2 className="text-base font-semibold text-zinc-50">Settings</h2>
       <div className="space-y-3 text-sm">
         <div className="space-y-2">

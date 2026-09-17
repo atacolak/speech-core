@@ -196,7 +196,7 @@ export function VoicesPane() {
   ) : null
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-3 overflow-auto bg-zinc-800 p-4">
+    <section className="flex h-full min-h-0 flex-col gap-3 overflow-auto bg-zinc-850 p-4">
       <h2 className="text-base font-semibold text-zinc-50">Voices</h2>
       {voices.isError ? (
         <p className="text-sm text-red-400">Could not load voices.</p>

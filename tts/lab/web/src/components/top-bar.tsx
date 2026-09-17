@@ -16,7 +16,7 @@ export function TopBar() {
 
   return (
     <header
-      className={cn('flex items-center gap-3 border-b border-zinc-700 bg-zinc-800 px-4 py-3')}
+      className={cn('flex items-center gap-3 border-b border-zinc-700 bg-zinc-850 px-4 py-3')}
     >
       <AudioLines className="h-5 w-5 text-zinc-100" aria-hidden />
       <h1 className="text-base font-semibold tracking-tight text-zinc-50">TTS lab</h1>

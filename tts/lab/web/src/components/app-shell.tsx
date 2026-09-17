@@ -12,11 +12,11 @@ export function AppShell() {
   const settingsOpen = useWorkspace((state) => state.settingsOpen)
 
   return (
-    <div className={cn('relative flex h-full min-h-screen flex-col bg-zinc-800 text-zinc-100')}>
+    <div className={cn('relative flex h-full min-h-screen flex-col bg-zinc-850 text-zinc-100')}>
       <TopBar />
       {mode === 'generate' ? (
         <Group className="min-h-0 flex-1" orientation="horizontal">
-          <Panel className="bg-zinc-800" defaultSize="24" id="voices" minSize="14">
+          <Panel className="bg-zinc-850" defaultSize="24" id="voices" minSize="14">
             <VoicesPane />
           </Panel>
           <Separator className="w-1 bg-zinc-500" />
@@ -26,7 +26,7 @@ export function AppShell() {
           {settingsOpen ? (
             <>
               <Separator className="w-1 bg-zinc-500" />
-              <Panel className="bg-zinc-800" defaultSize="28" id="settings" minSize="14">
+              <Panel className="bg-zinc-850" defaultSize="28" id="settings" minSize="14">
                 <InspectorPane />
               </Panel>
             </>
