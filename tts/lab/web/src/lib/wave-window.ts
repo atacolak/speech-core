@@ -1,6 +1,9 @@
 /** The visible wave window. Ten seconds is the operator's physical page size. */
 export const MAX_VISIBLE_S = 10
 
+/** Unplayed wave kept to the right of the playhead, so the page never runs dry. */
+export const LOOKAHEAD_S = 3
+
 export type WaveWindow = {
   startS: number
   visibleS: number
@@ -31,9 +34,10 @@ export function waveWindow(durationS: number, requestedStartS: number): WaveWind
 }
 
 /**
- * Keep the audible playhead inside the window, moving the viewport only when it
- * leaves: forward past the right edge, or back behind the left one. A growing
- * take never re-anchors the window, because the playhead has not moved.
+ * Keep the audible playhead inside the window with a 3s unplayed tail ahead of
+ * it: the viewport moves forward once the playhead crosses `visibleS - 3`, and
+ * back when it falls behind the left edge. A growing take re-anchors the window
+ * because the playhead crossed the lookahead, not because the duration changed.
  */
 export function followPlayhead(
   window: WaveWindow,
@@ -45,8 +49,9 @@ export function followPlayhead(
   if (playhead < window.startS) {
     return waveWindow(duration, playhead)
   }
-  if (playhead > window.startS + window.visibleS) {
-    return waveWindow(duration, playhead - window.visibleS)
+  const keep = Math.max(window.visibleS - LOOKAHEAD_S, 0)
+  if (playhead > window.startS + keep) {
+    return waveWindow(duration, playhead - keep)
   }
   return waveWindow(duration, window.startS)
 }

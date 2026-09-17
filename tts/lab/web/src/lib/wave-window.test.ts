@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { MAX_VISIBLE_S, followPlayhead, waveWindow, windowFraction } from '@/lib/wave-window'
+import {
+  LOOKAHEAD_S,
+  MAX_VISIBLE_S,
+  followPlayhead,
+  waveWindow,
+  windowFraction,
+} from '@/lib/wave-window'
 
 describe('waveWindow', () => {
   it('uses the full width below the ten second cap', () => {
@@ -29,34 +35,43 @@ describe('waveWindow', () => {
 })
 
 describe('followPlayhead', () => {
-  it('leaves the window alone while the playhead is inside it', () => {
+  it('advances once the playhead passes the 3s tail threshold', () => {
+    expect(LOOKAHEAD_S).toBe(3)
     const window = waveWindow(21, 0)
     expect(followPlayhead(window, 21, 5)).toEqual(window)
-    expect(followPlayhead(window, 21, 10)).toEqual(window)
-  })
-
-  it('scrolls just enough to keep the playhead visible', () => {
-    const window = waveWindow(21, 0)
-    expect(followPlayhead(window, 21, 12)).toEqual({
-      startS: 2,
+    expect(followPlayhead(window, 21, 7.5)).toEqual({
+      startS: 0.5,
       visibleS: 10,
       maxStartS: 11,
       scrollable: true,
     })
-    expect(followPlayhead(window, 21, 21)).toEqual({
+  })
+
+  it('keeps 3s of unplayed wave and clamps an honest short tail', () => {
+    expect(followPlayhead(waveWindow(12, 0), 12, 9)).toEqual({
+      startS: 2,
+      visibleS: 10,
+      maxStartS: 2,
+      scrollable: true,
+    })
+  })
+
+  it('re-anchors a growing take when the playhead crosses the lookahead', () => {
+    const window = followPlayhead(waveWindow(12, 0), 12, 2)
+    expect(window.startS).toBe(0)
+    // A 12.4s take caps the window start at 2.4, so the 2.6s offset the playhead
+    // asks for collapses to 2.4: the 2.8s tail stays honest, no overhang.
+    expect(followPlayhead(window, 12.4, 9.6).startS).toBeCloseTo(2.4)
+  })
+
+  it('scrolls just enough to keep the 3s tail at the end of the take', () => {
+    expect(followPlayhead(waveWindow(21, 0), 21, 21)).toEqual({
       startS: 11,
       visibleS: 10,
       maxStartS: 11,
       scrollable: true,
     })
     expect(followPlayhead(waveWindow(21, 11), 21, 3).startS).toBe(3)
-  })
-
-  it('does not re-anchor the window when the take keeps growing', () => {
-    const window = followPlayhead(waveWindow(12, 0), 12, 2)
-    expect(window.startS).toBe(0)
-    expect(followPlayhead(window, 12.4, 9.6).startS).toBe(0)
-    expect(followPlayhead(waveWindow(12.4, 0), 12.4, 5).visibleS).toBe(10)
   })
 })
 
