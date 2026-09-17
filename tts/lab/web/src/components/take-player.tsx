@@ -7,12 +7,10 @@ import type { WaveWindow } from '@/lib/wave-window'
 
 const SKIP_S = 5
 const EPSILON_S = 1e-6
-const WAVE_WIDTH = 360
+const WAVE_WIDTH = 1080
 const WAVE_HEIGHT = 128
-const PLAYHEAD_WIDTH = 1
-const PLAYHEAD_COLOR = '#38bdf8'
 const SILENT_STOPS = ['rgba(113,113,122,0.25)', 'rgba(161,161,170,0.6)', 'rgba(113,113,122,0.25)'] as const
-const PLAYED_STOPS = ['rgba(148,163,184,0.5)', 'rgba(241,245,249,0.95)', 'rgba(148,163,184,0.5)'] as const
+const PLAYED_STOPS = ['rgba(56,189,248,0.35)', 'rgba(56,189,248,0.95)', 'rgba(56,189,248,0.35)'] as const
 
 /** Vertical softness for one envelope fill: quiet at both edges, solid at the axis. */
 function envelopeGradient(
@@ -40,7 +38,7 @@ function paintWave(
   const peaks = timeline.peaksRange(
     visible.startS,
     visible.startS + visible.visibleS,
-    Math.max(1, Math.floor(width / 2)),
+    Math.max(1, Math.floor(width)),
   )
   const slot = width / Math.max(peaks.length, 1)
   drawing.clearRect(0, 0, width, height)
@@ -64,9 +62,6 @@ function paintWave(
   drawing.fillRect(0, 0, played * width, height)
   drawing.restore()
 
-  const playheadX = Math.min(Math.max(played * width - PLAYHEAD_WIDTH / 2, 0), width - PLAYHEAD_WIDTH)
-  drawing.fillStyle = PLAYHEAD_COLOR
-  drawing.fillRect(playheadX, 0, PLAYHEAD_WIDTH, height)
 }
 
 /**
@@ -381,7 +376,7 @@ export function TakePlayer({
       {visible.scrollable ? (
         <input
           aria-label="Window"
-          className="w-full accent-zinc-200"
+          className="h-1 w-full appearance-none bg-zinc-700 [&::-webkit-slider-thumb]:h-2 [&::-webkit-slider-thumb]:w-2 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-zinc-400"
           max={visible.maxStartS}
           min={0}
           onChange={(event) => {

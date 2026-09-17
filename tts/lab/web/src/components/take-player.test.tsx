@@ -88,7 +88,7 @@ class FakeGradient {
   }
 }
 
-type Fill = { x: number; y: number; width: number; height: number }
+type Fill = { x: number; y: number; width: number; height: number; fillStyle: unknown }
 
 class FakeDrawing {
   fillStyle: unknown = ''
@@ -141,7 +141,7 @@ class FakeDrawing {
 
   fillRect(x: number, y: number, width: number, height: number) {
     this.calls.push('fillRect')
-    this.fills.push({ x, y, width, height })
+    this.fills.push({ x, y, width, height, fillStyle: this.fillStyle })
   }
 }
 
@@ -329,16 +329,43 @@ describe('TakePlayer', () => {
     expect(drawing.calls).toContain('closePath')
     expect(drawing.calls).toContain('fill')
     expect(drawing.calls).toContain('createLinearGradient')
-    expect(drawing.gradients.some((gradient) => gradient.stops.length >= 3)).toBe(true)
-    // A thin playhead marker over the envelope.
-    expect(
-      drawing.fills.some((fill) => fill.width <= 2 && fill.height === WAVE_HEIGHT),
-    ).toBe(true)
+
+    // Progress is painted, never marked: one gradient rect, no playhead line.
+    const fullHeight = drawing.fills.filter((fill) => fill.height === WAVE_HEIGHT)
+    expect(fullHeight).toHaveLength(1)
+    expect(fullHeight[0].fillStyle).toBeInstanceOf(FakeGradient)
+    expect(drawing.fills.every((fill) => fill.fillStyle !== '#38bdf8')).toBe(true)
+
+    // The played part is a blue envelope, the unplayed part the zinc silents.
+    const painted = drawing.gradients.map((gradient) => gradient.stops.map((stop) => stop.color))
+    expect(painted).toContainEqual([
+      'rgba(56,189,248,0.35)',
+      'rgba(56,189,248,0.95)',
+      'rgba(56,189,248,0.35)',
+    ])
+    expect(painted).toContainEqual([
+      'rgba(113,113,122,0.25)',
+      'rgba(161,161,170,0.6)',
+      'rgba(113,113,122,0.25)',
+    ])
 
     // Wave, then the optional Window scroll, then the transport.
-    const order = [wave, windowSlider(), playButton()]
+    const scroll = windowSlider()
+    expect(scroll.className).toContain('appearance-none')
+    expect(scroll.className).toContain('h-1')
+    expect(scroll.className).not.toContain('accent-zinc-200')
+    const order = [wave, scroll, playButton()]
     expect(order[0].compareDocumentPosition(order[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(order[1].compareDocumentPosition(order[2]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('paints one min/max pair per 1080 backing pixel', () => {
+    stubCanvas()
+    const peaks = vi.spyOn(PcmTimeline.prototype, 'peaksRange')
+    const timeline = growingTake(11)
+    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    expect(waveSlider()).toHaveAttribute('width', '1080')
+    expect(peaks.mock.calls.at(-1)?.[2]).toBe(1080)
   })
 
   it('uses the full width below ten seconds and pages over ten seconds', () => {
