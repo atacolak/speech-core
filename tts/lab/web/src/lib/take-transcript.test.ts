@@ -47,7 +47,7 @@ describe('takeTranscript', () => {
 
   it('does not go blank when produced_text is empty but audio exists', () => {
     const result = takeTranscript(run({
-      text: 'Alpha beta gamma delta',
+      text: 'Alpha beta gamma plus many extra leftover words after that cut including delta',
       produced_text: '',
       segments_planned: 3,
       segments_completed: 0,
@@ -61,7 +61,7 @@ describe('takeTranscript', () => {
 
   it('does not show unborn Say when produced_text is missing on a stopped run', () => {
     const result = takeTranscript(run({
-      text: 'One. Two. Three.',
+      text: 'One. Two. extra leftover words. Three.',
       segments_planned: 3,
       segments_completed: 1,
       stopped: true,
@@ -80,7 +80,7 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(result).toEqual({ text: 'One.…', truncated: true })
+    expect(result).toEqual({ text: 'One. Two.…', truncated: true })
   })
 
   it('derives truncation from the segment counts, not the stopped flag', () => {
@@ -93,7 +93,7 @@ describe('takeTranscript', () => {
         stopped: false,
       }),
     )
-    expect(disconnected).toEqual({ text: 'Alpha.…', truncated: true })
+    expect(disconnected).toEqual({ text: 'Alpha. Beta.…', truncated: true })
 
     const stoppedAfterTheLastSegment = takeTranscript(
       run({
@@ -131,8 +131,8 @@ describe('takeTranscript', () => {
 
   it('clips an overlong produced_text on a stopped short take when alignment is missing', () => {
     const result = takeTranscript(run({
-      text: 'Alpha beta gamma delta epsilon',
-      produced_text: 'Alpha beta gamma delta epsilon',
+      text: 'Alpha beta gamma plus many extra leftover words after that cut including epsilon',
+      produced_text: 'Alpha beta gamma plus many extra leftover words after that cut including epsilon',
       segments_planned: 3,
       segments_completed: 0,
       stopped: true,

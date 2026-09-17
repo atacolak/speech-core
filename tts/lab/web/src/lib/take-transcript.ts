@@ -24,7 +24,6 @@ export function takeTranscript(run: RunItem): TakeTranscript {
     typeof completed === 'number' && typeof planned === 'number' && completed < planned
   const knownShort =
     incomplete ||
-    (snapshot?.stopped === true && incomplete) ||
     (snapshot?.stopped === true && (completed == null || planned == null))
 
   const alignment = run.alignment
@@ -39,16 +38,19 @@ export function takeTranscript(run: RunItem): TakeTranscript {
 
   const produced = snapshot?.produced_text
   const requested = snapshot?.text
-  const source = (typeof produced === 'string' && produced.length > 0 ? produced : requested) || ''
-  if (source && (knownShort || incomplete) && typeof duration === 'number' && duration > 0) {
-    return clipEstimatedText(source, duration)
-  }
-
   if (typeof produced === 'string' && produced.length > 0) {
+    const overclaim = Boolean(requested && produced === requested && knownShort)
+    if (overclaim && typeof duration === 'number' && duration > 0) {
+      return clipEstimatedText(produced, duration)
+    }
     return { text: incomplete ? `${produced}…` : produced, truncated: incomplete }
   }
 
-  if (typeof requested === 'string' && requested.length > 0) {
+  if (requested && knownShort && typeof duration === 'number' && duration > 0) {
+    return clipEstimatedText(requested, duration)
+  }
+
+  if (requested) {
     return { text: requested, truncated: false }
   }
 
@@ -60,11 +62,11 @@ function clipEstimatedText(text: string, duration: number | null): TakeTranscrip
     1,
     Math.floor((typeof duration === 'number' ? duration : 0) * ESTIMATED_CHARS_PER_S),
   )
-  const limit = Math.min(estimatedLimit, Math.max(1, text.length - 1))
-  let prefix = text.slice(0, limit).trimEnd()
+  const limit = estimatedLimit
+  let prefix = text.slice(0, Math.min(limit, text.length)).trimEnd()
   const boundary = prefix.search(/\s[^\s]*$/)
-  if (boundary > 0) {
+  if (boundary > 0 && limit < text.length) {
     prefix = prefix.slice(0, boundary).trimEnd()
   }
-  return { text: `${prefix || text.slice(0, limit)}…`, truncated: true }
+  return { text: `${prefix}…`, truncated: true }
 }
