@@ -149,6 +149,50 @@ class StopTrimStreamTest(unittest.TestCase):
         self.assertEqual(stream.stop_sample, 0)
         self.assertEqual(self._rows(), [])
 
+    def test_stopped_take_ends_at_the_quietest_flush_sample(self) -> None:
+        self._script([SPEECH, SPEECH, WINDOW, SPEECH], stop_after=3)
+        stream, chunks = self._run(["One."])
+        heard = np.frombuffer(b"".join(chunks), dtype="<i2")
+        expected = 2 * SPEECH.size + QUIETEST * FRAME + 1
+        saved = self._saved()
+        self.assertEqual(saved.size, expected)
+        self.assertEqual(int(saved[-1]), 1000)
+        self.assertTrue(np.array_equal(saved, heard[:expected]))
+        self.assertGreater(saved.size, stream.stop_sample)
+        self.assertAlmostEqual(
+            float(self._row()["duration_s"]), expected / SAMPLE_RATE, places=6
+        )
+
+    def test_energy_flat_window_keeps_the_last_sample(self) -> None:
+        self._script([SPEECH, SPEECH, FLAT, SPEECH], stop_after=3)
+        stream, chunks = self._run(["One."])
+        heard = b"".join(chunks)
+        self.assertEqual(stream.stop_sample, 2 * SPEECH.size)
+        self.assertEqual(self._saved().size, len(heard) // 2)
+
+    def test_completed_take_is_never_trimmed(self) -> None:
+        self._script([SPEECH, WINDOW, SPEECH])
+        stream, chunks = self._run(["One."])
+        heard = b"".join(chunks)
+        self.assertIsNone(stream.stop_sample)
+        self.assertEqual(self._saved().size, len(heard) // 2)
+        self.assertFalse(self._snapshot()["stopped"])
+
+    def test_produced_text_is_unchanged_by_the_trim(self) -> None:
+        self._script([SPEECH, WINDOW, SPEECH], stop_after=5)
+        stream, chunks = self._run(["One.", "Two."])
+        b"".join(chunks)
+        self.assertEqual(stream.stop_sample, 3 * SPEECH.size + WINDOW.size)
+        self.assertEqual(
+            self._saved().size, 3 * SPEECH.size + WINDOW.size + QUIETEST * FRAME + 1
+        )
+        snapshot = self._snapshot()
+        self.assertEqual(snapshot["produced_text"], "One.")
+        self.assertEqual(snapshot["segments_completed"], 1)
+        self.assertEqual(snapshot["segments_planned"], 2)
+        self.assertTrue(snapshot["stopped"])
+        self.assertNotIn("Two.", snapshot["produced_text"])
+
 
 if __name__ == "__main__":
     unittest.main()

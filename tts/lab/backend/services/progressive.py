@@ -22,6 +22,7 @@ import numpy as np
 from tts.lab.backend.routes.synthesis import record_synthesis_run
 from tts.lab.backend.runtime.worker import StreamCancelled
 from tts.lab.backend.services.breeze import GenerationCancelled
+from tts.lab.backend.services.stop_trim import find_min_energy_cut
 from tts.packets import new_id
 from tts.wav import duration_s, write_wav
 
@@ -199,6 +200,14 @@ def _record_take(
     if not raw:
         return
     samples = np.frombuffer(raw, dtype="<i2")
+    if stream.stop_sample is not None:
+        # The trim is the saved-take object: this is the wav desk, leftover and
+        # a later reload read. Only audio that landed after Stop is dropped.
+        cut = find_min_energy_cut(
+            samples, sample_rate=SAMPLE_RATE, search_from=stream.stop_sample
+        )
+        if cut is not None:
+            samples = samples[:cut]
     dest = Path(tempfile.mkdtemp(prefix=f"tts-lab-gen-{stream.id}-")) / "take.wav"
     write_wav(dest, SAMPLE_RATE, samples)
     result = SimpleNamespace(
