@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { TakePlayer } from '@/components/take-player'
+import { TakesSection } from '@/features/synthesis/takes-section'
 import {
   ApiError,
   artifactAudioUrl,
@@ -34,15 +35,9 @@ const ALIGNMENT_POLL_MS = 1000
  * arrive newest first, so without a selected pointer the newest row is the take
  * the GENERATE column is showing.
  */
-function alignmentPending(
-  runs: RunItem[] | undefined,
-  latestTakeId: string | null | undefined,
-): boolean {
-  const rows = runs ?? []
-  const observed = latestTakeId == null ? rows[0] : rows.find((run) => run.id === latestTakeId)
-  return observed?.alignment?.status === 'pending'
+function alignmentPending(runs: RunItem[] | undefined): boolean {
+  return (runs ?? [])[0]?.alignment?.status === 'pending'
 }
-
 /**
  * The newest ready-aligned take's measured character rate, excluding the take
  * being played. It is the only evidence a not-yet-aligned take may borrow.
@@ -132,8 +127,9 @@ export function SynthesisPane() {
     queryFn: () => fetchRuns(selectedVoiceId),
     enabled: Boolean(selectedVoiceId),
     refetchInterval: (query) =>
-      alignmentPending(query.state.data, selected?.latest_take_id) ? ALIGNMENT_POLL_MS : false,
+      alignmentPending(query.state.data) ? ALIGNMENT_POLL_MS : false,
   })
+  const takes = (runs.data ?? []).filter((run) => run.voice_id === selectedVoiceId)
   const fixtures = useQuery({ queryKey: ['steer-fixtures'], queryFn: fetchSteerFixtures })
   const load = useMutation({
     mutationFn: loadE2,
@@ -149,7 +145,7 @@ export function SynthesisPane() {
   })
 
   const liveCall = Boolean(runtime.data?.live_call_active)
-  const latestRun = (runs.data ?? []).find((run) => run.id === selected?.latest_take_id)
+  const latestRun = takes[0]
   const alignment = latestRun?.alignment ?? null
   const priorRate = useMemo(
     () => priorAlignedCharsPerSecond(runs.data ?? [], latestRun?.id),
@@ -370,29 +366,7 @@ export function SynthesisPane() {
         />
       ) : null}
       <div className="mt-auto rounded-md border border-zinc-800 bg-zinc-950/40 p-3">
-        <p className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-400">Latest take</p>
-        {latestRun ? (
-          <>
-            <p className="mt-2 text-xs text-zinc-400">
-              {latestRun.first_audio_ms != null
-                ? `first audio ${formatMs(latestRun.first_audio_ms)} · `
-                : ''}
-              cfg {generation.dual ? `dual ${generation.cfgRef}/${generation.cfgIns}` : generation.cfg} ·
-              seed {generation.seed} · {formatSeconds(latestRun.duration_s)}
-            </p>
-            <div className="mt-2 flex gap-3 text-xs">
-              <a
-                className="text-zinc-200 underline"
-                href={artifactAudioUrl(latestRun.output_artifact_id)}
-                download={`${latestRun.id}.wav`}
-              >
-                ↓ Download
-              </a>
-            </div>
-          </>
-        ) : (
-          <p className="text-sm text-zinc-300">No takes yet.</p>
-        )}
+        <TakesSection voice={selected} takes={takes} pending={runs.isPending} />
         <p className="mt-2 text-[11px] text-zinc-500">
           Voice: {selected ? selected.name : 'none selected'}
           {selected && selected.tags.includes('sample') ? ' · sample' : ''}

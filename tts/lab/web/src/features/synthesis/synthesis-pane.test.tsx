@@ -90,6 +90,7 @@ const RUN_PRIOR = {
 }
 
 const RUNS = [RUN_A, RUN_B]
+const RUN_NEWEST_FOR_VP1 = { ...RUN_A, id: 'run_newest', output_artifact_id: 'art_newest' }
 
 type Started = { when: number; offset: number }
 
@@ -201,10 +202,10 @@ type Lab = {
  * the stream stays open across Stop exactly as the server keeps it open while
  * it finalizes the take.
  */
-function stubLab(): Lab {
+function stubLab(initialRuns: unknown[] = RUNS): Lab {
   let controller: ReadableStreamDefaultController<Uint8Array> | null = null
   let closed = false
-  let runs: unknown[] = RUNS
+  let runs: unknown[] = initialRuns
   const body = new ReadableStream<Uint8Array>({
     start(next) {
       controller = next
@@ -245,6 +246,9 @@ function stubLab(): Lab {
       return json({ id: 'gen_1', stopped: true })
     }
     if (url.includes('/api/artifacts/art_a/audio')) {
+      return new Response(wav(6), { status: 200 })
+    }
+    if (url.includes('/api/artifacts/art_newest/audio')) {
       return new Response(wav(6), { status: 200 })
     }
     if (url.includes('/api/artifacts/art_b/audio')) {
@@ -367,9 +371,8 @@ describe('GENERATE take player', () => {
     // Later PCM grows the same buffer instead of a second player.
     act(() => lab.push(pcmChunk(1)))
     await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('2'))
-    expect(screen.getAllByLabelText('Waveform')).toHaveLength(1)
+    expect(document.querySelectorAll('audio')).toHaveLength(1)
     expect(FakeAudioContext.sources).toHaveLength(1)
-    expect(document.querySelector('audio')).toBeNull()
   })
 
   it('posts Stop and never renders Cancel or segment states', async () => {
@@ -423,13 +426,13 @@ describe('GENERATE take player', () => {
     expect(useWorkspace.getState().generation.seed).toBe(7)
   })
 
-  it('restores each selected voice latest take without audio src', async () => {
+  it('restores each selected voice latest take with its card audio', async () => {
     renderPane(<SynthesisPane />)
     await waitFor(() =>
       expect(callsTo(lab.fetchMock, '/api/artifacts/art_a/audio').length).toBeGreaterThan(0),
     )
     expect(screen.getByLabelText('Waveform')).toBeInTheDocument()
-    expect(document.querySelector('audio')).toBeNull()
+    expect(document.querySelectorAll('audio')).toHaveLength(1)
     expect(await screen.findByRole('link', { name: /Download/ })).toHaveAttribute(
       'href',
       expect.stringContaining('art_a'),
@@ -441,10 +444,23 @@ describe('GENERATE take player', () => {
     )
     expect(callsTo(lab.fetchMock, '/api/artifacts/art_a/audio').length).toBeGreaterThan(0)
     expect(screen.getByLabelText('Waveform')).toBeInTheDocument()
-    expect(document.querySelector('audio')).toBeNull()
+    expect(document.querySelectorAll('audio')).toHaveLength(1)
     expect(screen.getByRole('link', { name: /Download/ })).toHaveAttribute(
       'href',
       expect.stringContaining('art_b'),
+    )
+  })
+  it("follows the newest returned take when it differs from the voice's pointer", async () => {
+    lab.close()
+    lab = stubLab([RUN_NEWEST_FOR_VP1, RUN_A])
+    renderPane(<SynthesisPane />)
+
+    await waitFor(() =>
+      expect(callsTo(lab.fetchMock, '/api/artifacts/art_newest/audio').length).toBeGreaterThan(0),
+    )
+    expect(within(screen.getByRole('group', { name: 'Latest take' })).getByRole('link', { name: /Download/ })).toHaveAttribute(
+      'href',
+      expect.stringContaining('art_newest'),
     )
   })
 

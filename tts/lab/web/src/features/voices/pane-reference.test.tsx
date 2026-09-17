@@ -269,7 +269,7 @@ describe('reference picker chrome', () => {
     expect(screen.queryByText(/auk/i)).toBeNull()
   })
 
-  it('keeps Takes and drops every voice bench pile from the inspector', async () => {
+  it('drops Takes and every voice bench pile from the inspector', async () => {
     stubLab(() => legacyVoice(), {
       runs: [
         {
@@ -294,17 +294,13 @@ describe('reference picker chrome', () => {
     })
     renderPane(<InspectorPane />)
 
-    expect(await screen.findByRole('heading', { name: 'Takes' })).toBeInTheDocument()
+    expect(await screen.findByText(/^denoised · /)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Takes' })).toBeNull()
+    expect(screen.queryByText(/^cap$/i)).toBeNull()
     for (const name of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES']) {
       expect(screen.queryByRole('heading', { name })).toBeNull()
       expect(screen.queryByRole('region', { name })).toBeNull()
     }
-    const transcript = await screen.findByText('Born.…')
-    expect(transcript.textContent).toBe('Born.…')
-    for (const className of ['mt-1', 'line-clamp-4', 'text-[11px]', 'italic', 'text-zinc-500']) {
-      expect(transcript.classList.contains(className)).toBe(true)
-    }
-    expect(document.body.textContent).not.toContain('UNBORN')
   })
 
   it('renders neither GENERATE workbench door', async () => {
