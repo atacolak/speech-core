@@ -17,6 +17,9 @@ export const ALIGNED_TITLE =
 export const ESTIMATED_TITLE =
   "Estimated from the previous aligned take's speech rate; until this take is aligned, error may span the whole take."
 
+export const LIVE_ESTIMATED_TITLE =
+  "Estimated from this take's current duration; until the take settles, error may span the whole take."
+
 /** Surrounding Unicode punctuation and symbols are noise; interior spelling is not. */
 const SURROUNDING_NOISE = /^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu
 
@@ -26,6 +29,10 @@ function normalizeWord(text: string): string {
 
 function sayWords(say: string): string[] {
   return say.split(/\s+/).filter((word) => word.length > 0)
+}
+
+function sayCharacterCount(say: string): number {
+  return sayWords(say).reduce((total, word) => total + word.length, 0)
 }
 
 /**
@@ -73,6 +80,7 @@ export function highlightAt(
   say: string,
   alignment: RunAlignment | null,
   priorAlignedCharsPerSecond: number | null,
+  liveDurationS: number | null = null,
 ): Highlight | null {
   const heard = alignment?.words ?? []
   if (alignment?.status === 'ready' && heard.length > 0) {
@@ -81,20 +89,26 @@ export function highlightAt(
     )
     return match ? { wordIndex: match.wordIndex, mode: 'aligned', title: ALIGNED_TITLE } : null
   }
-  return estimateAt(playheadS, say, priorAlignedCharsPerSecond)
+  if (liveDurationS !== null) {
+    const characters = sayCharacterCount(say)
+    const liveRate = liveDurationS > 0 && characters > 0 ? characters / liveDurationS : null
+    return estimateAt(playheadS, say, liveRate, LIVE_ESTIMATED_TITLE)
+  }
+  return estimateAt(playheadS, say, priorAlignedCharsPerSecond, ESTIMATED_TITLE)
 }
 
 function estimateAt(
   playheadS: number,
   say: string,
-  priorAlignedCharsPerSecond: number | null,
+  charsPerSecond: number | null,
+  title: string,
 ): Highlight | null {
-  const rate = priorAlignedCharsPerSecond
+  const rate = charsPerSecond
   if (rate === null || !Number.isFinite(rate) || rate <= 0 || !Number.isFinite(playheadS)) {
     return null
   }
   const words = sayWords(say)
-  const characters = words.reduce((total, word) => total + word.length, 0)
+  const characters = sayCharacterCount(say)
   if (characters === 0) {
     return null
   }
@@ -103,8 +117,8 @@ function estimateAt(
   for (let index = 0; index < words.length; index += 1) {
     consumed += words[index].length
     if (position < consumed) {
-      return { wordIndex: index, mode: 'estimated', title: ESTIMATED_TITLE }
+      return { wordIndex: index, mode: 'estimated', title }
     }
   }
-  return { wordIndex: words.length - 1, mode: 'estimated', title: ESTIMATED_TITLE }
+  return { wordIndex: words.length - 1, mode: 'estimated', title }
 }

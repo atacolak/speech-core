@@ -107,6 +107,8 @@ export function SynthesisPane() {
   const [takeSeq, setTakeSeq] = useState(0)
   const [streamId, setStreamId] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
+  const sayRef = useRef<HTMLTextAreaElement | null>(null)
+  const overlayRef = useRef<HTMLDivElement | null>(null)
   // Coarse parent state: the player reports only when the audible position moves.
   const [playheadS, setPlayheadS] = useState(0)
   // The timeline is appended to in place, so a duration read is what re-renders
@@ -140,10 +142,24 @@ export function SynthesisPane() {
     () => priorAlignedCharsPerSecond(runs.data ?? [], latestRun?.id),
     [runs.data, latestRun?.id],
   )
+  const liveDurationS = generating ? (timeline?.durationS ?? 0) : null
   const highlight = useMemo(
-    () => highlightAt(playheadS, text, alignment, priorRate),
-    [alignment, playheadS, priorRate, text],
+    () => highlightAt(playheadS, text, alignment, priorRate, liveDurationS),
+    [alignment, liveDurationS, playheadS, priorRate, text],
   )
+  const syncOverlayScroll = () => {
+    const say = sayRef.current
+    const overlay = overlayRef.current
+    if (say === null || overlay === null) {
+      return
+    }
+    overlay.scrollTop = say.scrollTop
+    overlay.scrollLeft = say.scrollLeft
+  }
+
+  useEffect(() => {
+    syncOverlayScroll()
+  }, [text])
 
   // The knobs follow the selected profile, not whether any drawer is mounted.
   useEffect(() => {
@@ -266,7 +282,8 @@ export function SynthesisPane() {
         </label>
         <div className="relative mt-1">
           <textarea
-            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
+            ref={sayRef}
+            className="min-h-70 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm font-sans leading-6 tracking-normal whitespace-pre-wrap break-words text-zinc-100"
             id="say-text"
             spellCheck={false}
             autoComplete="off"
@@ -274,11 +291,13 @@ export function SynthesisPane() {
             autoCapitalize="off"
             value={text}
             onChange={(event) => setText(event.target.value)}
+            onScroll={syncOverlayScroll}
           />
           {/* The spoken word is drawn by the real text, so this layer stays silent. */}
           <div
+            ref={overlayRef}
             aria-hidden="true"
-            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-sm text-transparent"
+            className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 text-sm font-sans leading-6 tracking-normal text-transparent"
           >
             {mirroredSay(text, highlight)}
           </div>

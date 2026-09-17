@@ -6,6 +6,8 @@ const ALIGNED_TITLE =
   'Aligned from the produced take with Parakeet; Breeze supplies no word timestamps.'
 const ESTIMATED_TITLE =
   "Estimated from the previous aligned take's speech rate; until this take is aligned, error may span the whole take."
+const LIVE_ESTIMATED_TITLE =
+  "Estimated from this take's current duration; until the take settles, error may span the whole take."
 
 const SAY = 'Hello, brave world.'
 
@@ -85,6 +87,14 @@ describe('highlightAt', () => {
       mode: 'estimated',
       title: ESTIMATED_TITLE,
     })
+  })
+  it('estimates from the live take duration instead of the prior rate', () => {
+    expect(highlightAt(0.5, 'one two three', { status: 'pending' }, 6, 10)).toEqual({
+      wordIndex: 0,
+      mode: 'estimated',
+      title: LIVE_ESTIMATED_TITLE,
+    })
+    expect(highlightAt(0.5, 'one two three', { status: 'pending' }, 6, 0)).toBeNull()
   })
 
   it('returns null when no prior aligned rate exists', () => {

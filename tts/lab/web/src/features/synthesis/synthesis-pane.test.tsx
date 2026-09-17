@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppShell } from '@/components/app-shell'
 import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
 import { DEFAULT_GENERATION } from '@/lib/generation'
-import { ALIGNED_TITLE, ESTIMATED_TITLE } from '@/lib/spoken-alignment'
+import { ALIGNED_TITLE, ESTIMATED_TITLE, LIVE_ESTIMATED_TITLE } from '@/lib/spoken-alignment'
 import { useWorkspace } from '@/state/workspace'
 
 const RUNTIME = { state: 'ready', live_call_active: false }
@@ -496,6 +496,50 @@ describe('GENERATE take player', () => {
     }
     const mirror = say.parentElement?.querySelector('[aria-hidden="true"]')
     expect(mirror).toHaveClass('text-sm')
+  })
+  it('keeps the spoken overlay metrics and scroll aligned with Say', async () => {
+    renderPane(<SynthesisPane />, SAY)
+    const say = await screen.findByLabelText('Say')
+    const mirror = say.parentElement?.querySelector<HTMLElement>('[aria-hidden="true"]')
+    expect(mirror).not.toBeNull()
+
+    for (const className of [
+      'text-sm',
+      'leading-6',
+      'tracking-normal',
+      'px-3',
+      'py-2',
+      'whitespace-pre-wrap',
+      'break-words',
+    ]) {
+      expect(say).toHaveClass(className)
+      expect(mirror).toHaveClass(className)
+    }
+
+    fireEvent.scroll(say, { target: { scrollTop: 24, scrollLeft: 9 } })
+    expect(mirror).toHaveProperty('scrollTop', 24)
+    expect(mirror).toHaveProperty('scrollLeft', 9)
+
+    fireEvent.change(say, { target: { value: `${SAY} changed` } })
+    await waitFor(() => expect(mirror).toHaveProperty('scrollTop', 24))
+    expect(mirror).toHaveProperty('scrollLeft', 9)
+  })
+
+
+  it('estimates live speech from the current take duration, not the prior rate', async () => {
+    lab.setRuns([RUN_A_PENDING, RUN_PRIOR])
+    renderPane(<SynthesisPane />, SAY)
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate' }))
+    await waitFor(() => expect(callsTo(lab.fetchMock, '/api/generate/stream')).toHaveLength(1))
+
+    act(() => lab.push(pcmChunk(1)))
+    await waitFor(() => expect(waveSlider().getAttribute('aria-valuemax')).toBe('1'))
+    audio().currentTime = 0.5
+    tick()
+
+    const mark = await screen.findByTitle(LIVE_ESTIMATED_TITLE)
+    expect(mark.textContent).toBe('verylongword')
+    expect(screen.queryByTitle(ESTIMATED_TITLE)).toBeNull()
   })
 
   it('highlights the aligned Say word at the audible playhead', async () => {
