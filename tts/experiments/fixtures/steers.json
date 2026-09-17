@@ -1,37 +1,62 @@
 [
   {
-    "id": "k8s-one-process",
-    "text": "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
-    "steer": "fast, dry, technically confident, faintly amused. treat the first two sentences as obvious facts. pause briefly before \"congratulations\", then deliver the final sentence with deadpan satisfaction."
+    "id": "neutral-grounded",
+    "title": "neutral / grounded",
+    "text": "Okay, I've gone through everything. Here's what I think we should do next.",
+    "steer": "Natural conversational delivery. Calm, grounded, matter-of-fact, with an even pace and restrained expression."
   },
   {
-    "id": "you-are-confused",
-    "text": "the computer is not confused. YOU are confused. the computer is doing exactly the stupid thing you told it to do, with incredible consistency.",
-    "steer": "calm corrective delivery with restrained amusement. sharply emphasize \"you\", then become increasingly matter-of-fact. slow down slightly on \"with incredible consistency\" as the punchline lands."
+    "id": "warm-reassuring",
+    "title": "warm / reassuring",
+    "text": "Hey, you're alright. We have plenty of time to figure this out.",
+    "steer": "Warm and reassuring. Speak gently and intimately, with a soft voice, relaxed pace, and subtle tenderness."
   },
   {
-    "id": "abstraction-loan",
-    "text": "every abstraction is a loan you take out against understanding, and most engineers are running a leveraged position.",
-    "steer": "quiet, thoughtful, intellectually severe. medium-slow pace. begin almost philosophical, then let a trace of dark amusement appear on \"leveraged position\". understated, not theatrical."
+    "id": "excited-discovery",
+    "title": "excited / discovery",
+    "text": "Wait-holy shit. I think this actually works.",
+    "steer": "Genuinely excited and surprised. Start with sudden realization, then build into energetic delight. Fast, spontaneous delivery."
   },
   {
-    "id": "raised-by-committee",
-    "text": "if your agent needs twelve services and a message bus to edit a file, the agent is not autonomous. it's being raised by committee.",
-    "steer": "fast conversational delivery, incredulous but controlled. slightly accelerate through \"twelve services and a message bus\". pause after \"autonomous\", then make the final sentence completely deadpan."
+    "id": "dry-deadpan",
+    "title": "dry / deadpan",
+    "text": "Yeah, because apparently adding another abstraction layer was exactly what this system needed.",
+    "steer": "Extremely dry and deadpan. Flat affect, understated sarcasm, deliberate pacing, almost no overt emotional emphasis."
   },
   {
-    "id": "love-benchmarks",
-    "text": "i love benchmarks. benchmarks are where we all agree to lie in a standardized format.",
-    "steer": "begin genuinely warm and amused on \"i love benchmarks.\" after the pause, become dry and casually cynical. emphasize \"standardized format\" very lightly."
+    "id": "urgent-focused",
+    "title": "urgent / focused",
+    "text": "Don't restart it yet. Save the state first, then kill the worker.",
+    "steer": "Urgent and focused without shouting. Quick, clipped delivery with firm emphasis on the instructions."
   },
   {
-    "id": "yaml-until-fear",
-    "text": "you can understand the stack, or you can keep adding yaml until the fear goes away.",
-    "steer": "low-energy, almost sympathetic at first. pause after \"stack\". gradually become more amused through the second clause, with a tiny downward pitch movement on \"fear goes away\"."
+    "id": "hesitant-thinking",
+    "title": "hesitant / thinking",
+    "text": "I mean... maybe. I'm not convinced that's actually the same problem, though.",
+    "steer": "Thoughtful and uncertain, as if reasoning in real time. Hesitate naturally, use small pauses, and become firmer toward the end."
   },
   {
-    "id": "three-daemons",
-    "text": "(laugh) oh, this is incredible. we replaced a function call with three daemons and now everybody is surprised that debugging got harder.",
-    "steer": "start with genuine spontaneous amusement. recover quickly into fast technical speech. let disbelief rise through \"three daemons\", then finish dryly and almost exhausted."
+    "id": "tired-sigh",
+    "title": "tired / sigh",
+    "text": "(sigh) Okay. Let's try this one more time.",
+    "steer": "Tired and mildly frustrated, but composed. Low energy, slower pace, with resignation rather than anger."
+  },
+  {
+    "id": "amused-laugh",
+    "title": "amused / laugh",
+    "text": "Oh, so now you understand why I told you not to touch the scheduler. (laugh)",
+    "steer": "Playful and teasing. Lightly smug but warm, with genuine amusement and a lively conversational rhythm."
+  },
+  {
+    "id": "pure-laugh-event",
+    "title": "pure laugh event",
+    "text": "You named the second one the exact same thing. (laugh) That's incredible.",
+    "steer": "Natural conversational delivery."
+  },
+  {
+    "id": "pure-sigh-event",
+    "title": "pure sigh event",
+    "text": "(sigh) We still have three more of these to fix.",
+    "steer": "Natural conversational delivery."
   }
 ]

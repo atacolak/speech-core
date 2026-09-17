@@ -101,7 +101,7 @@ function labFetch({
     if (url.includes('/api/runs')) {
       return json({ items: runs })
     }
-    if (url.includes('/api/fixtures/steer')) {
+    if (url.endsWith('/api/fixtures/steers')) {
       return json({ items: [] })
     }
     return json({ detail: 'missing' }, 404)

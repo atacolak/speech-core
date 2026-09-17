@@ -227,6 +227,7 @@ export type Take = {
 
 export type SteerFixture = {
   id: string
+  title: string
   text: string
   steer: string
 }
@@ -737,7 +738,7 @@ export async function deleteRun(runId: string): Promise<void> {
 }
 
 export async function fetchSteerFixtures(): Promise<SteerFixture[]> {
-  const response = await apiFetch('/api/fixtures/steer')
+  const response = await apiFetch('/api/fixtures/steers')
   if (!response.ok) {
     throw await readError(response, 'fixtures')
   }

@@ -319,26 +319,24 @@ export function SynthesisPane() {
           onChange={(event) => setSteer(event.target.value)}
         />
         {fixtures.data && fixtures.data.length > 0 ? (
-          <details className="mt-2 text-xs text-zinc-400">
-            <summary className="cursor-pointer">Fixtures</summary>
-            <select
-              className="mt-1 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-2 py-1 text-sm text-zinc-100"
-              defaultValue=""
-              onChange={(event) => {
-                const fixture = fixtures.data?.find((item) => item.id === event.target.value)
-                if (!fixture) return
-                setText(fixture.text)
-                setSteer(fixture.steer)
-              }}
-            >
-              <option value="">pick a fixture…</option>
-              {fixtures.data.map((fixture) => (
-                <option key={fixture.id} value={fixture.id}>
-                  {fixture.id}
-                </option>
-              ))}
-            </select>
-          </details>
+          <select
+            aria-label="Fixture"
+            className="mt-2 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-2 py-1 text-sm text-zinc-100"
+            defaultValue=""
+            onChange={(event) => {
+              const fixture = fixtures.data?.find((item) => item.id === event.target.value)
+              if (!fixture) return
+              setText(fixture.text)
+              setSteer(fixture.steer)
+            }}
+          >
+            <option value="">pick a fixture…</option>
+            {fixtures.data.map((fixture) => (
+              <option key={fixture.id} value={fixture.id}>
+                {fixture.title}
+              </option>
+            ))}
+          </select>
         ) : null}
       </div>
       <div className="flex justify-center gap-2">

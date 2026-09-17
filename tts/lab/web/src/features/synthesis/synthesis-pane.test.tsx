@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import type { Mock } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -222,8 +222,18 @@ function stubLab(): Lab {
     if (url.includes('/api/runs')) {
       return json({ items: runs })
     }
-    if (url.includes('/api/fixtures/steer')) {
-      return json({ items: [] })
+    if (url.endsWith('/api/fixtures/steers')) {
+      return json({
+        items: [
+          {
+            id: 'neutral-grounded',
+            title: 'neutral / grounded',
+            text: "Okay, I've gone through everything. Here's what I think we should do next.",
+            steer:
+              'Natural conversational delivery. Calm, grounded, matter-of-fact, with an even pace and restrained expression.',
+          },
+        ],
+      })
     }
     if (url.includes('/api/generate/stream') && method === 'POST') {
       return new Response(body, {
@@ -386,6 +396,17 @@ describe('GENERATE take player', () => {
     const say = await screen.findByLabelText('Say')
     expect(say).toHaveClass('min-h-70')
     expect(say).not.toHaveClass('min-h-28')
+  })
+
+  it('loads titled fixtures from the plural path and applies one', async () => {
+    renderPane(<SynthesisPane />)
+    const picker = await screen.findByLabelText('Fixture')
+    expect(picker.tagName).toBe('SELECT')
+    expect(within(picker).getByText('neutral / grounded')).toBeInTheDocument()
+    fireEvent.change(picker, { target: { value: 'neutral-grounded' } })
+    expect(screen.getByLabelText('Say')).toHaveValue(
+      "Okay, I've gone through everything. Here's what I think we should do next.",
+    )
   })
 
   it('hydrates stored cfg before first Generate', async () => {

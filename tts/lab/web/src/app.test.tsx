@@ -100,7 +100,7 @@ function mockLabFetch(voices: unknown[] = [], sources: unknown[] = [MATERIAL]) {
     if (url.includes('/api/runs')) {
       return jsonResponse({ items: [] })
     }
-    if (url.includes('/api/fixtures/steers')) {
+    if (url.endsWith('/api/fixtures/steers')) {
       return jsonResponse({ items: [] })
     }
     if (url.includes('/api/artifacts/') && url.includes('/audio')) {
