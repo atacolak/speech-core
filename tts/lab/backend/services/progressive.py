@@ -35,6 +35,26 @@ class GenerateStream:
     voice_profile_id: str
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     run_id: str | None = None
+    recorded_samples: int = 0
+    stop_sample: int | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self, pcm: bytearray, chunk: bytes) -> None:
+        """Append one worker chunk and publish the take buffer's length."""
+        with self.lock:
+            pcm.extend(chunk)
+            self.recorded_samples = len(pcm) // 2
+
+    def mark_stopped(self) -> None:
+        """Latch where the post-Stop flush window starts, then stop.
+
+        One lock with `record`, so a Stop landing mid-append never opens the
+        window inside a chunk that arrived before it. The first Stop wins.
+        """
+        with self.lock:
+            if self.stop_sample is None:
+                self.stop_sample = self.recorded_samples
+        self.stop_event.set()
 
 
 class GenerationActive(RuntimeError):
@@ -70,7 +90,7 @@ class GenerateStreams:
     def stop(self, stream_id: str) -> GenerateStream:
         """End unborn work. Produced audio is still recorded as one take."""
         stream = self.get(stream_id)
-        stream.stop_event.set()
+        stream.mark_stopped()
         return stream
 
     def end(self, stream_id: str) -> None:
@@ -139,7 +159,7 @@ def iter_generate_pcm(
                         continue
                     if first_audio_s is None:
                         first_audio_s = time.monotonic() - started
-                    pcm.extend(chunk)
+                    stream.record(pcm, chunk)
                     yield chunk
             except (StreamCancelled, GenerationCancelled):
                 stopped = True
