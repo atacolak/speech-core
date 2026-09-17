@@ -412,6 +412,14 @@ describe('GENERATE take player', () => {
     )
   })
 
+  it('does not render a Delivery sparkle / Generate steer button', async () => {
+    renderPane(<SynthesisPane />)
+    await screen.findByLabelText('Delivery')
+    expect(screen.queryByRole('button', { name: /generate steer/i })).toBeNull()
+    expect(screen.queryByTitle('Generate steer')).toBeNull()
+    expect(screen.queryByText('Planning…')).toBeNull()
+  })
+
   it('hydrates stored cfg before first Generate', async () => {
     renderPane(<SynthesisPane />)
     await waitFor(() => expect(useWorkspace.getState().generation.cfg).toBe(1))

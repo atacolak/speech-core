@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Sparkles } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
@@ -15,7 +14,6 @@ import {
   formatApiError,
   loadE2,
   openGenerateStream,
-  planSteer,
   stopGenerate,
 } from '@/lib/api'
 import type { RunItem } from '@/lib/api'
@@ -133,14 +131,6 @@ export function SynthesisPane() {
   const load = useMutation({
     mutationFn: loadE2,
     onSuccess: () => void client.invalidateQueries({ queryKey: ['runtime'] }),
-  })
-  const plan = useMutation({
-    mutationFn: planSteer,
-    onSuccess: (body) => {
-      setSteer(body.steer)
-      toast.success('Delivery filled')
-    },
-    onError: (error) => toast.error(formatApiError(error)),
   })
 
   const liveCall = Boolean(runtime.data?.live_call_active)
@@ -290,19 +280,7 @@ export function SynthesisPane() {
         </div>
       </div>
       <div>
-        <div className="mb-1 flex items-center justify-between">
-          <span className="text-xs font-medium uppercase tracking-wide text-zinc-400">Delivery</span>
-          <button
-            type="button"
-            className="inline-flex items-center gap-1 text-xs text-zinc-200"
-            disabled={plan.isPending || !text.trim()}
-            onClick={() => plan.mutate(text)}
-            title="Generate steer"
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            {plan.isPending ? 'Planning…' : ''}
-          </button>
-        </div>
+        <label className="text-xs font-medium uppercase tracking-wide text-zinc-400">Delivery</label>
         <textarea
           aria-label="Delivery"
           className="min-h-20 w-full rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-100"
