@@ -2,13 +2,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import {
-  activeReferenceLabel,
   fetchVoices,
   formatApiError,
   patchVoice,
 } from '@/lib/api'
 import { fromStoredGeneration, toGenerationBody } from '@/lib/generation'
-import { formatSeconds } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { useWorkspace } from '@/state/workspace'
 
@@ -114,17 +112,6 @@ export function InspectorPane() {
     <section className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-zinc-800 p-4">
       <h2 className="text-base font-semibold text-zinc-50">Settings</h2>
       <div className="space-y-3 text-sm">
-        <div>
-          <p className="text-xs uppercase tracking-wide text-zinc-400">Voice</p>
-          <p className="text-zinc-100">{voice?.name ?? '—'}</p>
-        </div>
-        <div>
-          <p className="text-xs uppercase tracking-wide text-zinc-400">Reference</p>
-          <p className="text-zinc-100">
-            {activeReferenceLabel(voice)}
-            {voice?.duration_s != null ? ` · ${formatSeconds(voice.duration_s)}` : ''}
-          </p>
-        </div>
         <div className="space-y-2">
           <p className="text-xs uppercase tracking-wide text-zinc-400">Guidance</p>
           <label className="flex items-center gap-2 text-xs text-zinc-200">

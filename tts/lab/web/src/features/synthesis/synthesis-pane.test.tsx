@@ -564,6 +564,15 @@ describe('GENERATE take player', () => {
     expect(callsTo(lab.fetchMock, '/stop')).toHaveLength(0)
     expect(await screen.findByRole('button', { name: 'Stop' })).toBeInTheDocument()
   })
+  it('opens Settings on GENERATE load without Voice or Reference blocks', async () => {
+    useWorkspace.setState({ settingsOpen: true })
+    renderPane(<AppShell />)
+    expect(await screen.findByRole('heading', { name: 'Settings' })).toBeInTheDocument()
+    const settings = screen.getByRole('heading', { name: 'Settings' }).closest('section')
+    expect(within(settings!).queryByText(/^Voice$/)).toBeNull()
+    expect(within(settings!).queryByText(/^Reference$/)).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Voices' })).toBeInTheDocument()
+  })
 
   it('renders darker joined GENERATE chrome', async () => {
     useWorkspace.setState({ settingsOpen: true })

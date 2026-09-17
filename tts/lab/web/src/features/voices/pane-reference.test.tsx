@@ -253,22 +253,6 @@ describe('reference picker chrome', () => {
     expect(screen.queryByText(/auk/i)).toBeNull()
   })
 
-  it('reports the active reference kind in the settings pane', async () => {
-    stubLab(() => legacyVoice())
-    renderPane(<InspectorPane />)
-
-    expect(await screen.findByText(/^denoised · /)).toBeInTheDocument()
-    expect(screen.queryByText(/resemble/i)).toBeNull()
-  })
-
-  it('reports the parked auk variant as a candidate in the settings pane', async () => {
-    stubLab(() => legacyVoice(AUK_VARIANT))
-    renderPane(<InspectorPane />)
-
-    expect(await screen.findByText(/^candidate · /)).toBeInTheDocument()
-    expect(screen.queryByText(/auk/i)).toBeNull()
-  })
-
   it('drops Takes and every voice bench pile from the inspector', async () => {
     stubLab(() => legacyVoice(), {
       runs: [
@@ -294,7 +278,6 @@ describe('reference picker chrome', () => {
     })
     renderPane(<InspectorPane />)
 
-    expect(await screen.findByText(/^denoised · /)).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Takes' })).toBeNull()
     expect(screen.queryByText(/^cap$/i)).toBeNull()
     for (const name of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES']) {
