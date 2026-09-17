@@ -123,6 +123,78 @@ export function VoicesPane() {
     rename.mutate({ id: selected.id, name: next })
   }
 
+  // GENERATE always has a selected voice, and the row it selects wears the
+  // identity card in place: the pane never renders a second card below the list.
+  const expandedRow = selected ? (
+    <div className="flex flex-col gap-2 rounded-md border border-zinc-600 bg-zinc-900 p-3">
+      <label className="text-xs uppercase tracking-wide text-zinc-400">
+        Name
+        <input
+          className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1.5 text-sm font-medium text-zinc-50"
+          value={nameDraft}
+          onChange={(event) => setNameDraft(event.target.value)}
+          onBlur={commitName}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.currentTarget.blur()
+            }
+          }}
+        />
+      </label>
+      {hasReference ? (
+        <>
+          <label className="text-xs uppercase tracking-wide text-zinc-400">
+            Reference
+            <select
+              aria-label="Reference"
+              className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1.5 text-sm font-medium normal-case text-zinc-50"
+              value={picked?.id ?? ''}
+              disabled={activate.isPending}
+              onChange={(event) => {
+                const option = options.find((item) => item.id === event.target.value)
+                if (option && selected) {
+                  activate.mutate({ voiceId: selected.id, target: option.target })
+                }
+              }}
+            >
+              {options.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <AudioBar label="" src={selected ? referenceAudioSrc(selected, picked) : undefined} />
+          {quote ? <p className="text-sm italic text-zinc-400">{quote}</p> : null}
+        </>
+      ) : (
+        <>
+          <p className="text-sm text-amber-200">Reference missing</p>
+          <button
+            type="button"
+            className="w-fit rounded-md border border-zinc-500 px-3 py-1.5 text-xs text-zinc-100"
+            onClick={() => fileRef.current?.click()}
+          >
+            Choose audio
+          </button>
+        </>
+      )}
+      <button
+        type="button"
+        className="w-fit text-xs text-red-300 underline"
+        disabled={remove.isPending}
+        onClick={() => {
+          if (!window.confirm(`Delete voice “${selected.name}”? This cannot be undone.`)) {
+            return
+          }
+          remove.mutate(selected.id)
+        }}
+      >
+        {remove.isPending ? 'Deleting…' : 'Delete voice'}
+      </button>
+    </div>
+  ) : null
+
   return (
     <section className="flex h-full min-h-0 flex-col gap-3 overflow-auto bg-zinc-800 p-4">
       <h2 className="text-base font-semibold text-zinc-50">Voices</h2>
@@ -136,77 +208,9 @@ export function VoicesPane() {
             selectVoice(voice.id)
             void setActiveVoice(voice.id)
           }}
+          renderExpanded={() => expandedRow}
         />
       )}
-      {selected ? (
-        <div className="flex flex-col gap-2 rounded-md border border-zinc-600 bg-zinc-900 p-3">
-          <label className="text-xs uppercase tracking-wide text-zinc-400">
-            Name
-            <input
-              className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1.5 text-sm font-medium text-zinc-50"
-              value={nameDraft}
-              onChange={(event) => setNameDraft(event.target.value)}
-              onBlur={commitName}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.currentTarget.blur()
-                }
-              }}
-            />
-          </label>
-          {hasReference ? (
-            <>
-              <label className="text-xs uppercase tracking-wide text-zinc-400">
-                Reference
-                <select
-                  aria-label="Reference"
-                  className="mt-1 w-full rounded-md border border-zinc-600 bg-zinc-950 px-2 py-1.5 text-sm font-medium normal-case text-zinc-50"
-                  value={picked?.id ?? ''}
-                  disabled={activate.isPending}
-                  onChange={(event) => {
-                    const option = options.find((item) => item.id === event.target.value)
-                    if (option && selected) {
-                      activate.mutate({ voiceId: selected.id, target: option.target })
-                    }
-                  }}
-                >
-                  {options.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <AudioBar label="" src={selected ? referenceAudioSrc(selected, picked) : undefined} />
-              {quote ? <p className="text-sm italic text-zinc-400">{quote}</p> : null}
-            </>
-          ) : (
-            <>
-              <p className="text-sm text-amber-200">Reference missing</p>
-              <button
-                type="button"
-                className="w-fit rounded-md border border-zinc-500 px-3 py-1.5 text-xs text-zinc-100"
-                onClick={() => fileRef.current?.click()}
-              >
-                Choose audio
-              </button>
-            </>
-          )}
-          <button
-            type="button"
-            className="w-fit text-xs text-red-300 underline"
-            disabled={remove.isPending}
-            onClick={() => {
-              if (!window.confirm(`Delete voice “${selected.name}”? This cannot be undone.`)) {
-                return
-              }
-              remove.mutate(selected.id)
-            }}
-          >
-            {remove.isPending ? 'Deleting…' : 'Delete voice'}
-          </button>
-        </div>
-      ) : null}
 
       <input
         ref={fileRef}

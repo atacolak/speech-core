@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { InspectorPane } from '@/features/inspector/inspector-pane'
+import { VoiceLab } from '@/features/voice-lab/voice-lab'
 import { VoicesPane } from '@/features/voices/voices-pane'
 import { useWorkspace } from '@/state/workspace'
 
@@ -110,7 +111,7 @@ type Call = { url: string; method: string; body: string }
 
 function stubLab(
   read: () => VoiceFixture,
-  options: { runs?: unknown[]; activate?: (id: string) => void } = {},
+  options: { runs?: unknown[]; activate?: (id: string) => void; voices?: () => VoiceFixture[] } = {},
 ) {
   const calls: Call[] = []
   vi.stubGlobal(
@@ -126,7 +127,11 @@ function stubLab(
         ? { active_voice_id: null, lease_owner: null, phase: 'idle', leases: [] }
         : url.includes('/api/runs')
           ? { items: options.runs ?? [] }
-          : { items: [read()] }
+          : url.includes('/api/sources')
+            ? { items: [] }
+            : options.voices
+              ? { items: options.voices() }
+              : { items: [read()] }
       return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -241,7 +246,8 @@ describe('reference picker chrome', () => {
     const picker = await screen.findByLabelText('Reference')
 
     expect(within(picker).getByRole('option', { name: '★ candidate' })).toBeInTheDocument()
-    expect(screen.getByText(/▶ candidate/)).toBeInTheDocument()
+    // The selected GENERATE row is the identity card, so the neutral word is read
+    // off the picker option above, never a compact row subtitle.
     // Exact text only: prose may describe processing, but no asset is *named* by a task word.
     expect(screen.queryByText('enhance')).toBeNull()
     expect(screen.queryByText(/auk/i)).toBeNull()
@@ -314,5 +320,50 @@ describe('reference picker chrome', () => {
 
     expect(screen.queryByRole('button', { name: 'Open workbench' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+  })
+
+  it('expands the selected GENERATE voice in its list row', async () => {
+    stubLab(() => profileVoice())
+    renderPane(<VoicesPane />)
+
+    const list = await screen.findByRole('list')
+    const selected = within(list).getByRole('listitem')
+    expect(selected).toHaveAccessibleName('ata')
+    expect(within(selected).getByLabelText('Name')).toBeInTheDocument()
+    expect(within(selected).getByLabelText('Reference')).toBeInTheDocument()
+    expect(within(selected).getByRole('button', { name: 'Delete voice' })).toBeInTheDocument()
+    const after = list.nextElementSibling
+    expect(after?.querySelector?.('input, select')).toBeFalsy()
+  })
+
+  it('moves the expanded card to another voice when it is picked', async () => {
+    stubLab(() => profileVoice(), {
+      voices: () => [profileVoice(), profileVoice({ id: 'vp2', name: 'bee' })],
+    })
+    renderPane(<VoicesPane />)
+
+    const list = await screen.findByRole('list')
+    const [first, second] = within(list).getAllByRole('listitem')
+    expect(within(first).getByLabelText('Name')).toBeInTheDocument()
+    expect(within(second).queryByLabelText('Name')).toBeNull()
+
+    fireEvent.click(within(second).getByRole('button', { name: /bee/ }))
+
+    expect(await within(second).findByLabelText('Name')).toBeInTheDocument()
+    expect(within(first).queryByLabelText('Name')).toBeNull()
+  })
+
+  it('keeps the Voice Lab library rows compact', async () => {
+    stubLab(() => profileVoice())
+    renderPane(<VoiceLab />)
+
+    const row = (await screen.findByRole('button', { name: /ata/ })).closest('li') as HTMLElement
+    expect(row.tagName).toBe('LI')
+    const list = row.closest('ul') as HTMLElement
+    expect(list.tagName).toBe('UL')
+    for (const item of within(list).getAllByRole('listitem')) {
+      expect(within(item).queryByLabelText('Name')).toBeNull()
+    }
+    expect(within(list).queryByRole('button', { name: 'Delete voice' })).toBeNull()
   })
 })
