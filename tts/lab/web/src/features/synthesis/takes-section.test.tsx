@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { TakesSection } from '@/features/synthesis/takes-section'
 import type { RunItem, Voice } from '@/lib/api'
@@ -56,5 +56,12 @@ describe('takes section', () => {
     expect(within(takes).getByText('older words')).toBeInTheDocument()
     expect(within(takes).getByText(/cap/i)).toBeInTheDocument()
     expect(screen.getAllByText('newest words')).toHaveLength(1)
+  })
+
+  it('does not select a take card on click', () => {
+    renderSection()
+    fireEvent.click(screen.getByText('older words'))
+    expect(document.querySelector('.border-emerald-400')).toBeNull()
+    expect(useWorkspace.getState().selectedRunId).toBeNull()
   })
 })

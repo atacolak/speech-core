@@ -13,13 +13,10 @@ import { clampTakeLimit, DEFAULT_TAKE_LIMIT } from '@/lib/generation'
 import { formatMs, formatSeconds } from '@/lib/format'
 import { takeTranscript } from '@/lib/take-transcript'
 import { cn } from '@/lib/utils'
-import { useWorkspace } from '@/state/workspace'
 
 export function TakeCard({
   voice,
   run,
-  selected,
-  onSelect,
   onSave,
   onDelete,
   onInspect,
@@ -27,8 +24,6 @@ export function TakeCard({
 }: {
   voice: Voice
   run: RunItem
-  selected: boolean
-  onSelect: () => void
   onSave: () => void
   onDelete: () => void
   onInspect: () => void
@@ -50,14 +45,10 @@ export function TakeCard({
       <div
         className={cn(
           'rounded-md border p-3',
-          selected
-            ? 'border-emerald-400 bg-zinc-700'
-            : saved
-              ? 'border-zinc-100 bg-zinc-900'
-              : 'border-zinc-600 bg-zinc-900',
+          saved ? 'border-zinc-100 bg-zinc-900' : 'border-zinc-600 bg-zinc-900',
         )}
       >
-        <button type="button" className="w-full text-left" onClick={onSelect}>
+        <div className="w-full text-left">
           <p className="text-xs text-zinc-300">
             {voice.name}
             {saved ? ' · saved' : ''}
@@ -71,7 +62,7 @@ export function TakeCard({
           {transcript.text ? (
             <p className="mt-1 line-clamp-4 text-[11px] italic text-zinc-500">{transcript.text}</p>
           ) : null}
-        </button>
+        </div>
         <audio className="mt-2 w-full" controls src={artifactAudioUrl(run.output_artifact_id)} />
         <div className="mt-2 flex flex-wrap gap-2 text-xs">
           <button type="button" className="text-zinc-200 underline" onClick={onSave}>
@@ -116,8 +107,6 @@ export function TakesSection({
   pending: boolean
 }) {
   const client = useQueryClient()
-  const selectedRunId = useWorkspace((state) => state.selectedRunId)
-  const selectRun = useWorkspace((state) => state.selectRun)
   const [provenanceId, setProvenanceId] = useState<string | null>(null)
   const takeLimit = clampTakeLimit(voice?.take_limit ?? DEFAULT_TAKE_LIMIT)
   const rate = useMutation({
@@ -153,8 +142,6 @@ export function TakesSection({
       key={run.id}
       voice={voice}
       run={run}
-      selected={selectedRunId === run.id}
-      onSelect={() => selectRun(run.id)}
       onSave={() => rate.mutate({ id: run.id, rating: run.rating === 'keep' ? '' : 'keep' })}
       onDelete={() => remove.mutate(run.id)}
       onInspect={() => setProvenanceId(run.id)}
