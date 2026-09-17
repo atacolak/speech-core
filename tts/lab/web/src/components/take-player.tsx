@@ -413,7 +413,7 @@ export function TakePlayer({
         role="slider"
         width={WAVE_WIDTH}
       />
-      {visible.scrollable ? (
+      {!live && visible.scrollable ? (
         <input
           aria-label="Window"
           className="h-0.5 w-full appearance-none bg-zinc-800/70 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-zinc-500 [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-zinc-500"

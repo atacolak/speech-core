@@ -257,29 +257,44 @@ describe('TakePlayer', () => {
     expect(onPlayheadChange).toHaveBeenLastCalledWith(2.5)
   })
 
-  it('keeps playhead and window stable when PCM appends', () => {
+  it('keeps playhead stable and hides the Window slider while PCM appends live', () => {
     const timeline = growingTake(11)
     const view = render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
     fireEvent.click(playButton())
     audio().currentTime = 3
     tick()
     expect(waveValue()).toBe('3')
-    expect(windowSlider()).toHaveValue('0')
+    expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
 
     timeline.appendS16(silence(4))
     view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
     expect(waveValue()).toBe('3')
-    expect(windowSlider()).toHaveValue('0')
+    expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
     expect(FakeAudioContext.sources).toHaveLength(1)
 
     tick()
     expect(waveValue()).toBe('3')
-    expect(windowSlider()).toHaveValue('0')
+    expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
+  })
+
+  it('hides the Window slider while live and restores it after the stream ends', () => {
+    const timeline = growingTake(18)
+    const view = render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    fireEvent.click(playButton())
+
+    audio().currentTime = 12
+    tick()
+
+    expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
+    expect(waveValue()).toBe('12')
+
+    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
+    expect(windowSlider()).toHaveValue('5')
   })
 
   it('scrolls the window without seeking', () => {
     const timeline = growingTake(13)
-    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     fireEvent.click(playButton())
     expect(lastStart()).toEqual({ when: 0, offset: 0 })
 
@@ -314,7 +329,7 @@ describe('TakePlayer', () => {
   it('renders a 128 px soft wave and borderless transport', () => {
     const drawing = stubCanvas()
     const timeline = growingTake(13)
-    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
 
     const wave = waveSlider()
     expect(wave).toHaveAttribute('height', '128')
@@ -375,12 +390,12 @@ describe('TakePlayer', () => {
     stubCanvas()
     const peaks = vi.spyOn(PcmTimeline.prototype, 'peaksRange')
     const timeline = growingTake(4)
-    const view = render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    const view = render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     expect(screen.queryByRole('slider', { name: 'Window' })).toBeNull()
     expect(peaks.mock.calls.at(-1)?.slice(0, 2)).toEqual([0, 4])
 
     timeline.appendS16(silence(7))
-    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    view.rerender(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     expect(windowSlider()).toHaveAttribute('max', '1')
     expect(peaks.mock.calls.at(-1)?.slice(0, 2)).toEqual([0, 10])
   })
@@ -395,7 +410,7 @@ describe('TakePlayer', () => {
 
   it('maps wave pointer seeks through the visible window', () => {
     const timeline = growingTake(18)
-    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     fireEvent.click(playButton())
     fireEvent.change(windowSlider(), { target: { value: '8' } })
 
@@ -413,7 +428,7 @@ describe('TakePlayer', () => {
   })
   it('pans the window when the waveform is dragged without seeking', () => {
     const timeline = growingTake(13)
-    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     const wave = waveSlider()
     wave.getBoundingClientRect = () =>
       ({ left: 0, top: 0, width: 200, height: WAVE_HEIGHT }) as DOMRect
@@ -428,7 +443,7 @@ describe('TakePlayer', () => {
   })
   it('pans the window when the waveform is wheeled without seeking', () => {
     const timeline = growingTake(13)
-    render(<TakePlayer timeline={timeline} autoplay={false} live label="Take" />)
+    render(<TakePlayer timeline={timeline} autoplay={false} live={false} label="Take" />)
     const wave = waveSlider()
     wave.getBoundingClientRect = () =>
       ({ left: 0, top: 0, width: 200, height: WAVE_HEIGHT }) as DOMRect
