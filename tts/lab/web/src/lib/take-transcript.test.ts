@@ -101,7 +101,7 @@ describe('takeTranscript', () => {
         stopped: true,
       }),
     )
-    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta. --', truncated: true })
+    expect(stoppedAfterTheLastSegment).toEqual({ text: 'Alpha. Beta.', truncated: false })
   })
 
   it('does not mark a complete take with a double dash', () => {

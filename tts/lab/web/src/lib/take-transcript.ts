@@ -22,7 +22,8 @@ export function takeTranscript(run: RunItem): TakeTranscript {
   const incomplete =
     typeof completed === 'number' && typeof planned === 'number' && completed < planned
   const stopped = snapshot?.stopped === true
-  const truncated = incomplete || stopped
+  const truncated =
+    incomplete || (stopped && (completed == null || planned == null))
 
   const produced = snapshot?.produced_text
   const requested = snapshot?.text
