@@ -458,6 +458,17 @@ describe('GENERATE take player', () => {
       expect.stringContaining('art_b'),
     )
   })
+
+  it('restores Say and Delivery from the latest take script', async () => {
+    renderPane(
+      <SynthesisPane />,
+      "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
+    )
+    useWorkspace.setState({ steer: 'fast, dry, technically confident, faintly amused.' })
+    await waitFor(() => expect(screen.getByLabelText('Say')).toHaveValue(SAY))
+    // RUN_A snapshot has no steer — Delivery becomes empty, not the joke default
+    expect(screen.getByLabelText('Delivery')).toHaveValue('')
+  })
   it("follows the newest returned take when it differs from the voice's pointer", async () => {
     lab.close()
     lab = stubLab([RUN_NEWEST_FOR_VP1, RUN_A])

@@ -172,6 +172,11 @@ export function SynthesisPane() {
       return
     }
     restoredRef.current = key
+    const requestSnapshot = latestRun.request_snapshot
+    if (typeof requestSnapshot?.text === 'string' && requestSnapshot.text.length > 0) {
+      setText(requestSnapshot.text)
+      setSteer(requestSnapshot.steer ?? '')
+    }
     let cancelled = false
     fetch(artifactAudioUrl(artifactId))
       .then((response) => (response.ok ? response.arrayBuffer() : null))
