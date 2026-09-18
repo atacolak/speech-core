@@ -99,6 +99,69 @@ class VoiceTakes(unittest.TestCase):
         response = self.client.patch(f"/api/voices/{voice['id']}", json={"name": "   "})
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_run_name_persists(self) -> None:
+        voice = self._voice()
+        run = self._synth(voice["id"])
+        before = self.client.get(f"/api/runs/{run['id']}")
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertIsNone(before.json().get("name"))
+        response = self.client.patch(f"/api/runs/{run['id']}", json={"name": "morning take"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json().get("name"), "morning take")
+        got = self.client.get(f"/api/runs/{run['id']}")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json().get("name"), "morning take")
+        listed = self.client.get(f"/api/runs?voice_id={voice['id']}").json()["items"]
+        item = next(row for row in listed if row["id"] == run["id"])
+        self.assertEqual(item.get("name"), "morning take")
+
+    def test_blank_run_name_is_rejected(self) -> None:
+        voice = self._voice()
+        run = self._synth(voice["id"])
+        response = self.client.patch(f"/api/runs/{run['id']}", json={"name": "   "})
+        self.assertEqual(response.status_code, 422, response.text)
+        got = self.client.get(f"/api/runs/{run['id']}")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertIsNone(got.json().get("name"))
+
+    def test_naming_a_take_sets_keep(self) -> None:
+        voice = self._voice()
+        run = self._synth(voice["id"])
+        self.assertNotEqual(run.get("rating"), "keep")
+        response = self.client.patch(f"/api/runs/{run['id']}", json={"name": "saved take"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["rating"], "keep")
+        got = self.client.get(f"/api/runs/{run['id']}")
+        self.assertEqual(got.json()["rating"], "keep")
+        self.assertEqual(got.json()["name"], "saved take")
+
+    def test_naming_a_take_enrolls_voice_take(self) -> None:
+        voice = self._voice()
+        run = self._synth(voice["id"])
+        titled = self.client.patch(f"/api/runs/{run['id']}", json={"name": "  morning take  "})
+        self.assertEqual(titled.status_code, 200, titled.text)
+        profile = self.client.get(f"/api/voices/{voice['id']}")
+        self.assertEqual(profile.status_code, 200, profile.text)
+        artifact_id = f"vt_{run['id']}"
+        takes = [item for item in profile.json()["artifacts"] if item["id"] == artifact_id]
+        self.assertEqual(len(takes), 1)
+        enrolled = takes[0]
+        self.assertEqual(enrolled["role"], "reference")
+        self.assertEqual(enrolled["kind"], "take")
+        self.assertEqual(enrolled["name"], "morning take")
+        self.assertEqual(enrolled["audio_artifact_id"], run["output_artifact_id"])
+        self.assertEqual(enrolled["instruction"], "one process that does not suck.")
+        self.assertEqual(enrolled["settings"], {"run_id": run["id"]})
+        self.assertFalse(enrolled["stale"])
+
+        renamed = self.client.patch(f"/api/runs/{run['id']}", json={"name": "evening take"})
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        after = self.client.get(f"/api/voices/{voice['id']}").json()
+        takes = [item for item in after["artifacts"] if item["kind"] == "take"]
+        self.assertEqual(len(takes), 1)
+        self.assertEqual(takes[0]["id"], artifact_id)
+        self.assertEqual(takes[0]["name"], "evening take")
+
     def test_unsaved_takes_are_capped_saved_are_not(self) -> None:
         voice = self._voice()
         voice_id = voice["id"]

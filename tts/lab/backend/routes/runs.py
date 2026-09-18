@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
+from tts.lab.backend.services.candidates import REFERENCE, record_voice_artifact
+
 router = APIRouter()
 
 SAVED_RATING = "keep"
@@ -32,10 +34,14 @@ def _resume_pending(state: Any, rows: list[Any]) -> None:
 
 
 def _run_row(row: Any) -> dict[str, Any]:
+    snapshot = json.loads(row["request_json"])
+    raw_name = snapshot.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else None
     return {
         "id": row["id"],
         "voice_id": row["voice_id"],
-        "request_snapshot": json.loads(row["request_json"]),
+        "name": name,
+        "request_snapshot": snapshot,
         "output_artifact_id": row["output_artifact_id"],
         "effective_reference_snapshot": json.loads(row["effective_reference_json"]),
         "latency_ms": row["latency_ms"],
@@ -133,8 +139,29 @@ def patch_run(request: Request, run_id: str, body: RunPatch) -> dict[str, Any]:
     tags = body.tags if body.tags is not None else current["tags"]
     snapshot = current["request_snapshot"]
     if body.name is not None:
+        title = body.name.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="run name is required")
         snapshot = dict(snapshot)
-        snapshot["name"] = body.name
+        snapshot["name"] = title
+        rating = SAVED_RATING
+        voice_id = current.get("voice_id")
+        audio_id = current.get("output_artifact_id")
+        if voice_id and audio_id:
+            instruction = str(snapshot.get("produced_text") or snapshot.get("text") or "")
+            record_voice_artifact(
+                store,
+                str(voice_id),
+                artifact_id=f"vt_{run_id}",
+                role=REFERENCE,
+                kind="take",
+                name=title,
+                audio_artifact_id=str(audio_id),
+                provenance={
+                    "instruction": instruction,
+                    "settings": {"run_id": run_id},
+                },
+            )
     store.execute(
         "UPDATE runs SET rating=?, tags_json=?, request_json=? WHERE id=?",
         (rating, json.dumps(tags), json.dumps(snapshot), run_id),

@@ -1,9 +1,18 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, within } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
-import { TakesSection } from '@/features/synthesis/takes-section'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TakeCard, TakesSection } from '@/features/synthesis/takes-section'
 import type { RunItem, Voice } from '@/lib/api'
+import { renameRun } from '@/lib/api'
 import { useWorkspace } from '@/state/workspace'
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    renameRun: vi.fn(),
+  }
+})
 
 const voice = {
   id: 'voice-1',
@@ -64,4 +73,58 @@ describe('takes section', () => {
     expect(document.querySelector('.border-emerald-400')).toBeNull()
     expect(useWorkspace.getState().selectedRunId).toBeNull()
   })
+
+
+  it('titles a take with an untitled field, never the run hash', () => {
+    const hashed = { ...older, id: 'take_run_deadbeef', name: null }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <TakeCard
+          inspected={false}
+          onDelete={() => undefined}
+          onInspect={() => undefined}
+          onSave={() => undefined}
+          run={hashed}
+          voice={voice}
+        />
+      </QueryClientProvider>,
+    )
+
+    const title = screen.getByPlaceholderText('Untitled')
+    expect(title).toHaveValue('')
+    expect(screen.queryByDisplayValue(/take_run_/)).toBeNull()
+    expect(screen.queryByRole('heading', { name: /take_run_/ })).toBeNull()
+  })
+
+  it('commits a take title on blur and Enter', async () => {
+    vi.mocked(renameRun).mockResolvedValue({ ...older, name: 'morning take' })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <TakeCard
+          inspected={false}
+          onDelete={() => undefined}
+          onInspect={() => undefined}
+          onSave={() => undefined}
+          run={older}
+          voice={voice}
+        />
+      </QueryClientProvider>,
+    )
+
+    const title = screen.getByPlaceholderText('Untitled')
+    fireEvent.change(title, { target: { value: 'morning take' } })
+    fireEvent.blur(title)
+    await waitFor(() => expect(renameRun).toHaveBeenCalledWith(older.id, 'morning take'))
+
+    vi.mocked(renameRun).mockClear()
+    fireEvent.change(title, { target: { value: 'evening take' } })
+    fireEvent.keyDown(title, { key: 'Enter' })
+    await waitFor(() => expect(renameRun).toHaveBeenCalledWith(older.id, 'evening take'))
+  })
+})
+
+afterEach(() => {
+  vi.mocked(renameRun).mockReset()
 })

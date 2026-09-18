@@ -33,7 +33,7 @@ export type OriginalRow = {
   stale: boolean
 }
 
-/** A Breeze take. It carries no reference field, so a generation can never wear the ★. */
+/** A Breeze take. An unnamed generation cannot wear the ★; a named take enrolls elsewhere. */
 export type GenerationRow = {
   id: string
   label: string
@@ -104,7 +104,7 @@ function artifactFromVariant(variant: ReferenceVariant): DatedArtifact {
 export function voiceGenerations(runs: RunItem[]): GenerationRow[] {
   return runs.map((run) => ({
     id: run.id,
-    label: `take ${run.id}`,
+    label: run.name?.trim() || 'Untitled',
     audioArtifactId: run.output_artifact_id,
     durationS: run.duration_s ?? null,
     firstAudioMs: run.first_audio_ms ?? null,
@@ -211,7 +211,7 @@ export function voiceAssets(voice: Voice | undefined): VoiceAssets {
       } satisfies OriginalRow,
     })),
     ...artifacts
-      .filter((item) => !absorbedIds.has(item.id))
+      .filter((item) => !absorbedIds.has(item.id) && item.kind !== 'take')
       .map((item) => {
         const parent = parentRowId(item)
         return {

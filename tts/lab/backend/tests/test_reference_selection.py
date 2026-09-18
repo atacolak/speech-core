@@ -2,13 +2,14 @@
 """A selected reference's origin transcript is the audio's truth. CPU only.
 
 Activation picks the audio; synthesis resolves the same target for both the
-reference audio and its clean transcript. A GENERATION never becomes a
-reference.
+reference audio and its clean transcript. An unnamed GENERATION never becomes
+a reference. A named take enrolls as a kind=take reference.
 """
 
 from __future__ import annotations
 
 import re
+import json
 import sys
 import tempfile
 import unittest
@@ -338,6 +339,72 @@ class ReferenceResolutionTest(unittest.TestCase):
         self.assertEqual(
             self._voice(self.voice["id"])["default_reference_id"], self.second_reference
         )
+
+    def test_unnamed_run_id_cannot_be_activated_as_reference(self) -> None:
+        activated = self._activate(self.second_reference)
+        self.assertEqual(activated.status_code, 200, activated.text)
+        run = self._run("art_generation")
+
+        response = self._activate(run["id"])
+
+        self.assertIn(response.status_code, (404, 422))
+        self.assertEqual(
+            self._voice(self.voice["id"])["default_reference_id"], self.second_reference
+        )
+
+    def _name_take(self, artifact_id: str, *, name: str, produced_text: str) -> dict:
+        run = self._run(artifact_id)
+        self.store.execute(
+            "UPDATE runs SET request_json=? WHERE id=?",
+            (
+                json.dumps({"text": "requested say text", "produced_text": produced_text}),
+                run["id"],
+            ),
+        )
+        self.store.commit()
+        titled = self.client.patch(f"/api/runs/{run['id']}", json={"name": name})
+        self.assertEqual(titled.status_code, 200, titled.text)
+        return titled.json()
+
+    def test_named_take_can_be_activated_as_reference(self) -> None:
+        run = self._name_take("art_named_take", name="morning take", produced_text="produced take words")
+        artifact_id = f"vt_{run['id']}"
+
+        response = self._activate(artifact_id)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["default_reference_id"], artifact_id)
+
+    def test_named_take_ref_text_is_produced_text_not_primary(self) -> None:
+        run = self._name_take("art_named_take", name="morning take", produced_text="produced take words")
+        artifact_id = f"vt_{run['id']}"
+        activated = self._activate(artifact_id)
+        self.assertEqual(activated.status_code, 200, activated.text)
+
+        with patch(
+            "breeze_tts_qual.transcribe.transcribe_audio",
+            return_value={"text": ASR_TEXT, "words": []},
+        ) as transcribe:
+            resolved = resolve_synthesis_request(self.state, self._body())
+
+        self.assertEqual(transcribe.call_count, 0)
+        self.assertEqual(resolved.artifact.id, run["output_artifact_id"])
+        self.assertEqual(resolved.reference_path, self.store.get(run["output_artifact_id"]).path)
+        self.assertEqual(resolved.reference_text, "produced take words")
+        self.assertNotEqual(resolved.reference_text, FIRST_TRANSCRIPT)
+
+    def test_leftover_hop_files_are_unedited(self) -> None:
+        import subprocess
+
+        repo = Path(__file__).resolve().parents[4]
+        for rel in (
+            "tts/lab/backend/routes/leftover.py",
+            "tts/lab/backend/runtime/leftover.py",
+        ):
+            path = repo / rel
+            self.assertTrue(path.is_file(), rel)
+            head = subprocess.check_output(["git", "show", f"HEAD:{rel}"], cwd=repo)
+            self.assertEqual(path.read_bytes(), head, rel)
 
     def _source_without_transcript(self, artifact_id: str) -> str:
         """A second immutable source whose clean transcript is still unknown."""

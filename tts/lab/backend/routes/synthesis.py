@@ -21,6 +21,7 @@ from tts.lab.backend.services.candidates import REFERENCE
 from tts.lab.backend.services.references import (
     CLIP,
     SOURCE,
+    TAKE,
     ReferenceOrigin,
     clean_ref_text,
     reference_origin,
@@ -125,15 +126,28 @@ def _fill_ref_text(
 ) -> str:
     """The ref_text Breeze gets: one origin's own clean transcript.
 
-    `audio_artifact_id` is the audio this request sends. A transcription of a
-    non-primary origin is cached on that origin alone — never on the voice's
-    primary transcript columns — and an origin whose clean transcript is unknown
-    is transcribed or fails closed rather than borrowing the primary text.
+    `audio_artifact_id` is the audio this request sends. A named take uses the
+    artifact instruction (produced take text) and is never transcribed. A
+    transcription of a non-primary origin is cached on that origin alone —
+    never on the voice's primary transcript columns — and an origin whose
+    clean transcript is unknown is transcribed or fails closed rather than
+    borrowing the primary text.
     """
     origin = reference_origin(voice, reference_id, audio_artifact_id)
     text = clean_ref_text(origin.transcript)
     if text:
         return text
+    if origin.kind == TAKE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "missing_ref_text",
+                "message": (
+                    "clone needs a transcript of the reference audio. "
+                    "transcribe or paste it in the voice editor."
+                ),
+            },
+        )
     text = clean_ref_text(_asr_reference_text(reference_path))
     if not text:
         raise HTTPException(
@@ -162,8 +176,8 @@ class ResolvedSynthesis:
 def _reference_artifact(voice: dict[str, Any], reference_id: str | None) -> dict[str, Any] | None:
     """The approved reference artifact `reference_id` names, or None.
 
-    Activation applies this same role test: an experiment and a GENERATION are
-    never references.
+    Activation applies this same role test: an experiment and an unnamed
+    GENERATION are never references. A named take enrolls as kind=take.
     """
     if not reference_id:
         return None
@@ -177,7 +191,8 @@ def _reference_audio_id(voice: dict[str, Any], reference_id: str | None) -> str 
     """The audio artifact a selected reference id names, when it is not a legacy variant.
 
     A reference artifact, a clip, or a source artifact names its own audio. An
-    experiment, a GENERATION or a foreign id names nothing here.
+    experiment, an unnamed GENERATION or a foreign id names nothing here.
+    A named take's enrolled artifact names the take audio.
     """
     if not reference_id:
         return None
@@ -209,9 +224,9 @@ def _require_selectable_reference(voice: dict[str, Any], reference_id: str) -> N
     """An explicit request id obeys activation's rule: only a reference may be picked.
 
     A legacy variant, or anything naming an origin's own audio — an approved
-    reference artifact, a clip, a source — is selectable. A GENERATION's
-    artifact, an experiment or a foreign id is rejected, so it can never become
-    reference audio or ref_text.
+    reference artifact, a clip, a source, a named take — is selectable. An
+    unnamed GENERATION's artifact, an experiment or a foreign id is rejected,
+    so it can never become reference audio or ref_text.
     """
     if _reference_audio_id(voice, reference_id) is not None:
         return

@@ -190,4 +190,41 @@ describe('referenceOptions', () => {
     ])
     expect(referenceOptions(undefined)).toEqual([])
   })
+
+  it('lists a named take with its produced text and never as an original', () => {
+    const profile = voice({
+      artifacts: [
+        {
+          id: 'ref_orig',
+          role: 'reference',
+          kind: 'original',
+          name: 'source take',
+          audio_artifact_id: 'art_src',
+        },
+        {
+          id: 'vt_run_1',
+          role: 'reference',
+          kind: 'take',
+          name: 'morning take',
+          audio_artifact_id: 'art_take',
+          instruction: 'produced take words',
+        },
+      ],
+      default_reference_id: 'vt_run_1',
+    })
+
+    const options = referenceOptions(profile)
+    const take = options.find((item) => item.id === 'vt_run_1')
+
+    expect(options.map((item) => item.id)).not.toContain(profile.latest_take_id)
+    expect(take).toMatchObject({
+      target: 'vt_run_1',
+      label: '★ morning take',
+      selected: true,
+      isOriginal: false,
+      transcript: 'produced take words',
+      audioArtifactId: 'art_take',
+    })
+    expect(take?.transcript).not.toBe('legacy A words')
+  })
 })

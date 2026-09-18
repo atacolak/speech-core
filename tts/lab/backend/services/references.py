@@ -24,6 +24,7 @@ PRIMARY = "primary"
 SOURCE = "source"
 CLIP = "clip"
 UNKNOWN = "unknown"
+TAKE = "take"
 
 # Breeze conditions on `ref_text`: prose only. The analysis boundary strips
 # diarization markup (`services/sources.py`); a stored top-level transcript may
@@ -316,9 +317,11 @@ class ReferenceOrigin:
 
     `kind` is `primary` for the voice's own source audio (and for a legacy
     variant or no selection at all), `source` for a `voice_sources` row, `clip`
-    for a `clips` row, and `unknown` when the audio belongs to no origin row of
-    this voice. An `unknown` origin carries no transcript on purpose: one
-    origin's audio is never paired with another origin's text.
+    for a `clips` row, `take` for a named generation enrolled as a reference,
+    and `unknown` when the audio belongs to no origin row of this voice. An
+    `unknown` origin carries no transcript on purpose: one origin's audio is
+    never paired with another origin's text. A `take` origin's transcript is
+    the artifact instruction (produced take text), never another origin's.
     """
 
     kind: str
@@ -338,14 +341,29 @@ def reference_origin(
 ) -> ReferenceOrigin:
     """The origin a request sends, and that origin's own transcript.
 
-    `audio_artifact_id` is the audio the request actually sends. When it is the
-    voice's own source audio, or a legacy variant / no selection at all, the
-    origin is the primary and its transcript is `reference_transcript`'s ladder.
-    Any other audio must find an origin row that owns it — the row a selected
-    artifact declares, the clip it names, or the `voice_sources` / clip row whose
-    own artifact it is — because one origin's audio is never given another
-    origin's text.
+    `audio_artifact_id` is the audio the request actually sends. A named take
+    (`kind=take`) uses that artifact's instruction as its origin transcript.
+    When the audio is the voice's own source audio, or a legacy variant / no
+    selection at all, the origin is the primary and its transcript is
+    `reference_transcript`'s ladder. Any other audio must find an origin row
+    that owns it — the row a selected artifact declares, the clip it names, or
+    the `voice_sources` / clip row whose own artifact it is — because one
+    origin's audio is never given another origin's text. An unnamed GENERATION
+    is not an origin; a named take is.
     """
+    selected = next(
+        (item for item in voice.get("artifacts") or [] if item["id"] == reference_id),
+        None,
+    )
+    if selected is not None and selected.get("kind") == TAKE:
+        audio = None if audio_artifact_id is None else str(audio_artifact_id)
+        if audio is None:
+            audio = str(selected.get("audio_artifact_id") or "") or None
+        return ReferenceOrigin(
+            TAKE,
+            audio,
+            str(selected.get("instruction") or "").strip(),
+        )
     audio = None if audio_artifact_id is None else str(audio_artifact_id)
     primary_audio = str(voice.get("source_audio_artifact_id") or "")
     if audio is None or audio == primary_audio:

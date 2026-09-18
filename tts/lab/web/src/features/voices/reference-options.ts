@@ -7,7 +7,7 @@ export type ReferenceClip = {
   clean_transcript?: string | null
 }
 
-/** One row of the GENERATE reference picker. A run/take is never one. */
+/** One row of the GENERATE reference picker. An unnamed run is never one. */
 export type ReferenceOption = {
   /** The option's identity: the stored reference id it matches, and its React key. */
   id: string
@@ -15,7 +15,7 @@ export type ReferenceOption = {
   target: string
   label: string
   selected: boolean
-  /** An ORIGINAL (enrolled source or clip). ★ marks an original or a reference, never a generation. */
+  /** An ORIGINAL (enrolled source or clip). ★ marks an original or a reference, never an unnamed generation. */
   isOriginal: boolean
   /** The selected origin's own clean transcript, never another origin's text. */
   transcript: string
@@ -30,6 +30,7 @@ type Candidate = {
   audioArtifactId: string
   /** Set when the candidate is an artifact, so its declared source can win. */
   sourceId?: string | null
+  instruction?: string | null
   stale: boolean
 }
 
@@ -81,6 +82,7 @@ function referenceCandidates(voice: Voice): Candidate[] {
       name: item.name,
       audioArtifactId: item.audio_artifact_id,
       sourceId: item.source_id ?? null,
+      instruction: item.instruction ?? null,
       stale: Boolean(item.stale),
     }))
   }
@@ -123,6 +125,9 @@ function primaryReferenceId(voice: Voice, candidates: Candidate[]): string | nul
  * An origin with no transcript shows empty, never another origin's words.
  */
 function resolvedTranscript(voice: Voice, clips: ReferenceClip[], candidate: Candidate): string {
+  if (candidate.kind === 'take') {
+    return (candidate.instruction ?? '').trim()
+  }
   if (candidate.sourceId) {
     const source = (voice.sources ?? []).find((item) => item.id === candidate.sourceId)
     if (source) {

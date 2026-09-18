@@ -192,6 +192,7 @@ export type RunAlignment = {
 export type RunItem = {
   id: string
   voice_id: string
+  name?: string | null
   request_snapshot?: {
     text?: string
     steer?: string
@@ -723,6 +724,18 @@ export async function rateRun(runId: string, rating: string): Promise<RunItem> {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ rating }),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'runs')
+  }
+  return (await response.json()) as RunItem
+}
+
+export async function renameRun(runId: string, name: string): Promise<RunItem> {
+  const response = await apiFetch(`/api/runs/${runId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
   })
   if (!response.ok) {
     throw await readError(response, 'runs')

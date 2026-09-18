@@ -338,20 +338,41 @@ describe('voice assets', () => {
     expect(assets.originals.map((row) => row.id)).not.toContain('run_1')
     expect(assets.originals.map((row) => row.audioArtifactId)).not.toContain('art_take')
   })
+
+  it('keeps a named take artifact out of the originals tree', () => {
+    const base = lineageVoice()
+    const assets = voiceAssets({
+      ...base,
+      artifacts: [
+        ...(base.artifacts ?? []),
+        artifact({
+          id: 'vt_run_1',
+          role: 'reference',
+          kind: 'take',
+          name: 'morning take',
+          audio_artifact_id: 'art_take',
+          instruction: 'produced take words',
+        }),
+      ],
+    })
+    expect(assets.originals.map((row) => row.id)).not.toContain('vt_run_1')
+    expect(assets.originals.map((row) => row.label)).not.toContain('morning take')
+  })
 })
 
 describe('voice generations', () => {
-  it('names each Breeze take by its run, with the audio it produced', () => {
+  it('names a titled take by its run name and leaves untitled takes quiet', () => {
     expect(voiceGenerations([RUN])).toEqual([
       {
         id: 'run_1',
-        label: 'take run_1',
+        label: 'Untitled',
         audioArtifactId: 'art_take',
         durationS: 6,
         firstAudioMs: 120,
         createdAt: '2026-09-14T00:00:00Z',
       },
     ])
+    expect(voiceGenerations([{ ...RUN, name: 'morning take' }])[0]?.label).toBe('morning take')
   })
 
   it('carries no reference marker for a take to wear', () => {
@@ -364,7 +385,7 @@ describe('voice generations', () => {
     ).toEqual([
       {
         id: 'run_1',
-        label: 'take run_1',
+        label: 'Untitled',
         audioArtifactId: 'art_take',
         durationS: null,
         firstAudioMs: null,

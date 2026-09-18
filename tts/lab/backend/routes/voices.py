@@ -197,7 +197,8 @@ def _artifacts_json(store, row: Any, sources: list[dict[str, Any]]) -> list[dict
             item["processor_config"] = auk_processor_config(item)
         item.pop("parent_variant_id", None)
         source = by_source.get(art["source_id"]) or primary
-        if source is not None and item["kind"] != ORIGINAL_KIND:
+        # A named take is its own audio, never a processed keep-crop variant.
+        if source is not None and item["kind"] not in (ORIGINAL_KIND, "take"):
             artifact_id = str(source["artifact_id"])
             if artifact_id not in shas:
                 shas[artifact_id] = store.get(artifact_id).sha256
@@ -708,8 +709,9 @@ def activate_variant(request: Request, voice_id: str, body: ActivateBody) -> dic
         set_default_reference(store, voice_id, target["id"])
         store.commit()
         return get_voice_or_404(store, voice_id)
-    # An enrolled reference artifact, not a legacy variant. A GENERATION, an
-    # experiment or a foreign id is never eligible, and stored ids stay put.
+    # An enrolled reference artifact, not a legacy variant. An unnamed
+    # GENERATION, an experiment or a foreign id is never eligible. A named
+    # take enrolls as kind=take and is selectable. Stored ids stay put.
     artifact = None
     if body.variant_id:
         artifact = next(

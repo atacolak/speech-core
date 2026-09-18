@@ -7,6 +7,7 @@ import {
   formatApiError,
   patchVoice,
   rateRun,
+  renameRun,
 } from '@/lib/api'
 import type { RunItem, Voice } from '@/lib/api'
 import { clampTakeLimit, DEFAULT_TAKE_LIMIT } from '@/lib/generation'
@@ -35,11 +36,28 @@ export function TakeCard({
   const saved = run.rating === 'keep'
   const guidance = snapshot?.guidance
   const transcript = takeTranscript(run)
+  const client = useQueryClient()
+  const [title, setTitle] = useState(run.name?.trim() ?? '')
+  const rename = useMutation({
+    mutationFn: (name: string) => renameRun(run.id, name),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['runs'] })
+      void client.invalidateQueries({ queryKey: ['voices'] })
+    },
+    onError: (error) => toast.error(formatApiError(error)),
+  })
+  const commitTitle = () => {
+    const next = title.trim()
+    if (!next || next === (run.name?.trim() ?? '')) {
+      setTitle(run.name?.trim() ?? '')
+      return
+    }
+    rename.mutate(next)
+  }
   const cfgLabel =
     guidance?.mode === 'dual'
       ? `dual ${guidance.reference ?? '—'}/${guidance.instruction ?? '—'}`
       : `cfg ${guidance?.cfg ?? '—'}`
-
   return (
     <li>
       <div
@@ -49,6 +67,20 @@ export function TakeCard({
         )}
       >
         <div className="w-full text-left">
+          <input
+            aria-label="Take title"
+            className="w-full bg-transparent text-xs text-zinc-200 outline-none placeholder:text-zinc-500"
+            onBlur={commitTitle}
+            onChange={(event) => setTitle(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                commitTitle()
+              }
+            }}
+            placeholder="Untitled"
+            value={title}
+          />
           <p className="text-xs text-zinc-300">
             {voice.name}
             {saved ? ' · saved' : ''}
