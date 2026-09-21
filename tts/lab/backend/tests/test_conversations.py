@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Conversation sessions, turns, and unsaved ring. not on the voicecat path."""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPO))
+
+from tts.lab.backend.services.conversations import (
+    begin_session,
+    clamp_ring_limit,
+    end_session,
+    insert_turn,
+    open_conversation_id,
+    prune_unsaved_conversations,
+)
+from tts.lab.backend.store.artifacts import ArtifactStore
+from tts.lab.backend.store.session import (
+    read_conversation_ring_limit,
+    write_conversation_ring_limit,
+)
+from tts.wav import write_wav
+
+
+def _tone(path: Path, *, freq: float = 440.0, seconds: float = 0.2) -> Path:
+    sr = 24000
+    t = np.arange(int(sr * seconds), dtype=np.float32) / sr
+    write_wav(path, sr, 0.1 * np.sin(2 * np.pi * freq * t))
+    return path
+
+
+class ConversationsServiceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = ArtifactStore(self.root)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_hold_mints_then_reuses_open_conversation(self) -> None:
+        first = begin_session(self.store, None)
+        self.assertTrue(first.startswith("cv_"))
+        self.assertEqual(begin_session(self.store, None), first)
+        self.assertEqual(open_conversation_id(self.store), first)
+        again = begin_session(self.store, None, reuse_open=False)
+        self.assertNotEqual(again, first)
+        self.assertTrue(again.startswith("cv_"))
+        self.assertEqual(open_conversation_id(self.store), again)
+        ended = self.store.execute(
+            "SELECT ended_at FROM conversations WHERE id = ?", (first,)
+        ).fetchone()
+        self.assertIsNotNone(ended["ended_at"])
+
+    def test_new_session_id_ends_open_and_opens_new(self) -> None:
+        first = begin_session(self.store, "desk-1")
+        self.assertEqual(first, "desk-1")
+        self.assertEqual(begin_session(self.store, "desk-1"), first)
+        second = begin_session(self.store, "desk-2")
+        self.assertEqual(second, "desk-2")
+        row = self.store.execute(
+            "SELECT ended_at FROM conversations WHERE id = ?", (first,)
+        ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+        self.assertEqual(open_conversation_id(self.store), "desk-2")
+        end_session(self.store)
+        reopened = begin_session(self.store, "desk-1")
+        self.assertTrue(reopened.startswith("cv_"))
+        self.assertNotEqual(reopened, "desk-1")
+        self.assertEqual(open_conversation_id(self.store), reopened)
+
+    def test_end_session_prunes_unsaved_ring_and_keeps_saved(self) -> None:
+        write_conversation_ring_limit(self.root, 50)
+        saved_id = begin_session(self.store, None)
+        audio = self.store.import_audio(_tone(self.root / "saved.wav"))
+        turn = insert_turn(
+            self.store,
+            saved_id,
+            role="assistant",
+            text="kept",
+            audio_artifact_id=audio.id,
+        )
+        pin_reason = f"turn:{turn['id']}"
+        self.store.pin(audio.id, reason=pin_reason)
+        self.store.execute(
+            "UPDATE conversations SET saved = 1 WHERE id = ?", (saved_id,)
+        )
+        self.store.commit()
+        self.assertEqual(end_session(self.store), saved_id)
+
+        unsaved: list[str] = []
+        for index in range(5):
+            cid = begin_session(self.store, None)
+            insert_turn(
+                self.store,
+                cid,
+                role="assistant",
+                text=f"unsaved-{index}",
+            )
+            self.assertEqual(end_session(self.store), cid)
+            unsaved.append(cid)
+
+        remaining_before = self.store.execute(
+            "SELECT id FROM conversations WHERE saved = 0 ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        self.assertEqual([row["id"] for row in remaining_before], unsaved)
+
+        pruned = prune_unsaved_conversations(self.store, 3)
+        self.assertEqual(pruned, 2)
+        remaining = self.store.execute(
+            "SELECT id FROM conversations WHERE saved = 0 ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        self.assertEqual([row["id"] for row in remaining], unsaved[-3:])
+        gone = unsaved[:2]
+        for cid in gone:
+            self.assertIsNone(
+                self.store.execute(
+                    "SELECT 1 FROM conversations WHERE id = ?", (cid,)
+                ).fetchone()
+            )
+            self.assertIsNone(
+                self.store.execute(
+                    "SELECT 1 FROM conversation_turns WHERE conversation_id = ?",
+                    (cid,),
+                ).fetchone()
+            )
+
+        self.assertIsNotNone(
+            self.store.execute(
+                "SELECT 1 FROM conversations WHERE id = ? AND saved = 1",
+                (saved_id,),
+            ).fetchone()
+        )
+        self.assertIsNotNone(
+            self.store.execute(
+                "SELECT 1 FROM conversation_turns WHERE conversation_id = ?",
+                (saved_id,),
+            ).fetchone()
+        )
+        self.assertIsNotNone(
+            self.store.execute(
+                "SELECT 1 FROM pins WHERE artifact_id = ? AND reason = ?",
+                (audio.id, pin_reason),
+            ).fetchone()
+        )
+        self.assertTrue(self.store.path_for(audio.id).is_file())
+
+    def test_ring_limit_clamps_1_to_50_default_3(self) -> None:
+        self.assertEqual(clamp_ring_limit(None), 3)
+        self.assertEqual(clamp_ring_limit("junk"), 3)
+        self.assertEqual(clamp_ring_limit(0), 1)
+        self.assertEqual(clamp_ring_limit(51), 50)
+        self.assertEqual(clamp_ring_limit(3), 3)
+        self.assertIsNone(read_conversation_ring_limit(self.root))
+        write_conversation_ring_limit(self.root, 7)
+        self.assertEqual(read_conversation_ring_limit(self.root), 7)
+
+    def test_insert_turn_allocates_msg_seq_and_single_chosen(self) -> None:
+        cid = begin_session(self.store, None)
+        first = insert_turn(self.store, cid, role="assistant", text="one")
+        self.assertEqual(first["msg_seq"], 0)
+        self.assertEqual(first["variation_seq"], 0)
+        self.assertEqual(first["chosen"], 1)
+        second = insert_turn(self.store, cid, role="assistant", text="two")
+        self.assertEqual(second["msg_seq"], 1)
+        self.assertEqual(second["variation_seq"], 0)
+        third = insert_turn(
+            self.store,
+            cid,
+            role="assistant",
+            text="one-b",
+            msg_seq=0,
+            variation_seq=1,
+            chosen=1,
+        )
+        self.assertEqual(third["msg_seq"], 0)
+        self.assertEqual(third["variation_seq"], 1)
+        self.assertEqual(third["chosen"], 1)
+        sibling = self.store.execute(
+            "SELECT chosen FROM conversation_turns WHERE id = ?",
+            (first["id"],),
+        ).fetchone()
+        self.assertEqual(sibling["chosen"], 0)
+        chosen_count = self.store.execute(
+            """
+            SELECT COUNT(*) AS n FROM conversation_turns
+            WHERE conversation_id = ? AND msg_seq = 0 AND chosen = 1
+            """,
+            (cid,),
+        ).fetchone()
+        self.assertEqual(chosen_count["n"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

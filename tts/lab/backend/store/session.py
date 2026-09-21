@@ -46,3 +46,19 @@ def write_active_voice_id(root: Path | str, voice_id: str | None) -> str | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return cleaned
+
+
+def read_conversation_ring_limit(root: Path | str) -> int | None:
+    value = read_session(root).get("conversation_ring_limit")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def write_conversation_ring_limit(root: Path | str, value: int) -> None:
+    path = _path(root)
+    payload = read_session(root)
+    payload["conversation_ring_limit"] = int(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

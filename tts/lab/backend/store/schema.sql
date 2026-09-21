@@ -224,3 +224,31 @@ CREATE TABLE IF NOT EXISTS runs (
     alignment_json TEXT,
     FOREIGN KEY (output_artifact_id) REFERENCES artifacts(id)
 );
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    saved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    msg_seq INTEGER NOT NULL,
+    variation_seq INTEGER NOT NULL DEFAULT 0,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    text TEXT NOT NULL DEFAULT '',
+    audio_artifact_id TEXT,
+    voice_id TEXT,
+    steer TEXT,
+    generation_json TEXT,
+    alignment_json TEXT,
+    chosen INTEGER NOT NULL DEFAULT 1,
+    started_at REAL,
+    ended_at REAL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+    FOREIGN KEY (audio_artifact_id) REFERENCES artifacts(id)
+);
