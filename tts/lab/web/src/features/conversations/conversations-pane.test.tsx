@@ -1,8 +1,18 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ConversationDetail, ConversationSummary, ConversationTurn } from '@/lib/api'
-import { fetchConversation, fetchConversations } from '@/lib/api'
+import type { ConversationDetail, ConversationSummary, ConversationTurn, RuntimeInfo } from '@/lib/api'
+import {
+  ApiError,
+  chooseTurnVariation,
+  fetchConversation,
+  fetchConversations,
+  fetchRuntime,
+  putConversationRingLimit,
+  regenerateTurn,
+  saveConversation,
+  saveTurnVariation,
+} from '@/lib/api'
 import { ALIGNED_TITLE } from '@/lib/spoken-alignment'
 
 const player = vi.hoisted(() => ({
@@ -29,6 +39,12 @@ vi.mock('@/lib/api', async (importOriginal) => {
     ...actual,
     fetchConversations: vi.fn(),
     fetchConversation: vi.fn(),
+    fetchRuntime: vi.fn(),
+    chooseTurnVariation: vi.fn(),
+    regenerateTurn: vi.fn(),
+    saveTurnVariation: vi.fn(),
+    saveConversation: vi.fn(),
+    putConversationRingLimit: vi.fn(),
   }
 })
 
@@ -58,6 +74,16 @@ const SUMMARY: ConversationSummary = {
   ended_at: '2026-09-21T12:05:00Z',
   saved: false,
   turn_count: 2,
+}
+
+const RUNTIME: RuntimeInfo = {
+  selected: 'E2',
+  status: 'unloaded',
+  state: 'unloaded',
+  leftover_parked: false,
+  not_a_pin_swap: true,
+  voicecat_path: true,
+  live_call_active: false,
 }
 
 function wav(): ArrayBuffer {
@@ -109,6 +135,12 @@ describe('conversations pane', () => {
     player.onPlayheadChange = undefined
     vi.mocked(fetchConversations).mockResolvedValue([SUMMARY])
     vi.mocked(fetchConversation).mockResolvedValue(detail([]))
+    vi.mocked(fetchRuntime).mockResolvedValue(RUNTIME)
+    vi.mocked(chooseTurnVariation).mockResolvedValue(turn({}))
+    vi.mocked(regenerateTurn).mockResolvedValue(turn({}))
+    vi.mocked(saveTurnVariation).mockResolvedValue({ run_id: 'run_1' })
+    vi.mocked(saveConversation).mockResolvedValue({ ...SUMMARY, saved: true })
+    vi.mocked(putConversationRingLimit).mockResolvedValue({ ring_limit: 3 })
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo) => {
@@ -237,5 +269,109 @@ describe('conversations pane', () => {
       player.onPlayingChange?.(false)
     })
     expect(document.querySelector('mark')).toBeNull()
+  })
+
+  it('selecting a variation posts choose and re-renders chosen', async () => {
+    let chosenId = 'ct_v0'
+    const variations = (): ConversationTurn[] => [
+      turn({
+        id: 'ct_v0',
+        msg_seq: 0,
+        variation_seq: 0,
+        text: 'first take',
+        chosen: chosenId === 'ct_v0',
+        audio_artifact_id: 'art_1',
+      }),
+      turn({
+        id: 'ct_v1',
+        msg_seq: 0,
+        variation_seq: 1,
+        text: 'second take',
+        chosen: chosenId === 'ct_v1',
+        audio_artifact_id: 'art_2',
+      }),
+    ]
+    vi.mocked(fetchConversation).mockImplementation(async () => detail(variations()))
+    vi.mocked(chooseTurnVariation).mockImplementation(async (_conversationId, turnId) => {
+      chosenId = turnId
+      return variations().find((row) => row.id === turnId)!
+    })
+    renderPane()
+    await openSession()
+    expect(await screen.findByRole('button', { name: 'V1' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByRole('button', { name: 'V2' })).not.toHaveAttribute('aria-current')
+    fireEvent.click(screen.getByRole('button', { name: 'V2' }))
+    await waitFor(() => {
+      expect(chooseTurnVariation).toHaveBeenCalledWith('cv_1', 'ct_v1')
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'V2' })).toHaveAttribute('aria-current', 'true')
+    })
+  })
+
+  it('regenerate is disabled while live_call_active', async () => {
+    vi.mocked(fetchRuntime).mockResolvedValue({ ...RUNTIME, live_call_active: true })
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([turn({ id: 'ct_asst', msg_seq: 0, text: 'hello', audio_artifact_id: 'art_1' })]),
+    )
+    renderPane()
+    await openSession()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /regenerate/i })).toBeDisabled()
+    })
+
+    cleanup()
+    vi.mocked(fetchRuntime).mockResolvedValue({ ...RUNTIME, live_call_active: false })
+    renderPane()
+    await openSession()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /regenerate/i })).toBeEnabled()
+    })
+  })
+
+  it('regenerate surfaces the 409 live_call_active message', async () => {
+    vi.mocked(fetchRuntime).mockResolvedValue({ ...RUNTIME, live_call_active: false })
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([turn({ id: 'ct_asst', msg_seq: 0, text: 'hello', audio_artifact_id: 'art_1' })]),
+    )
+    vi.mocked(regenerateTurn).mockRejectedValue(
+      new ApiError('conversations', 409, {
+        code: 'live_call_active',
+        message: 'live call owns the engine',
+      }),
+    )
+    renderPane()
+    await openSession()
+    fireEvent.click(await screen.findByRole('button', { name: /regenerate/i }))
+    expect(await screen.findByText('live call owns the engine')).toBeInTheDocument()
+  })
+
+  it('save to voice posts the variation save and save posts the conversation save', async () => {
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([turn({ id: 'ct_asst', msg_seq: 0, text: 'hello', audio_artifact_id: 'art_1' })]),
+    )
+    renderPane()
+    await openSession()
+    fireEvent.click(await screen.findByRole('button', { name: 'Save to voice' }))
+    await waitFor(() => {
+      expect(saveTurnVariation).toHaveBeenCalledWith('cv_1', 'ct_asst')
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => {
+      expect(saveConversation).toHaveBeenCalledWith('cv_1')
+    })
+  })
+
+  it('ring limit input puts the clamped value', async () => {
+    vi.mocked(putConversationRingLimit).mockResolvedValue({ ring_limit: 50 })
+    renderPane()
+    const input = await screen.findByRole('spinbutton', { name: /ring/i })
+    fireEvent.change(input, { target: { value: '51' } })
+    await waitFor(() => {
+      expect(putConversationRingLimit).toHaveBeenCalledWith(51)
+    })
+    await waitFor(() => {
+      expect(input).toHaveValue(50)
+    })
   })
 })
