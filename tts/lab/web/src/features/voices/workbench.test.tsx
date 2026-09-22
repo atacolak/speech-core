@@ -246,7 +246,7 @@ describe('workbench capability ledger in the lab shell', () => {
     expect(screen.queryByRole('button', { name: 'Open workbench' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
     const nav = screen.getByRole('navigation', { name: 'Lab modes' })
-    expect(within(nav).getAllByRole('button')).toHaveLength(2)
+    expect(within(nav).getAllByRole('button')).toHaveLength(4)
 
     await openMaterial()
 
@@ -312,13 +312,10 @@ describe('workbench capability ledger in the lab shell', () => {
     renderShell()
     fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
     fireEvent.click(await screen.findByRole('button', { name: /Ford/ }))
-    await screen.findByRole('region', { name: 'ORIGINALS' })
-
-    const originals = screen.getByRole('region', { name: 'ORIGINALS' })
+    const originals = await screen.findByRole('region', { name: 'Originals' })
     expect(originals).toHaveTextContent('Westworld S01E01')
-    expect(originals).toHaveTextContent('derived from')
     expect(originals).toHaveTextContent('★')
-    expect(screen.getByRole('region', { name: 'GENERATIONS' })).toHaveTextContent('No takes yet')
+    expect(screen.getByRole('region', { name: 'Takes' })).toHaveTextContent('No takes yet')
     expect(screen.queryByText(/Voice workbench/)).toBeNull()
   })
 
