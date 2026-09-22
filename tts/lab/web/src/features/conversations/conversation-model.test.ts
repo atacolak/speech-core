@@ -60,7 +60,7 @@ describe('conversation model', () => {
       turn({ id: 'c', msg_seq: 3, voice_id: 'v2' }),
     ])
     expect(speakerBefore(messages, 0)).toEqual({ role: 'user', voiceId: null })
-    expect(speakerBefore(messages, 1)).toEqual({ role: 'assistant', voiceId: 'v1' })
+    expect(speakerBefore(messages, 1)).toBeNull()
     expect(speakerBefore(messages, 2)).toBeNull()
     expect(speakerBefore(messages, 3)).toEqual({ role: 'assistant', voiceId: 'v2' })
   })

@@ -42,9 +42,17 @@ def _summary(store: Any, row: Any) -> dict[str, Any]:
         (row["id"],),
     ).fetchone()
     title = row["title"] if "title" in row.keys() else None
+    if not (isinstance(title, str) and title.strip()):
+        first = store.execute(
+            "SELECT text FROM conversation_turns"
+            " WHERE conversation_id = ? AND role = 'user'"
+            " ORDER BY msg_seq LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        title = str(first["text"]).strip() if first and first["text"] else None
     return {
         "id": row["id"],
-        "title": title,
+        "title": title or None,
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
         "saved": bool(row["saved"]),

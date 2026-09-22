@@ -94,7 +94,10 @@ function TurnView({ turn }: { turn: ConversationTurn }) {
   const highlight = playing ? highlightAt(playheadS, turn.text, turn.alignment, null) : null
 
   return (
-    <article aria-label={`${turn.role} turn`} className="flex w-[30%] min-w-56 max-w-md flex-col gap-1">
+    <article
+      aria-label={`${turn.role} turn`}
+      className="flex w-[42%] min-w-64 max-w-lg flex-col gap-1.5 rounded-2xl border border-zinc-700/80 bg-zinc-900/70 px-3 py-2.5"
+    >
       {artifactId && timeline ? (
         <TakePlayer
           timeline={timeline}
@@ -104,7 +107,7 @@ function TurnView({ turn }: { turn: ConversationTurn }) {
           onPlayingChange={setPlaying}
         />
       ) : null}
-      <p className="whitespace-pre-wrap break-words text-sm italic text-zinc-400">
+      <p className="whitespace-pre-wrap break-words text-base italic leading-6 text-zinc-400">
         {spokenText(turn.text, highlight)}
       </p>
     </article>
@@ -340,7 +343,7 @@ export function ConversationsPane() {
                     <button
                       type="button"
                       disabled={liveCallActive}
-                      className="rounded-md px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={() => {
                         if (!selectedId) return
                         regenerate.mutate({ conversationId: selectedId, turnId: turn.id })
@@ -352,7 +355,7 @@ export function ConversationsPane() {
                   {turn.audio_artifact_id ? (
                     <button
                       type="button"
-                      className="rounded-md px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+                      className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
                       onClick={() => {
                         if (!selectedId) return
                         saveVariation.mutate({ conversationId: selectedId, turnId: turn.id })

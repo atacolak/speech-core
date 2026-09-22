@@ -48,10 +48,11 @@ export function speakerBefore(
   const current = messages[index]
   const voiceId = chosenTurn(current).voice_id
   if (index === 0) return { role: current.role, voiceId }
-  const previous = messages[index - 1]
-  const previousVoice = chosenTurn(previous).voice_id
-  if (previous.role !== current.role || previousVoice !== voiceId) {
-    return { role: current.role, voiceId }
+  if (current.role !== 'assistant') return null
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (messages[i].role !== 'assistant') continue
+    const previous = chosenTurn(messages[i]).voice_id
+    return previous !== voiceId ? { role: 'assistant', voiceId } : null
   }
   return null
 }
