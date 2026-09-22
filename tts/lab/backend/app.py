@@ -13,6 +13,7 @@ from tts.lab.backend.runtime.auk import AukRuntimeManager
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.routes import (
     auk,
+    conversations,
     leftover,
     plan,
     progressive,
@@ -58,6 +59,7 @@ def create_app(
     app.include_router(synthesis.router)
     app.include_router(progressive.router)
     app.include_router(runs.router)
+    app.include_router(conversations.router)
     if seed_samples:
         from tts.lab.backend.services.samples import ensure_sample_voices
 
