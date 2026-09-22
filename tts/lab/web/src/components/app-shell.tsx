@@ -1,5 +1,7 @@
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import { TopBar } from '@/components/top-bar'
+import { ConversationsPane } from '@/features/conversations/conversations-pane'
+import { DeskPane } from '@/features/desk/desk-pane'
 import { InspectorPane } from '@/features/inspector/inspector-pane'
 import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
 import { VoiceLab } from '@/features/voice-lab/voice-lab'
@@ -32,8 +34,12 @@ export function AppShell() {
             </>
           ) : null}
         </Group>
-      ) : (
+      ) : mode === 'voice-lab' ? (
         <VoiceLab />
+      ) : mode === 'conversations' ? (
+        <ConversationsPane />
+      ) : (
+        <DeskPane />
       )}
     </div>
   )

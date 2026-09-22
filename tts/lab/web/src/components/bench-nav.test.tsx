@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from '@/app'
+import { useWorkspace } from '@/state/workspace'
 
 const RUNTIME = {
   selected: 'E2',
@@ -104,6 +105,9 @@ function labFetch({
     if (url.endsWith('/api/fixtures/steers')) {
       return json({ items: [] })
     }
+    if (url.includes('/api/conversations')) {
+      return json({ items: [] })
+    }
     return json({ detail: 'missing' }, 404)
   })
 }
@@ -117,20 +121,30 @@ function renderApp() {
   )
 }
 
-/** GENERATE | VOICE LAB is the whole top nav; material is a selection inside the lab. */
+/** GENERATE | VOICE LAB | CONVERSATIONS | DESK is the whole top nav. */
 describe('lab modes', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', labFetch())
+    useWorkspace.setState({ mode: 'generate' })
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    useWorkspace.setState({ mode: 'generate' })
+    window.history.replaceState({}, '', '/')
   })
 
   it('swaps GENERATE for VOICE LAB and keeps Sources out of the nav', async () => {
     renderApp()
     const nav = screen.getByRole('navigation', { name: 'Lab modes' })
-    expect(within(nav).getAllByRole('button')).toHaveLength(2)
+    const buttons = within(nav).getAllByRole('button')
+    expect(buttons).toHaveLength(4)
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      'GENERATE',
+      'VOICE LAB',
+      'CONVERSATIONS',
+      'DESK',
+    ])
     expect(within(nav).queryByRole('button', { name: /WORKBENCH|SOURCES/ })).toBeNull()
     const generate = screen.getByRole('button', { name: 'GENERATE' })
     const voiceLab = screen.getByRole('button', { name: 'VOICE LAB' })
@@ -157,6 +171,27 @@ describe('lab modes', () => {
     expect(screen.queryByRole('heading', { name: 'Material' })).toBeNull()
   })
 
+  it('swaps GENERATE for CONVERSATIONS and DESK', async () => {
+    renderApp()
+    expect(screen.getByRole('button', { name: 'GENERATE' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByText(/^Say$/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'CONVERSATIONS' }))
+
+    expect(screen.getByRole('button', { name: 'CONVERSATIONS' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    )
+    expect(screen.getByRole('heading', { name: 'CONVERSATIONS' })).toBeInTheDocument()
+    expect(screen.queryByText(/^Say$/i)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'DESK' }))
+
+    expect(screen.getByRole('button', { name: 'DESK' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByRole('heading', { name: 'DESK' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'CONVERSATIONS' })).toBeNull()
+  })
+
   it('says so when the library is empty', async () => {
     vi.stubGlobal('fetch', labFetch({ voices: [], sources: [] }))
     renderApp()
@@ -172,12 +207,12 @@ describe('lab modes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
     fireEvent.click(await screen.findByRole('button', { name: /Ford/ }))
 
-    const originals = await screen.findByRole('region', { name: 'ORIGINALS' })
+    const originals = await screen.findByRole('region', { name: 'Originals' })
     expect(originals).toHaveTextContent('8.00s')
-    expect(await screen.findByRole('region', { name: 'GENERATIONS' })).toHaveTextContent('take run_1')
+    expect(await screen.findByRole('region', { name: 'Takes' })).toHaveTextContent('6.00s')
     // Not the retired piles, not the parked workbench skeleton: no permanent
     // inspector, no empty compare, no second workbench surface.
-    for (const name of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES', 'TAKES']) {
+    for (const name of ['REFERENCES', 'SOURCE MATERIAL', 'DERIVATIVES', 'GENERATIONS']) {
       expect(screen.queryByRole('region', { name })).toBeNull()
     }
     expect(screen.queryByRole('complementary', { name: 'inspector' })).toBeNull()
@@ -193,12 +228,12 @@ describe('lab modes', () => {
     expect(await screen.findByLabelText('waveform')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Westworld S01E01' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'ANALYZE whole' })).toBeEnabled()
-    expect(screen.queryByRole('region', { name: 'ORIGINALS' })).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Originals' })).toBeNull()
   })
 
   it('keeps parked AuK chrome off both modes', async () => {
     renderApp()
-    expect(await screen.findByRole('button', { name: /Ford/ })).toBeInTheDocument()
+    expect(await screen.findByRole('listitem', { name: 'Ford' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Load AuK' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Unload AuK' })).toBeNull()
     expect(screen.queryByRole('radio', { name: /bf16|int8/i })).toBeNull()
@@ -209,7 +244,7 @@ describe('lab modes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'VOICE LAB' }))
     fireEvent.click(await screen.findByRole('button', { name: /Ford/ }))
 
-    expect(await screen.findByRole('region', { name: 'ORIGINALS' })).toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: 'Originals' })).toBeInTheDocument()
     expect(screen.queryByText(/AuK/)).toBeNull()
     expect(screen.queryByRole('button', { name: 'Load AuK' })).toBeNull()
     expect(screen.queryByRole('radio', { name: /bf16|int8/i })).toBeNull()

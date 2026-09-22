@@ -2,9 +2,16 @@ import { create } from 'zustand'
 import type { Voice } from '@/lib/api'
 import { DEFAULT_GENERATION, fromStoredGeneration, type GenerationState } from '@/lib/generation'
 
-/** Two modes; the top nav is the only way between them. */
-export type ModeId = 'generate' | 'voice-lab'
+/** Four modes; the top nav is the only way between them. */
+export type ModeId = 'generate' | 'voice-lab' | 'conversations' | 'desk'
 export type { GenerationState }
+
+const MODE_IDS: readonly ModeId[] = ['generate', 'voice-lab', 'conversations', 'desk']
+
+function initialMode(): ModeId {
+  const mode = new URLSearchParams(window.location.search).get('mode')
+  return MODE_IDS.includes(mode as ModeId) ? (mode as ModeId) : 'generate'
+}
 
 type WorkspaceState = {
   mode: ModeId
@@ -31,7 +38,7 @@ type WorkspaceState = {
 }
 
 export const useWorkspace = create<WorkspaceState>((set) => ({
-  mode: 'generate',
+  mode: initialMode(),
   selectedVoiceId: null,
   selectedMaterialId: null,
   selectedRunId: null,
