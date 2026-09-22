@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from '@/app'
-import { useWorkspace } from '@/state/workspace'
+import { modeFromPath, useWorkspace } from '@/state/workspace'
 
 const RUNTIME = {
   selected: 'E2',
@@ -183,13 +183,29 @@ describe('lab modes', () => {
       'page',
     )
     expect(screen.getByRole('heading', { name: 'CONVERSATIONS' })).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/conversations')
     expect(screen.queryByText(/^Say$/i)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'DESK' }))
 
     expect(screen.getByRole('button', { name: 'DESK' })).toHaveAttribute('aria-current', 'page')
     expect(screen.getByRole('heading', { name: 'DESK' })).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desk')
     expect(screen.queryByRole('heading', { name: 'CONVERSATIONS' })).toBeNull()
+  })
+
+  it('opens desk from leftover ?mode=desk and from /lab/desk', async () => {
+    window.history.replaceState({}, '', '/lab/?mode=desk')
+    useWorkspace.setState({ mode: modeFromPath(window.location.pathname, window.location.search) })
+    renderApp()
+    expect(screen.getByRole('button', { name: 'DESK' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByRole('heading', { name: 'DESK' })).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desk')
+    expect(window.location.search).toBe('')
+
+    fireEvent.click(screen.getByRole('button', { name: 'GENERATE' }))
+    expect(window.location.pathname).toBe('/generate')
+    expect(window.location.search).toBe('')
   })
 
   it('says so when the library is empty', async () => {

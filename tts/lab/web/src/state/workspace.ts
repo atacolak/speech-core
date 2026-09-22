@@ -2,15 +2,37 @@ import { create } from 'zustand'
 import type { Voice } from '@/lib/api'
 import { DEFAULT_GENERATION, fromStoredGeneration, type GenerationState } from '@/lib/generation'
 
-/** Four modes; the top nav is the only way between them. */
+/** Four modes; the public path is the only way between them. */
 export type ModeId = 'generate' | 'voice-lab' | 'conversations' | 'desk'
 export type { GenerationState }
 
-const MODE_IDS: readonly ModeId[] = ['generate', 'voice-lab', 'conversations', 'desk']
+const PATH_BY_MODE: Record<ModeId, string> = {
+  desk: '/desk',
+  generate: '/generate',
+  conversations: '/conversations',
+  'voice-lab': '/lab',
+}
+
+export function modeFromPath(pathname: string, search = ''): ModeId {
+  const query = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search).get('mode')
+  if (query === 'desk') return 'desk'
+  if (query === 'conversations') return 'conversations'
+  if (query === 'voice-lab' || query === 'lab') return 'voice-lab'
+  if (query === 'generate') return 'generate'
+  const path = pathname.replace(/\/+$/, '') || '/'
+  const last = path.split('/').filter(Boolean).at(-1)
+  if (last === 'desk') return 'desk'
+  if (last === 'conversations') return 'conversations'
+  if (last === 'lab') return 'voice-lab'
+  return 'generate'
+}
+
+export function pathForMode(mode: ModeId): string {
+  return PATH_BY_MODE[mode]
+}
 
 function initialMode(): ModeId {
-  const mode = new URLSearchParams(window.location.search).get('mode')
-  return MODE_IDS.includes(mode as ModeId) ? (mode as ModeId) : 'generate'
+  return modeFromPath(window.location.pathname, window.location.search)
 }
 
 type WorkspaceState = {
@@ -47,7 +69,13 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
   text: "you don't need kubernetes. you need one process that doesn't suck. if it dies, restart it. congratulations, you invented infrastructure.",
   steer: 'fast, dry, technically confident, faintly amused.',
   generation: { ...DEFAULT_GENERATION },
-  selectMode: (mode) => set({ mode }),
+  selectMode: (mode) => {
+    const path = PATH_BY_MODE[mode]
+    if (window.location.pathname !== path || window.location.search) {
+      window.history.pushState({}, '', path)
+    }
+    set({ mode })
+  },
   selectVoice: (id) =>
     set({ selectedVoiceId: id, selectedMaterialId: null, selectedRunId: null, hydratedVoiceId: null }),
   selectMaterial: (id) => set({ selectedMaterialId: id }),

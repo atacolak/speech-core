@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import { TopBar } from '@/components/top-bar'
 import { ConversationsPane } from '@/features/conversations/conversations-pane'
@@ -7,12 +8,25 @@ import { SynthesisPane } from '@/features/synthesis/synthesis-pane'
 import { VoiceLab } from '@/features/voice-lab/voice-lab'
 import { VoicesPane } from '@/features/voices/voices-pane'
 import { cn } from '@/lib/utils'
-import { useWorkspace } from '@/state/workspace'
+import { modeFromPath, pathForMode, useWorkspace } from '@/state/workspace'
 
 export function AppShell() {
   const mode = useWorkspace((state) => state.mode)
   const settingsOpen = useWorkspace((state) => state.settingsOpen)
 
+  useEffect(() => {
+    const canonical = pathForMode(mode)
+    if (window.location.pathname !== canonical || window.location.search) {
+      window.history.replaceState({}, '', canonical)
+    }
+    const onPop = () => {
+      useWorkspace.setState({
+        mode: modeFromPath(window.location.pathname, window.location.search),
+      })
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [mode])
   return (
     <div className={cn('relative flex h-full min-h-screen flex-col bg-zinc-850 text-zinc-100')}>
       <TopBar />
