@@ -118,6 +118,11 @@ export function ConversationsPane() {
       ),
     [conversations.data],
   )
+  useEffect(() => {
+    if (selectedId === null && items[0]) {
+      setSelectedId(items[0].id)
+    }
+  }, [items, selectedId])
   const messages = detail.data ? groupTurns(detail.data.turns) : []
 
   const invalidateConversation = (conversationId: string) => {
@@ -202,6 +207,11 @@ export function ConversationsPane() {
       </header>
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col gap-2 overflow-y-auto border-r border-zinc-700 p-3">
+          {items.length === 0 ? (
+            <p className="px-1 text-sm text-zinc-400">
+              no conversations yet. a live desk call opens a session.
+            </p>
+          ) : null}
           {items.map((item) => (
             <button
               key={item.id}
@@ -223,6 +233,12 @@ export function ConversationsPane() {
           ))}
         </aside>
         <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+          {detail.data && messages.length === 0 ? (
+            <p className="text-sm text-zinc-400">
+              no turns in this session. live-call opened it; leftover mouth pcm
+              and leftover-accepted transcript never landed.
+            </p>
+          ) : null}
           {messages.map((message, index) => {
             const turn = chosenTurn(message)
             const changedFrom = voiceChangeBefore(messages, index)

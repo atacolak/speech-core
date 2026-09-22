@@ -374,4 +374,9 @@ describe('conversations pane', () => {
       expect(input).toHaveValue(50)
     })
   })
+
+  it('says so when the selected session has no turns', async () => {
+    renderPane()
+    expect(await screen.findByText(/no turns in this session/i)).toBeInTheDocument()
+  })
 })
