@@ -11,12 +11,15 @@ import numpy as np
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, ConfigDict
 
+from tts.lab.backend.routes.synthesis import SynthesisBody, resolve_synthesis_request
+from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.conversations import (
     clamp_ring_limit,
     insert_turn,
     keep_turn_as_take,
     prune_unsaved_conversations,
 )
+from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.lab.backend.store.session import write_conversation_ring_limit
 from tts.wav import write_wav
 
@@ -240,3 +243,121 @@ def save_conversation(request: Request, conversation_id: str) -> dict[str, Any]:
         "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
     ).fetchone()
     return _summary(store, row)
+
+
+class RegenerateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    generation: dict[str, Any] | None = None
+
+
+@router.post("/api/conversations/{conversation_id}/turns/{turn_id}/regenerate")
+def regenerate_turn(
+    request: Request,
+    conversation_id: str,
+    turn_id: str,
+    body: RegenerateBody | None = None,
+) -> dict[str, Any]:
+    state = request.app.state.lab
+    store = state.store
+    _get_conversation_row(store, conversation_id)
+    turn = dict(_get_turn_row(store, conversation_id, turn_id))
+    if (
+        turn["role"] != "assistant"
+        or not turn.get("audio_artifact_id")
+        or not turn.get("voice_id")
+    ):
+        raise HTTPException(status_code=422, detail="turn is not a regenerable assistant variation")
+    remaining = float(getattr(state.runtime, "live_call_remaining_s", lambda: 0.0)())
+    if remaining > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "live_call_active",
+                "message": "live call owns the engine",
+                "remaining_s": remaining,
+            },
+        )
+    generation = dict(_json_field(turn, "generation_json") or {})
+    if body and body.generation:
+        generation.update(body.generation)
+    synth_body = SynthesisBody(
+        text=str(turn["text"] or ""),
+        steer=str(turn["steer"] or ""),
+        voice_profile_id=str(turn["voice_id"]),
+        generation=generation,
+    )
+    resolved = resolve_synthesis_request(state, synth_body)
+    try:
+        payload = state.runtime.synthesize(
+            {
+                "text": synth_body.text,
+                "steer": synth_body.steer,
+                "synthesis_text": synth_body.synthesis_text,
+                "voice_profile_id": synth_body.voice_profile_id,
+                "reference_audio": str(resolved.reference_path),
+                "reference_text": resolved.reference_text,
+                "generation": resolved.settings.to_dict(),
+            }
+        )
+    except RuntimeUnloaded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "runtime_unloaded", "runtime": "e2", "state": exc.state},
+        ) from exc
+    except RuntimeBusy as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "runtime_busy", "runtime": "e2", "state": exc.state},
+        ) from exc
+    except LiveCallActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "live_call_active",
+                "message": "live call owns the engine",
+                "remaining_s": exc.remaining_s,
+            },
+        ) from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        missing = "missing template fields" in message or "ref_text" in message
+        raise HTTPException(
+            status_code=422 if missing else 500,
+            detail={
+                "code": "missing_ref_text" if missing else "synthesize_failed",
+                "message": message,
+            },
+        ) from exc
+    artifact = store.import_audio(Path(payload["wav_path"]))
+    next_seq = store.execute(
+        """
+        SELECT COALESCE(MAX(variation_seq) + 1, 0) AS next_seq
+        FROM conversation_turns
+        WHERE conversation_id = ? AND msg_seq = ?
+        """,
+        (conversation_id, turn["msg_seq"]),
+    ).fetchone()
+    new_turn = insert_turn(
+        store,
+        conversation_id,
+        role="assistant",
+        text=str(turn["text"] or ""),
+        msg_seq=turn["msg_seq"],
+        variation_seq=int(next_seq["next_seq"]),
+        chosen=0,
+        audio_artifact_id=artifact.id,
+        voice_id=turn["voice_id"],
+        steer=turn["steer"],
+        generation=generation,
+    )
+    store.execute(
+        "UPDATE conversation_turns SET alignment_json = ? WHERE id = ?",
+        (json.dumps(pending_alignment()), new_turn["id"]),
+    )
+    store.pin(artifact.id, reason=f"turn:{new_turn['id']}")
+    store.commit()
+    state.run_alignments.schedule_turn(store, str(new_turn["id"]), str(artifact.id))
+    row = store.execute(
+        "SELECT * FROM conversation_turns WHERE id = ?", (new_turn["id"],)
+    ).fetchone()
+    return _turn(row)
