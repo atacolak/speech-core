@@ -79,6 +79,7 @@ class E2RuntimeManager:
         self.live_call_lease_s = float(live_call_lease_s)
         self.live_call_session_lease_s = float(live_call_session_lease_s)
         self._synth_inflight = 0
+        self._stream_observer: Any | None = None
         self._load_phase: str | None = None
         self._load_started_at: datetime | None = None
         self._load_started_mono: float | None = None
@@ -190,6 +191,10 @@ class E2RuntimeManager:
         """GPU occupant, owned by ProcessorLease. E2 never sets this itself."""
         with self._lock:
             self._processor = None if name is None else str(name)
+
+    def set_stream_observer(self, observer: Any | None) -> None:
+        """Optional wrap(request, chunks) tap on synthesize_stream. Default None."""
+        self._stream_observer = observer
 
     def status(self) -> RuntimeStatus:
         with self._lock:
@@ -499,18 +504,25 @@ class E2RuntimeManager:
                     dest = Path(tempfile.mkdtemp(prefix="tts-lab-e2-")) / "take.wav"
                     payload["output_path"] = str(dest)
                 cmd = {"cmd": "synthesize", "request": payload}
+                observer = self._stream_observer
                 try:
-                    yield from current.iter_synthesize(
+                    stream = current.iter_synthesize(
                         cmd, timeout=self.synth_timeout_s, should_cancel=should_cancel
                     )
+                    if observer is not None:
+                        stream = observer.wrap(dict(payload), stream)
+                    yield from stream
                     return
                 except WorkerChannelDirty:
                     with self._lock:
                         held = self._worker if self._worker is not None else current
                         current = self._reload_dirty_worker(held)
-                    yield from current.iter_synthesize(
+                    stream = current.iter_synthesize(
                         cmd, timeout=self.synth_timeout_s, should_cancel=should_cancel
                     )
+                    if observer is not None:
+                        stream = observer.wrap(dict(payload), stream)
+                    yield from stream
             finally:
                 with self._lock:
                     self._synth_inflight = max(0, self._synth_inflight - 1)

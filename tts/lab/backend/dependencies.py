@@ -12,6 +12,7 @@ from tts.lab.backend.runtime.auk import AukRuntimeManager
 from tts.lab.backend.runtime.leftover import NoopLeftover
 from tts.lab.backend.runtime.manager import E2RuntimeManager
 from tts.lab.backend.runtime.processors import ProcessorLease
+from tts.lab.backend.services.conversation_capture import ConversationRecorder
 from tts.lab.backend.services.progressive import GenerateStreams
 from tts.lab.backend.services.run_alignment import RunAlignments
 from tts.lab.backend.store.artifacts import ArtifactStore
@@ -27,6 +28,7 @@ class LabState:
     leftover_parked: bool = False
     generate_streams: GenerateStreams = field(default_factory=GenerateStreams)
     run_alignments: RunAlignments = field(default_factory=RunAlignments)
+    conversation_recorder: ConversationRecorder | None = None
 
 
 def create_state(
@@ -38,12 +40,18 @@ def create_state(
     auk: AukRuntimeManager | None = None,
 ) -> LabState:
     runtime = runtime or E2RuntimeManager(leftover=NoopLeftover())
+    store = ArtifactStore(Path(root) if root is not None else lab_root())
+    alignments = RunAlignments()
+    recorder = ConversationRecorder(store, alignments)
+    runtime.set_stream_observer(recorder)
     return LabState(
-        store=ArtifactStore(Path(root) if root is not None else lab_root()),
+        store=store,
         runtime=runtime,
         auk=auk or AukRuntimeManager(lease=ProcessorLease(runtime)),
         engine=engine,
         leftover_parked=leftover_parked,
+        run_alignments=alignments,
+        conversation_recorder=recorder,
     )
 
 
