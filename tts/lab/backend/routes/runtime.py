@@ -7,6 +7,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from tts.lab.backend.routes.voices import get_voice_or_404
 from tts.lab.backend.runtime.types import RuntimeBusy
+from tts.lab.backend.services.conversations import (
+    begin_session,
+    end_session,
+    open_conversation_id,
+)
 from tts.lab.backend.store.session import read_active_voice_id, write_active_voice_id
 from tts.paths import ENGINE_ID
 
@@ -30,6 +35,7 @@ def _status_payload(request: Request, status: dict[str, object] | None = None) -
     payload["voicecat_path"] = True
     payload["leftover_parked"] = bool(payload.get("leftover_parked") or state.leftover_parked)
     payload["active_voice_id"] = read_active_voice_id(state.store.root)
+    payload["conversation_id"] = open_conversation_id(state.store)
     return payload
 
 
@@ -99,9 +105,11 @@ class LiveCallLeaseBody(BaseModel):
 @router.post("/api/runtime/breeze/live-call")
 def hold_live_call(request: Request, body: LiveCallLeaseBody | None = None) -> dict[str, object]:
     """VoiceCat desk session hold. Not inferred from hop traffic."""
-    runtime = request.app.state.lab.runtime
+    state = request.app.state.lab
     payload = body or LiveCallLeaseBody()
-    runtime.hold_session_lease(ttl_s=payload.ttl_s)
+    had_session = state.runtime.status().live_call_holder == "session"
+    state.runtime.hold_session_lease(ttl_s=payload.ttl_s)
+    begin_session(state.store, payload.session_id, reuse_open=had_session)
     return _status_payload(request)
 
 
@@ -110,5 +118,7 @@ def hold_live_call(request: Request, body: LiveCallLeaseBody | None = None) -> d
 @router.delete("/api/runtime/breeze/live-call")
 def clear_live_call(request: Request) -> dict[str, object]:
     """Clear the session lease. In-flight hop TTL may still hold."""
-    request.app.state.lab.runtime.clear_session_lease()
+    state = request.app.state.lab
+    end_session(state.store)
+    state.runtime.clear_session_lease()
     return _status_payload(request)

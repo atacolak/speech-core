@@ -9,10 +9,16 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from fastapi.testclient import TestClient
 
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO))
 
+from tts.lab.backend.app import create_app
+from tts.lab.backend.runtime.leftover import NoopLeftover
+from tts.lab.backend.runtime.manager import E2RuntimeManager
+from tts.lab.backend.runtime.vram import FixedVramProbe
+from tts.lab.backend.runtime.worker import CountingWorkerFactory
 from tts.lab.backend.services.conversations import (
     begin_session,
     clamp_ring_limit,
@@ -27,6 +33,8 @@ from tts.lab.backend.store.session import (
     write_conversation_ring_limit,
 )
 from tts.wav import write_wav
+
+GIB = 1024 ** 3
 
 
 def _tone(path: Path, *, freq: float = 440.0, seconds: float = 0.2) -> Path:
@@ -196,6 +204,74 @@ class ConversationsServiceTest(unittest.TestCase):
             (cid,),
         ).fetchone()
         self.assertEqual(chosen_count["n"], 1)
+
+
+class ConversationSessionHttpTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        leftover = NoopLeftover()
+        factory = CountingWorkerFactory()
+        self.factory = factory
+        self.runtime = E2RuntimeManager(
+            vram=FixedVramProbe(free=12 * GIB),
+            leftover=leftover,
+            worker_factory=factory,
+            required_vram_bytes=8 * GIB,
+            vram_margin_bytes=0,
+        )
+        self.client = TestClient(
+            create_app(root=Path(self.tmp.name), leftover_parked=False, e2_runtime=self.runtime)
+        )
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.tmp.cleanup()
+
+    def test_hold_mints_and_status_carries_conversation_id(self) -> None:
+        held = self.client.post("/api/runtime/live-call", json={})
+        self.assertEqual(held.status_code, 200, held.text)
+        conversation_id = held.json()["conversation_id"]
+        self.assertTrue(conversation_id.startswith("cv_"))
+        self.assertEqual(
+            self.client.get("/api/runtime").json()["conversation_id"], conversation_id
+        )
+
+    def test_heartbeat_with_session_id_reuses_open(self) -> None:
+        first = self.client.post("/api/runtime/live-call", json={"session_id": "desk-9"})
+        self.assertEqual(first.status_code, 200, first.text)
+        conversation_id = first.json()["conversation_id"]
+        again = self.client.post("/api/runtime/live-call", json={"session_id": "desk-9"})
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertEqual(again.json()["conversation_id"], conversation_id)
+        third = self.client.post("/api/runtime/live-call", json={"session_id": "desk-10"})
+        self.assertEqual(third.status_code, 200, third.text)
+        self.assertNotEqual(third.json()["conversation_id"], conversation_id)
+        row = self.client.app.state.lab.store.execute(
+            "SELECT ended_at FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+
+    def test_hold_after_lease_drop_starts_new_conversation(self) -> None:
+        first = self.client.post("/api/runtime/live-call", json={}).json()["conversation_id"]
+        self.client.app.state.lab.runtime.clear_session_lease()
+        second = self.client.post("/api/runtime/live-call", json={}).json()["conversation_id"]
+        self.assertNotEqual(first, second)
+        row = self.client.app.state.lab.store.execute(
+            "SELECT ended_at FROM conversations WHERE id = ?", (first,)
+        ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+
+    def test_clear_ends_session_and_prunes_ring(self) -> None:
+        held = self.client.post("/api/runtime/live-call", json={})
+        self.assertEqual(held.status_code, 200, held.text)
+        conversation_id = held.json()["conversation_id"]
+        cleared = self.client.delete("/api/runtime/live-call")
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        row = self.client.app.state.lab.store.execute(
+            "SELECT ended_at FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+        self.assertIsNone(self.client.get("/api/runtime").json()["conversation_id"])
 
 
 if __name__ == "__main__":
