@@ -409,7 +409,7 @@ impl SmartTurnDetector {
             reason,
             ..
         } = action;
-        if *reason != "vad_speech_start" {
+        if *reason != "vad_speech_start" && *reason != "acoustic_fallback_tokens_in_flight" {
             if let Some(session) = self.sessions.get_mut(stream_session_id) {
                 session.clear_through(*decision_sample);
             }

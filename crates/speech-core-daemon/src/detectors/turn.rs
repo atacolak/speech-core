@@ -276,9 +276,9 @@ impl TurnManager {
                                 && decision.available
                                 && decision.complete =>
                         {
-                            // Smart Turn completion is an endpoint decision. Do not gate it on
-                            // committed transcript tokens: ASR tokens can legitimately lag the
-                            // endpoint decision, especially with Nemotron right-context.
+                            // Smart Turn completion is an endpoint decision. Do not require a
+                            // token timestamp that reaches decision_sample (VAD hangover). After
+                            // finalize, empty ASR still must not commit.
                             close_source = "smart_turn";
                             close_detector = decision.detector;
                             close_confidence = decision.probability;
@@ -398,6 +398,33 @@ impl TurnManager {
                         .as_ref()
                         .map(|t| t.start_sample)
                         .unwrap_or(start_sample);
+                    let baseline = session.current_turn_start_token_count;
+                    if close_source == "smart_turn"
+                        && per_turn_lacks_speech(
+                            model_progress.as_ref(),
+                            &stream_session_id,
+                            baseline,
+                            turn_start_sample,
+                            effective_end_sample.max(effective_decision_sample),
+                        )
+                    {
+                        writer.write(&TurnEouSuppressedEvent {
+                            event: "turn_eou_suppressed",
+                            stream_id: stream_id.clone(),
+                            stream_session_id: stream_session_id.clone(),
+                            adapter_id: adapter_id.clone(),
+                            source: "smart_turn",
+                            detector: close_detector,
+                            reason: "smart_turn_empty_transcript",
+                            end_sample: effective_end_sample,
+                            decision_sample: effective_decision_sample,
+                            observed_speech_samples: effective_end_sample
+                                .saturating_sub(turn_start_sample),
+                            min_required_samples: 1,
+                            daemon_mono_ns: now_mono_ns(),
+                        })?;
+                        return Ok(Vec::new());
+                    }
                     let model_progress_ref = model_progress.as_ref();
                     session.close_turn(
                         turn_id,
@@ -1005,6 +1032,49 @@ impl TurnManager {
                         .as_ref()
                         .map(|t| t.start_sample)
                         .unwrap_or(start_sample);
+                    let baseline = session.current_turn_start_token_count;
+                    let token_end = model_progress
+                        .as_ref()
+                        .and_then(|progress| progress.last_token_end_sample(&stream_session_id));
+                    // ASR still decoding past the VAD segment that armed this
+                    // timer. Closing now splits one spoken sentence across two
+                    // leftover prompts (beb2e22d turn:10/11). Hold the floor;
+                    // rearm VAD so a later quiet window can still last-resort
+                    // close once tokens stop extending past the segment.
+                    let tokens_in_flight = token_end.is_some_and(|te| te > end_sample)
+                        && !per_turn_lacks_speech(
+                            model_progress.as_ref(),
+                            &stream_session_id,
+                            baseline,
+                            turn_start_sample,
+                            token_end.unwrap_or(end_sample),
+                        );
+                    if tokens_in_flight {
+                        writer.write(&TurnEouSuppressedEvent {
+                            event: "turn_eou_suppressed",
+                            stream_id: stream_id.clone(),
+                            stream_session_id: stream_session_id.clone(),
+                            adapter_id: adapter_id.clone(),
+                            source: "vad_acoustic_fallback",
+                            detector,
+                            reason: "acoustic_fallback_tokens_in_flight",
+                            end_sample,
+                            decision_sample,
+                            observed_speech_samples,
+                            min_required_samples: min_vad_speech_samples,
+                            daemon_mono_ns: now_mono_ns(),
+                        })?;
+                        return Ok(vec![DetectorAction::ResetEouState {
+                            stream_id,
+                            stream_session_id,
+                            adapter_id,
+                            mode: EouResetMode::Decoder,
+                            anchor_sample: decision_sample,
+                            source: "vad_acoustic_fallback",
+                            reason: "acoustic_fallback_tokens_in_flight",
+                            decision_sample,
+                        }]);
+                    }
                     let mp_ref = model_progress.as_ref();
                     session.close_turn(
                         turn_id,
@@ -1193,6 +1263,34 @@ impl TurnManager {
             .as_ref()
             .map(|t| t.start_sample)
             .unwrap_or(end_sample);
+        let baseline = session.current_turn_start_token_count;
+        // Finalize already flushed right-context. If Nemotron still has no
+        // speech tokens, do not publish transcript_committed "". Leftover
+        // ignores empty commits; holding the turn lets a later utterance on
+        // this same turn land tokens instead of four mute closes.
+        if per_turn_lacks_speech(
+            model_progress.as_ref(),
+            stream_session_id,
+            baseline,
+            turn_start_sample,
+            effective_end_sample.max(effective_decision_sample),
+        ) {
+            writer.write(&TurnEouSuppressedEvent {
+                event: "turn_eou_suppressed",
+                stream_id: stream_id.to_owned(),
+                stream_session_id: stream_session_id.to_owned(),
+                adapter_id: adapter_id.to_owned(),
+                source: "smart_turn",
+                detector,
+                reason: "smart_turn_empty_transcript",
+                end_sample: effective_end_sample,
+                decision_sample: effective_decision_sample,
+                observed_speech_samples: effective_end_sample.saturating_sub(turn_start_sample),
+                min_required_samples: 1,
+                daemon_mono_ns: now_mono_ns(),
+            })?;
+            return Ok(Vec::new());
+        }
         let mp_ref = model_progress.as_ref();
         session.close_turn(
             turn_id,
@@ -1831,6 +1929,22 @@ const CLOSE_FINALIZE_PADDING_MS: u32 = 320;
 const CLOSE_FINALIZE_TIMEOUT_MS: u32 = 800;
 
 
+fn per_turn_lacks_speech(
+    progress: Option<&ModelProgressMap>,
+    session_id: &str,
+    baseline: u32,
+    turn_start: u64,
+    turn_end: u64,
+) -> bool {
+    let Some(progress) = progress else {
+        return false;
+    };
+    match progress.per_turn_committed_snapshot(session_id, baseline, turn_start, turn_end) {
+        Some((text, count, _)) => count == 0 || !text.chars().any(|ch| ch.is_alphanumeric()),
+        None => true,
+    }
+}
+
 fn model_alignment_deadline(timeout_ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(timeout_ms as u64)
 }
@@ -2461,11 +2575,20 @@ mod tests {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
             semantic_gate_close_enabled: true,
-            model_progress: Some(progress),
+            model_progress: Some(progress.clone()),
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
         harness.drain_events();
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " hello".to_owned(),
+                start_sample: 0,
+                end_sample: 3_200,
+            },
+        );
 
         // SemanticTurnDecision with complete=true now closes directly.
         let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
@@ -2473,6 +2596,50 @@ mod tests {
 
         assert_reset_action(&actions, "smart_turn", "smart_turn_complete_direct", 17_920);
         assert_turn_closed(&events, "smart_turn", false, "smart_turn_complete_direct");
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.get("event").and_then(Value::as_str) == Some("transcript_committed"))
+                .and_then(|e| e.get("text").and_then(Value::as_str)),
+            Some(" hello")
+        );
+    }
+
+    #[test]
+    fn smart_turn_complete_with_empty_asr_does_not_commit() {
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            model_progress: Some(progress),
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
+        let events = harness.drain_events();
+
+        assert!(
+            actions.is_empty(),
+            "empty ASR must not reset EOU or close; got actions: {actions:#?}"
+        );
+        assert_suppressed(&events, "smart_turn", "smart_turn_empty_transcript");
+        assert_no_event(&events, "turn_closed");
+        assert_no_event(&events, "transcript_committed");
+
+        // Matching VAD end must not publish the empty commit the direct path just refused.
+        let vad_actions = harness.send(vad_end(0, 16_000, 17_920));
+        let vad_events = harness.drain_events();
+        assert!(
+            vad_actions.is_empty(),
+            "empty ASR must not close on VAD end after suppressed smart-turn; got actions: {vad_actions:#?}"
+        );
+        assert_suppressed(&vad_events, "smart_turn", "smart_turn_empty_transcript");
+        assert_no_event(&vad_events, "turn_closed");
+        assert_no_event(&vad_events, "transcript_committed");
     }
 
     #[test]
@@ -2804,10 +2971,19 @@ mod tests {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
             semantic_gate_close_enabled: true,
-            model_progress: Some(progress),
+            model_progress: Some(progress.clone()),
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " hello".to_owned(),
+                start_sample: 0,
+                end_sample: 3_200,
+            },
+        );
         let actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
         let events = harness.drain_events();
         assert_reset_action(&actions, "smart_turn", "smart_turn_complete_direct", 17_920);
@@ -2904,11 +3080,20 @@ mod tests {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
             semantic_gate_close_enabled: true,
-            model_progress: Some(progress),
+            model_progress: Some(progress.clone()),
             ..Default::default()
         });
         harness.send(vad_start(0, 3_200));
         harness.drain_events();
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " hello".to_owned(),
+                start_sample: 0,
+                end_sample: 3_200,
+            },
+        );
 
         // Smart turn completes and closes the turn at 17_920.
         let _actions = harness.send(semantic_decision(16_000, 17_920, true, true, false));
@@ -2944,6 +3129,157 @@ mod tests {
             "stale fallback should not emit eou candidate: {stale_events:#?}"
         );
     }
+
+    fn acoustic_fallback(
+        start_sample: u64,
+        end_sample: u64,
+        decision_sample: u64,
+    ) -> DetectorSignal {
+        DetectorSignal::VadAcousticFallback {
+            detector: VAD,
+            stream_id: STREAM_ID.to_owned(),
+            stream_session_id: SESSION_ID.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            start_sample,
+            end_sample,
+            decision_sample,
+            silence_samples: 40_000,
+            confidence: Some(0.03),
+        }
+    }
+
+    #[test]
+    fn acoustic_fallback_with_tokens_past_vad_end_holds_the_floor() {
+        // beb2e22d turn:10: fallback fired, then ASR tokens whose audio
+        // extends past the VAD segment landed during the 3s wait. Closing
+        // that prefix minted turn:11 for the rest of the same sentence.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 48_128);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress.clone()),
+            model_alignment_timeout_ms: 5,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " Now can".to_owned(),
+                start_sample: 0,
+                end_sample: 20_000,
+            },
+        );
+        progress.record_token(SESSION_ID, 20_000);
+
+        let actions = harness.send(acoustic_fallback(0, 16_000, 56_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "vad_acoustic_fallback",
+            "acoustic_fallback_tokens_in_flight",
+            56_000,
+        );
+        assert_suppressed(
+            &events,
+            "vad_acoustic_fallback",
+            "acoustic_fallback_tokens_in_flight",
+        );
+        assert_no_event(&events, "turn_closed");
+        assert_no_event(&events, "transcript_committed");
+
+        // Same utterance, later VAD onset: keep turn:0, do not mint turn:1.
+        let start_actions = harness.send(vad_start(56_512, 59_712));
+        let start_events = harness.drain_events();
+        assert!(
+            start_actions.is_empty(),
+            "re-onset on an open turn must not reset EOU: {start_actions:#?}"
+        );
+        assert_eq!(
+            event_count(&start_events, "turn_started"),
+            0,
+            "must keep one turn_id for one spoken sentence: {start_events:#?}"
+        );
+    }
+
+    #[test]
+    fn acoustic_fallback_with_no_tokens_still_closes() {
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 56_000);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress),
+            model_alignment_timeout_ms: 5,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+
+        let actions = harness.send(acoustic_fallback(0, 16_000, 56_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "vad_acoustic_fallback",
+            "vad_acoustic_fallback_low_probability_silence",
+            56_000,
+        );
+        assert_turn_closed(
+            &events,
+            "vad_acoustic_fallback",
+            true,
+            "vad_acoustic_fallback_low_probability_silence",
+        );
+    }
+
+    #[test]
+    fn acoustic_fallback_with_tokens_inside_vad_segment_still_closes() {
+        // ASR finished inside the VAD segment and the user is actually silent.
+        // Last-resort close is still the right call.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 56_000);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            model_progress: Some(progress.clone()),
+            model_alignment_timeout_ms: 5,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.drain_events();
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " hello".to_owned(),
+                start_sample: 0,
+                end_sample: 12_000,
+            },
+        );
+        progress.record_token(SESSION_ID, 12_000);
+
+        let actions = harness.send(acoustic_fallback(0, 16_000, 56_000));
+        let events = harness.drain_events();
+
+        assert_reset_action(
+            &actions,
+            "vad_acoustic_fallback",
+            "vad_acoustic_fallback_low_probability_silence",
+            56_000,
+        );
+        assert_turn_closed(
+            &events,
+            "vad_acoustic_fallback",
+            true,
+            "vad_acoustic_fallback_low_probability_silence",
+        );
+    }
+
 
     #[test]
     fn transcript_started_turn_commits_first_token_at_session_end_without_stale_vad_boundary() {

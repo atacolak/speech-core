@@ -263,12 +263,23 @@ impl AudioDetector for SileroVadDetector {
         let DetectorAction::ResetEouState {
             stream_session_id,
             reason,
+            decision_sample,
             ..
         } = action;
         if *reason == "vad_speech_start" {
             return Ok(());
         }
         if let Some(session) = self.sessions.get_mut(stream_session_id) {
+            if *reason == "acoustic_fallback_tokens_in_flight" {
+                // Restart the last-resort silence clock from the abort sample.
+                // Keep the original segment start so the same utterance stays
+                // one floor. Do not require a low-release rearm: VAD is already
+                // out of speech, and the user may still be talking.
+                session.acoustic_fallback_emitted = false;
+                session.last_segment_end_sample = Some(*decision_sample);
+                session.last_segment_end_confidence = None;
+                return Ok(());
+            }
             session.acoustic_fallback_emitted = true;
             session.last_segment_start_sample = None;
             session.last_segment_end_sample = None;
@@ -1134,5 +1145,35 @@ mod tests {
         assert!(!session.in_speech);
         assert_eq!(session.current_segment_start_sample, None);
         assert!(!session.onset_can_arm());
+    }
+
+    #[test]
+    fn tokens_in_flight_abort_rearms_fallback_clock_from_abort_sample() {
+        let mut detector = SileroVadDetector {
+            config: SileroVadConfig::default(),
+            sessions: HashMap::from([(SESSION_ID.to_owned(), test_session())]),
+        };
+        {
+            let session = detector.sessions.get_mut(SESSION_ID).unwrap();
+            session.acoustic_fallback_emitted = true;
+            session.last_segment_start_sample = Some(0);
+            session.last_segment_end_sample = Some(16_000);
+            session.last_segment_end_confidence = Some(0.15);
+        }
+        let (runtime, logger, _dir, _events) = writer_fixture();
+        let mut writer = DetectorWriter::new(&logger, runtime.handle());
+
+        detector
+            .handle_action(
+                &test_action("acoustic_fallback_tokens_in_flight", 56_000),
+                &mut writer,
+            )
+            .expect("abort rearm should succeed");
+
+        let session = detector.sessions.get(SESSION_ID).expect("session remains");
+        assert!(!session.acoustic_fallback_emitted);
+        assert_eq!(session.last_segment_start_sample, Some(0));
+        assert_eq!(session.last_segment_end_sample, Some(56_000));
+        assert!(session.onset_can_arm());
     }
 }

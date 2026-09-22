@@ -237,6 +237,9 @@ impl AudioDetector for ParakeetEouDetector {
                 reason,
                 decision_sample,
             } => {
+                if *reason == "acoustic_fallback_tokens_in_flight" {
+                    return Ok(());
+                }
                 let Some(session) = self.sessions.get_mut(stream_session_id) else {
                     return Ok(());
                 };

@@ -742,7 +742,9 @@ impl DetectorWorker {
                         reason,
                         ..
                     } = &action;
-                    if *reason != "vad_speech_start" {
+                    if *reason != "vad_speech_start"
+                        && *reason != "acoustic_fallback_tokens_in_flight"
+                    {
                         self.semantic_rechecks
                             .retain(|state| state.stream_session_id != *stream_session_id);
                     }
@@ -918,7 +920,9 @@ impl DetectorWorker {
                     reason,
                     ..
                 } = &action;
-                if *reason != "vad_speech_start" {
+                if *reason != "vad_speech_start"
+                    && *reason != "acoustic_fallback_tokens_in_flight"
+                {
                     self.semantic_rechecks
                         .retain(|state| state.stream_session_id != *stream_session_id);
                 }
