@@ -173,6 +173,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "alignment_json" not in run_cols:
         conn.execute("ALTER TABLE runs ADD COLUMN alignment_json TEXT")
 
+    conversation_cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "title" not in conversation_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN title TEXT")
+
     source_cols = {row[1] for row in conn.execute("PRAGMA table_info(voice_sources)")}
     if "transcript_locked" not in source_cols:
         conn.execute(

@@ -15,9 +15,12 @@ from tts.lab.backend.routes.synthesis import SynthesisBody, resolve_synthesis_re
 from tts.lab.backend.runtime.types import LiveCallActive, RuntimeBusy, RuntimeUnloaded
 from tts.lab.backend.services.conversations import (
     clamp_ring_limit,
+    delete_conversation,
+    delete_variation,
     insert_turn,
     keep_turn_as_take,
     prune_unsaved_conversations,
+    set_conversation_title,
 )
 from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.lab.backend.store.session import write_conversation_ring_limit
@@ -38,8 +41,10 @@ def _summary(store: Any, row: Any) -> dict[str, Any]:
         "SELECT COUNT(*) AS n FROM conversation_turns WHERE conversation_id = ?",
         (row["id"],),
     ).fetchone()
+    title = row["title"] if "title" in row.keys() else None
     return {
         "id": row["id"],
+        "title": title,
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
         "saved": bool(row["saved"]),
@@ -171,6 +176,7 @@ async def post_user_turn(
     if artifact_id is not None:
         store.pin(artifact_id, reason=f"turn:{turn['id']}")
         store.commit()
+    set_conversation_title(store, conversation_id, transcript)
     return _turn(turn)
 
 
@@ -202,12 +208,16 @@ def save_turn(request: Request, conversation_id: str, turn_id: str) -> dict[str,
     store = request.app.state.lab.store
     _get_conversation_row(store, conversation_id)
     turn = dict(_get_turn_row(store, conversation_id, turn_id))
-    if (
-        turn["role"] != "assistant"
-        or not turn.get("audio_artifact_id")
-        or not turn.get("voice_id")
-    ):
-        raise HTTPException(status_code=422, detail="turn is not a savable assistant variation")
+    if not turn.get("audio_artifact_id"):
+        raise HTTPException(status_code=422, detail="turn has no audio")
+    voice_id = turn.get("voice_id")
+    if not voice_id:
+        from tts.lab.backend.store.session import read_active_voice_id
+
+        voice_id = read_active_voice_id(store.root)
+    if not voice_id:
+        raise HTTPException(status_code=422, detail="turn has no voice")
+    turn["voice_id"] = voice_id
     turn["generation"] = _json_field(turn, "generation_json")
     run_id = keep_turn_as_take(store, turn)
     return {"run_id": run_id}
@@ -248,6 +258,11 @@ def save_conversation(request: Request, conversation_id: str) -> dict[str, Any]:
 class RegenerateBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     generation: dict[str, Any] | None = None
+
+
+class TitleBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str
 
 
 @router.post("/api/conversations/{conversation_id}/turns/{turn_id}/regenerate")
@@ -361,3 +376,38 @@ def regenerate_turn(
         "SELECT * FROM conversation_turns WHERE id = ?", (new_turn["id"],)
     ).fetchone()
     return _turn(row)
+
+
+@router.patch("/api/conversations/{conversation_id}")
+def patch_conversation(request: Request, conversation_id: str, body: TitleBody) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    _get_conversation_row(store, conversation_id)
+    store.execute(
+        "UPDATE conversations SET title = ? WHERE id = ?",
+        (body.title.strip(), conversation_id),
+    )
+    store.commit()
+    row = store.execute(
+        "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    return _summary(store, row)
+
+
+@router.delete("/api/conversations/{conversation_id}/turns/{turn_id}")
+def delete_turn(request: Request, conversation_id: str, turn_id: str) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    _get_conversation_row(store, conversation_id)
+    _get_turn_row(store, conversation_id, turn_id)
+    try:
+        delete_variation(store, conversation_id, turn_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"turn not found: {turn_id}") from exc
+    return {"ok": True}
+
+
+@router.delete("/api/conversations/{conversation_id}")
+def remove_conversation(request: Request, conversation_id: str) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    _get_conversation_row(store, conversation_id)
+    delete_conversation(store, conversation_id)
+    return {"ok": True}

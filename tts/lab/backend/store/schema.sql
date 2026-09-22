@@ -230,6 +230,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     saved INTEGER NOT NULL DEFAULT 0,
+    title TEXT,
     created_at TEXT NOT NULL
 );
 

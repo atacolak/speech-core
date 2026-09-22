@@ -305,14 +305,11 @@ async function readError(response: Response, label: string): Promise<ApiError> {
 }
 
 export function apiUrl(path: string): string {
-  const relative = path.replace(/^\//, '')
+  const absolute = path.startsWith('/') ? path : `/${path}`
   if (typeof window === 'undefined') {
-    return `/${relative}`
+    return absolute
   }
-  const dir = window.location.pathname.endsWith('/')
-    ? window.location.pathname
-    : `${window.location.pathname}/`
-  const url = new URL(relative, `${window.location.origin}${dir}`)
+  const url = new URL(absolute, window.location.origin)
   return `${url.pathname}${url.search}${url.hash}`
 }
 
@@ -866,6 +863,7 @@ export type ConversationTurn = {
 
 export type ConversationSummary = {
   id: string
+  title: string | null
   started_at: string
   ended_at: string | null
   saved: boolean
@@ -947,4 +945,20 @@ export async function regenerateTurn(
     throw await readError(response, 'conversations')
   }
   return (await response.json()) as ConversationTurn
+}
+
+export async function deleteTurnVariation(conversationId: string, turnId: string): Promise<void> {
+  const response = await apiFetch(`/api/conversations/${conversationId}/turns/${turnId}`, {
+    method: 'DELETE',
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await apiFetch(`/api/conversations/${conversationId}`, { method: 'DELETE' })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
 }

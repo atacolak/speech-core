@@ -32,21 +32,25 @@ def open_conversation_id(store: Any) -> str | None:
     return None if row is None else str(row["id"])
 
 
-def _insert_conversation(store: Any, conversation_id: str) -> str:
+def _insert_conversation(store: Any, conversation_id: str, title: str | None = None) -> str:
     now = _now()
     store.execute(
         """
-        INSERT INTO conversations (id, started_at, ended_at, saved, created_at)
-        VALUES (?, ?, NULL, 0, ?)
+        INSERT INTO conversations (id, started_at, ended_at, saved, title, created_at)
+        VALUES (?, ?, NULL, 0, ?, ?)
         """,
-        (conversation_id, now, now),
+        (conversation_id, now, title, now),
     )
     store.commit()
     return conversation_id
 
 
 def begin_session(
-    store: Any, session_id: str | None = None, *, reuse_open: bool = True
+    store: Any,
+    session_id: str | None = None,
+    *,
+    reuse_open: bool = True,
+    title: str | None = None,
 ) -> str:
     open_id = open_conversation_id(store)
     if session_id is not None:
@@ -55,17 +59,32 @@ def begin_session(
             (session_id,),
         ).fetchone()
         if existing is not None and existing["ended_at"] is None:
+            if title:
+                set_conversation_title(store, str(existing["id"]), title)
             return str(existing["id"])
         if open_id is not None:
             end_session(store)
         if existing is not None:
-            return _insert_conversation(store, new_id("cv"))
-        return _insert_conversation(store, session_id)
+            return _insert_conversation(store, new_id("cv"), title)
+        return _insert_conversation(store, session_id, title)
     if open_id is not None:
         if reuse_open:
+            if title:
+                set_conversation_title(store, open_id, title)
             return open_id
         end_session(store)
-    return _insert_conversation(store, new_id("cv"))
+    return _insert_conversation(store, new_id("cv"), title)
+
+
+def set_conversation_title(store: Any, conversation_id: str, title: str) -> None:
+    cleaned = title.strip()
+    if not cleaned:
+        return
+    store.execute(
+        "UPDATE conversations SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
+        (cleaned, conversation_id),
+    )
+    store.commit()
 
 
 def end_session(store: Any) -> str | None:
@@ -179,7 +198,7 @@ def prune_unsaved_conversations(store: Any, ring_limit: int | None = None) -> in
 
 
 def keep_turn_as_take(store: Any, turn: dict[str, Any]) -> str:
-    """Save one chosen assistant variation as a generate keep-take on its voice."""
+    """Save one chosen variation as a generate keep-take on its voice."""
     from tts.wav import read_wav
 
     run_id = new_id("run")
@@ -192,6 +211,7 @@ def keep_turn_as_take(store: Any, turn: dict[str, Any]) -> str:
         "voice_profile_id": turn["voice_id"],
         "generation": turn["generation"],
         "conversation_turn_id": turn["id"],
+        "role": turn.get("role"),
     }
     store.execute(
         """
@@ -223,3 +243,44 @@ def keep_turn_as_take(store: Any, turn: dict[str, Any]) -> str:
     )
     store.commit()
     return run_id
+
+
+def delete_variation(store: Any, conversation_id: str, turn_id: str) -> None:
+    turn = store.execute(
+        "SELECT * FROM conversation_turns WHERE id = ? AND conversation_id = ?",
+        (turn_id, conversation_id),
+    ).fetchone()
+    if turn is None:
+        raise KeyError(turn_id)
+    siblings = store.execute(
+        """
+        SELECT id FROM conversation_turns
+        WHERE conversation_id = ? AND msg_seq = ? AND id != ?
+        ORDER BY variation_seq
+        """,
+        (conversation_id, turn["msg_seq"], turn_id),
+    ).fetchall()
+    if turn["audio_artifact_id"]:
+        store.unpin(str(turn["audio_artifact_id"]), reason=f"turn:{turn_id}")
+    store.execute("DELETE FROM conversation_turns WHERE id = ?", (turn_id,))
+    if turn["chosen"] and siblings:
+        store.execute(
+            "UPDATE conversation_turns SET chosen = 1 WHERE id = ?",
+            (str(siblings[0]["id"]),),
+        )
+    store.commit()
+
+
+def delete_conversation(store: Any, conversation_id: str) -> None:
+    turns = store.execute(
+        "SELECT id, audio_artifact_id FROM conversation_turns WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchall()
+    for turn in turns:
+        if turn["audio_artifact_id"]:
+            store.unpin(str(turn["audio_artifact_id"]), reason=f"turn:{turn['id']}")
+    store.execute(
+        "DELETE FROM conversation_turns WHERE conversation_id = ?", (conversation_id,)
+    )
+    store.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+    store.commit()

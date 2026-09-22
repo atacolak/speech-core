@@ -40,3 +40,18 @@ export function voiceChangeBefore(
   }
   return null
 }
+
+export function speakerBefore(
+  messages: ConversationMessage[],
+  index: number,
+): { role: 'user' | 'assistant'; voiceId: string | null } | null {
+  const current = messages[index]
+  const voiceId = chosenTurn(current).voice_id
+  if (index === 0) return { role: current.role, voiceId }
+  const previous = messages[index - 1]
+  const previousVoice = chosenTurn(previous).voice_id
+  if (previous.role !== current.role || previousVoice !== voiceId) {
+    return { role: current.role, voiceId }
+  }
+  return null
+}

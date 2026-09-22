@@ -2,19 +2,27 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { TakePlayer } from '@/components/take-player'
-import { chosenTurn, groupTurns, voiceChangeBefore } from '@/features/conversations/conversation-model'
+import {
+  chosenTurn,
+  groupTurns,
+  speakerBefore,
+} from '@/features/conversations/conversation-model'
 import {
   artifactAudioUrl,
   chooseTurnVariation,
+  deleteConversation,
+  deleteTurnVariation,
   fetchConversation,
   fetchConversations,
   fetchRuntime,
+  fetchVoices,
   formatApiError,
   putConversationRingLimit,
   regenerateTurn,
   saveConversation,
   saveTurnVariation,
   type ConversationTurn,
+  type Voice,
 } from '@/lib/api'
 import { decodePcmWav, type PcmTimeline } from '@/lib/pcm-timeline'
 import { highlightAt, type Highlight } from '@/lib/spoken-alignment'
@@ -49,6 +57,11 @@ function spokenText(text: string, highlight: Highlight | null): ReactNode[] {
   return nodes
 }
 
+function voiceName(voices: Voice[], voiceId: string | null): string {
+  if (!voiceId) return 'You'
+  return voices.find((voice) => voice.id === voiceId)?.name ?? voiceId
+}
+
 function TurnView({ turn }: { turn: ConversationTurn }) {
   const [timeline, setTimeline] = useState<PcmTimeline | null>(null)
   const [playing, setPlaying] = useState(false)
@@ -81,10 +94,7 @@ function TurnView({ turn }: { turn: ConversationTurn }) {
   const highlight = playing ? highlightAt(playheadS, turn.text, turn.alignment, null) : null
 
   return (
-    <article aria-label={`${turn.role} turn`} className="flex flex-col gap-2">
-      <p className="whitespace-pre-wrap break-words text-sm text-zinc-100">
-        {spokenText(turn.text, highlight)}
-      </p>
+    <article aria-label={`${turn.role} turn`} className="flex w-[30%] min-w-56 max-w-md flex-col gap-1">
       {artifactId && timeline ? (
         <TakePlayer
           timeline={timeline}
@@ -94,6 +104,9 @@ function TurnView({ turn }: { turn: ConversationTurn }) {
           onPlayingChange={setPlaying}
         />
       ) : null}
+      <p className="whitespace-pre-wrap break-words text-sm italic text-zinc-400">
+        {spokenText(turn.text, highlight)}
+      </p>
     </article>
   )
 }
@@ -104,6 +117,7 @@ export function ConversationsPane() {
   const [ringLimit, setRingLimit] = useState(3)
   const [regenErrors, setRegenErrors] = useState<Record<string, string>>({})
   const conversations = useQuery({ queryKey: ['conversations'], queryFn: fetchConversations })
+  const voices = useQuery({ queryKey: ['voices'], queryFn: fetchVoices })
   const detail = useQuery({
     queryKey: ['conversation', selectedId],
     queryFn: () => fetchConversation(selectedId!),
@@ -124,6 +138,19 @@ export function ConversationsPane() {
     }
   }, [items, selectedId])
   const messages = detail.data ? groupTurns(detail.data.turns) : []
+  const sessionTitle =
+    detail.data?.title?.trim() ||
+    messages.find((message) => message.role === 'user')?.variations[0]?.text.trim() ||
+    selectedId ||
+    'conversation'
+  const participantNames = useMemo(() => {
+    const names = new Set<string>()
+    for (const message of messages) {
+      if (message.role !== 'assistant') continue
+      names.add(voiceName(voices.data ?? [], chosenTurn(message).voice_id))
+    }
+    return [...names]
+  }, [messages, voices.data])
 
   const invalidateConversation = (conversationId: string) => {
     void client.invalidateQueries({ queryKey: ['conversations'] })
@@ -162,6 +189,20 @@ export function ConversationsPane() {
   const saveSession = useMutation({
     mutationFn: (conversationId: string) => saveConversation(conversationId),
     onSuccess: (_data, conversationId) => invalidateConversation(conversationId),
+    onError: (error) => toast.error(formatApiError(error)),
+  })
+  const removeVariation = useMutation({
+    mutationFn: ({ conversationId, turnId }: { conversationId: string; turnId: string }) =>
+      deleteTurnVariation(conversationId, turnId),
+    onSuccess: (_data, vars) => invalidateConversation(vars.conversationId),
+    onError: (error) => toast.error(formatApiError(error)),
+  })
+  const removeSession = useMutation({
+    mutationFn: (conversationId: string) => deleteConversation(conversationId),
+    onSuccess: (_data, conversationId) => {
+      setSelectedId((current) => (current === conversationId ? null : current))
+      void client.invalidateQueries({ queryKey: ['conversations'] })
+    },
     onError: (error) => toast.error(formatApiError(error)),
   })
   const updateRing = useMutation({
@@ -203,7 +244,27 @@ export function ConversationsPane() {
               Save
             </button>
           ) : null}
+          {selectedId ? (
+            <button
+              type="button"
+              className="rounded-md px-2 py-1 text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+              onClick={() => removeSession.mutate(selectedId)}
+            >
+              Delete conversation
+            </button>
+          ) : null}
         </div>
+        {detail.data ? (
+          <p className="mt-2 flex min-w-0 items-baseline gap-2 text-sm">
+            <span className="truncate font-semibold text-zinc-50">{sessionTitle}</span>
+            {participantNames.length > 0 ? (
+              <>
+                <span className="text-zinc-500">·</span>
+                <span className="truncate text-zinc-400">{participantNames.join(', ')}</span>
+              </>
+            ) : null}
+          </p>
+        ) : null}
       </header>
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col gap-2 overflow-y-auto border-r border-zinc-700 p-3">
@@ -225,14 +286,14 @@ export function ConversationsPane() {
               )}
               onClick={() => setSelectedId(item.id)}
             >
-              <span className="block truncate">{item.id}</span>
+              <span className="block truncate">{item.title?.trim() || item.id}</span>
               {item.saved ? (
                 <span className="text-[11px] uppercase tracking-wide text-emerald-400">saved</span>
               ) : null}
             </button>
           ))}
         </aside>
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-5 overflow-y-auto p-4">
           {detail.data && messages.length === 0 ? (
             <p className="text-sm text-zinc-400">
               no turns in this session. live-call opened it; leftover mouth pcm
@@ -241,40 +302,41 @@ export function ConversationsPane() {
           ) : null}
           {messages.map((message, index) => {
             const turn = chosenTurn(message)
-            const changedFrom = voiceChangeBefore(messages, index)
+            const speaker = speakerBefore(messages, index)
+            const mine = message.role === 'user'
             return (
-              <div className="flex flex-col gap-2" key={message.msgSeq}>
-                {changedFrom ? (
-                  <p className="text-[11px] uppercase tracking-wide text-zinc-500">
-                    voice changed from {changedFrom}
+              <div className={cn('flex flex-col gap-1', mine ? 'items-start' : 'items-end')} key={message.msgSeq}>
+                {speaker ? (
+                  <p className="text-[11px] font-normal text-zinc-500">
+                    {speaker.role === 'user' ? 'You' : voiceName(voices.data ?? [], speaker.voiceId)}
                   </p>
                 ) : null}
-                {message.variations.length > 1 ? (
-                  <div className="flex flex-wrap gap-1">
-                    {message.variations.map((variation) => (
-                      <button
-                        key={variation.id}
-                        type="button"
-                        aria-current={turn.id === variation.id ? 'true' : undefined}
-                        className={cn(
-                          'rounded-md px-2 py-0.5 text-xs',
-                          turn.id === variation.id
-                            ? 'bg-zinc-700 font-medium text-zinc-50'
-                            : 'text-zinc-300 hover:bg-zinc-800',
-                        )}
-                        onClick={() => {
+                <TurnView turn={turn} />
+                <div className={cn('flex flex-wrap items-center gap-2', mine ? '' : 'flex-row-reverse')}>
+                  {message.variations.length > 1 ? (
+                    <label className="flex items-center gap-1 text-[11px] text-zinc-400">
+                      <span className="sr-only">variation</span>
+                      <select
+                        aria-label="variation"
+                        className="rounded-md border border-zinc-600 bg-zinc-950 px-1.5 py-0.5 text-xs text-zinc-200"
+                        value={turn.id}
+                        onChange={(event) => {
                           if (!selectedId) return
-                          chooseVariation.mutate({ conversationId: selectedId, turnId: variation.id })
+                          chooseVariation.mutate({
+                            conversationId: selectedId,
+                            turnId: event.target.value,
+                          })
                         }}
                       >
-                        {`V${variation.variation_seq + 1}`}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-                <TurnView turn={turn} />
-                {message.role === 'assistant' ? (
-                  <div className="flex flex-wrap items-center gap-2">
+                        {message.variations.map((variation) => (
+                          <option key={variation.id} value={variation.id}>
+                            {`V${variation.variation_seq + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {message.role === 'assistant' ? (
                     <button
                       type="button"
                       disabled={liveCallActive}
@@ -286,23 +348,35 @@ export function ConversationsPane() {
                     >
                       Regenerate
                     </button>
-                    {turn.audio_artifact_id ? (
-                      <button
-                        type="button"
-                        className="rounded-md px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
-                        onClick={() => {
-                          if (!selectedId) return
-                          saveVariation.mutate({ conversationId: selectedId, turnId: turn.id })
-                        }}
-                      >
-                        Save to voice
-                      </button>
-                    ) : null}
-                    {regenErrors[turn.id] ? (
-                      <p className="text-xs text-red-400">{regenErrors[turn.id]}</p>
-                    ) : null}
-                  </div>
-                ) : null}
+                  ) : null}
+                  {turn.audio_artifact_id ? (
+                    <button
+                      type="button"
+                      className="rounded-md px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+                      onClick={() => {
+                        if (!selectedId) return
+                        saveVariation.mutate({ conversationId: selectedId, turnId: turn.id })
+                      }}
+                    >
+                      Save to voice
+                    </button>
+                  ) : null}
+                  {message.variations.length > 1 ? (
+                    <button
+                      type="button"
+                      className="rounded-md px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+                      onClick={() => {
+                        if (!selectedId) return
+                        removeVariation.mutate({ conversationId: selectedId, turnId: turn.id })
+                      }}
+                    >
+                      Delete variation
+                    </button>
+                  ) : null}
+                  {regenErrors[turn.id] ? (
+                    <p className="text-xs text-red-400">{regenErrors[turn.id]}</p>
+                  ) : null}
+                </div>
               </div>
             )
           })}

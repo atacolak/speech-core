@@ -98,6 +98,7 @@ class LiveCallLeaseBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ttl_s: float | None = Field(default=None, gt=0, le=600)
     session_id: str | None = None
+    title: str | None = None
 
 
 @router.post("/api/runtime/live-call")
@@ -109,7 +110,7 @@ def hold_live_call(request: Request, body: LiveCallLeaseBody | None = None) -> d
     payload = body or LiveCallLeaseBody()
     had_session = state.runtime.status().live_call_holder == "session"
     state.runtime.hold_session_lease(ttl_s=payload.ttl_s)
-    begin_session(state.store, payload.session_id, reuse_open=had_session)
+    begin_session(state.store, payload.session_id, reuse_open=had_session, title=payload.title)
     return _status_payload(request)
 
 

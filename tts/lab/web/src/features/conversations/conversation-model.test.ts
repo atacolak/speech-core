@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ConversationTurn } from '@/lib/api'
-import { chosenTurn, groupTurns, voiceChangeBefore } from '@/features/conversations/conversation-model'
+import { chosenTurn, groupTurns, speakerBefore, voiceChangeBefore } from '@/features/conversations/conversation-model'
 
 const turn = (over: Partial<ConversationTurn>): ConversationTurn => ({
   id: 'ct_x', conversation_id: 'cv_1', msg_seq: 0, variation_seq: 0,
@@ -50,5 +50,18 @@ describe('conversation model', () => {
     expect(voiceChangeBefore(messages, 3)).toBeNull()
     expect(voiceChangeBefore(messages, 1)).toBeNull()
     expect(voiceChangeBefore(messages, 0)).toBeNull()
+  })
+
+  it('labels the first speaker and later speaker changes', () => {
+    const messages = groupTurns([
+      turn({ id: 'u', msg_seq: 0, role: 'user', voice_id: null }),
+      turn({ id: 'a', msg_seq: 1, voice_id: 'v1' }),
+      turn({ id: 'b', msg_seq: 2, voice_id: 'v1' }),
+      turn({ id: 'c', msg_seq: 3, voice_id: 'v2' }),
+    ])
+    expect(speakerBefore(messages, 0)).toEqual({ role: 'user', voiceId: null })
+    expect(speakerBefore(messages, 1)).toEqual({ role: 'assistant', voiceId: 'v1' })
+    expect(speakerBefore(messages, 2)).toBeNull()
+    expect(speakerBefore(messages, 3)).toEqual({ role: 'assistant', voiceId: 'v2' })
   })
 })

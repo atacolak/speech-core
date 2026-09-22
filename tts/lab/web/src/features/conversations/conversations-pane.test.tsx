@@ -5,9 +5,12 @@ import type { ConversationDetail, ConversationSummary, ConversationTurn, Runtime
 import {
   ApiError,
   chooseTurnVariation,
+  deleteConversation,
+  deleteTurnVariation,
   fetchConversation,
   fetchConversations,
   fetchRuntime,
+  fetchVoices,
   putConversationRingLimit,
   regenerateTurn,
   saveConversation,
@@ -40,11 +43,14 @@ vi.mock('@/lib/api', async (importOriginal) => {
     fetchConversations: vi.fn(),
     fetchConversation: vi.fn(),
     fetchRuntime: vi.fn(),
+    fetchVoices: vi.fn(),
     chooseTurnVariation: vi.fn(),
     regenerateTurn: vi.fn(),
     saveTurnVariation: vi.fn(),
     saveConversation: vi.fn(),
     putConversationRingLimit: vi.fn(),
+    deleteTurnVariation: vi.fn(),
+    deleteConversation: vi.fn(),
   }
 })
 
@@ -70,6 +76,7 @@ const turn = (over: Partial<ConversationTurn>): ConversationTurn => ({
 
 const SUMMARY: ConversationSummary = {
   id: 'cv_1',
+  title: 'Say a sentence.',
   started_at: '2026-09-21T12:00:00Z',
   ended_at: '2026-09-21T12:05:00Z',
   saved: false,
@@ -125,10 +132,6 @@ function renderPane(): void {
   )
 }
 
-async function openSession(): Promise<void> {
-  fireEvent.click(await screen.findByRole('button', { name: /cv_1/ }))
-}
-
 describe('conversations pane', () => {
   beforeEach(() => {
     player.onPlayingChange = undefined
@@ -136,11 +139,17 @@ describe('conversations pane', () => {
     vi.mocked(fetchConversations).mockResolvedValue([SUMMARY])
     vi.mocked(fetchConversation).mockResolvedValue(detail([]))
     vi.mocked(fetchRuntime).mockResolvedValue(RUNTIME)
+    vi.mocked(fetchVoices).mockResolvedValue([
+      { id: 'v1', name: 'Ford', tags: [] } as never,
+      { id: 'v2', name: 'Westworld', tags: [] } as never,
+    ])
     vi.mocked(chooseTurnVariation).mockResolvedValue(turn({}))
     vi.mocked(regenerateTurn).mockResolvedValue(turn({}))
     vi.mocked(saveTurnVariation).mockResolvedValue({ run_id: 'run_1' })
     vi.mocked(saveConversation).mockResolvedValue({ ...SUMMARY, saved: true })
     vi.mocked(putConversationRingLimit).mockResolvedValue({ ring_limit: 3 })
+    vi.mocked(deleteTurnVariation).mockResolvedValue(undefined)
+    vi.mocked(deleteConversation).mockResolvedValue(undefined)
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo) => {
@@ -176,7 +185,6 @@ describe('conversations pane', () => {
       ]),
     )
     renderPane()
-    await openSession()
     const user = await screen.findByText('user said this')
     const assistant = screen.getByText('assistant said that')
     expect(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -202,7 +210,6 @@ describe('conversations pane', () => {
       ]),
     )
     renderPane()
-    await openSession()
     const user = await screen.findByRole('article', { name: 'user turn' })
     expect(user).toHaveTextContent('just a transcript')
     expect(within(user).queryByTestId('take-player')).toBeNull()
@@ -225,9 +232,8 @@ describe('conversations pane', () => {
       ]),
     )
     renderPane()
-    await openSession()
     const first = await screen.findByText('hello from v1')
-    const marker = await screen.findByText(/voice changed/i)
+    const marker = await screen.findByText('Westworld')
     const second = screen.getByText('hello from v2')
     expect(first.compareDocumentPosition(marker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(marker.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -253,7 +259,6 @@ describe('conversations pane', () => {
       ]),
     )
     renderPane()
-    await openSession()
     await screen.findByTestId('take-player')
     expect(document.querySelector('mark')).toBeNull()
 
@@ -297,15 +302,14 @@ describe('conversations pane', () => {
       return variations().find((row) => row.id === turnId)!
     })
     renderPane()
-    await openSession()
-    expect(await screen.findByRole('button', { name: 'V1' })).toHaveAttribute('aria-current', 'true')
-    expect(screen.getByRole('button', { name: 'V2' })).not.toHaveAttribute('aria-current')
-    fireEvent.click(screen.getByRole('button', { name: 'V2' }))
+    const select = await screen.findByRole('combobox', { name: 'variation' })
+    expect(select).toHaveValue('ct_v0')
+    fireEvent.change(select, { target: { value: 'ct_v1' } })
     await waitFor(() => {
       expect(chooseTurnVariation).toHaveBeenCalledWith('cv_1', 'ct_v1')
     })
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'V2' })).toHaveAttribute('aria-current', 'true')
+      expect(screen.getByRole('combobox', { name: 'variation' })).toHaveValue('ct_v1')
     })
   })
 
@@ -315,7 +319,6 @@ describe('conversations pane', () => {
       detail([turn({ id: 'ct_asst', msg_seq: 0, text: 'hello', audio_artifact_id: 'art_1' })]),
     )
     renderPane()
-    await openSession()
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /regenerate/i })).toBeDisabled()
     })
@@ -323,7 +326,6 @@ describe('conversations pane', () => {
     cleanup()
     vi.mocked(fetchRuntime).mockResolvedValue({ ...RUNTIME, live_call_active: false })
     renderPane()
-    await openSession()
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /regenerate/i })).toBeEnabled()
     })
@@ -341,7 +343,6 @@ describe('conversations pane', () => {
       }),
     )
     renderPane()
-    await openSession()
     fireEvent.click(await screen.findByRole('button', { name: /regenerate/i }))
     expect(await screen.findByText('live call owns the engine')).toBeInTheDocument()
   })
@@ -351,7 +352,6 @@ describe('conversations pane', () => {
       detail([turn({ id: 'ct_asst', msg_seq: 0, text: 'hello', audio_artifact_id: 'art_1' })]),
     )
     renderPane()
-    await openSession()
     fireEvent.click(await screen.findByRole('button', { name: 'Save to voice' }))
     await waitFor(() => {
       expect(saveTurnVariation).toHaveBeenCalledWith('cv_1', 'ct_asst')
@@ -378,5 +378,42 @@ describe('conversations pane', () => {
   it('says so when the selected session has no turns', async () => {
     renderPane()
     expect(await screen.findByText(/no turns in this session/i)).toBeInTheDocument()
+  })
+
+  it('puts the session title in the header gap with voice names', async () => {
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([
+        turn({ id: 'ct_user', msg_seq: 0, role: 'user', text: 'Say a sentence.', voice_id: null }),
+        turn({ id: 'ct_asst', msg_seq: 1, text: 'Understood', voice_id: 'v1', audio_artifact_id: 'art_1' }),
+      ]),
+    )
+    renderPane()
+    expect(await screen.findByText('Understood')).toBeInTheDocument()
+    expect(screen.getAllByText('Ford').length).toBeGreaterThan(0)
+  })
+
+  it('deletes a variation and a conversation', async () => {
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([
+        turn({ id: 'ct_v0', msg_seq: 0, variation_seq: 0, text: 'first', audio_artifact_id: 'art_1' }),
+        turn({
+          id: 'ct_v1',
+          msg_seq: 0,
+          variation_seq: 1,
+          text: 'second',
+          chosen: false,
+          audio_artifact_id: 'art_2',
+        }),
+      ]),
+    )
+    renderPane()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete variation' }))
+    await waitFor(() => {
+      expect(deleteTurnVariation).toHaveBeenCalledWith('cv_1', 'ct_v0')
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Delete conversation' }))
+    await waitFor(() => {
+      expect(deleteConversation).toHaveBeenCalledWith('cv_1')
+    })
   })
 })
