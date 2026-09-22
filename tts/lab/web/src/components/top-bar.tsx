@@ -4,10 +4,10 @@ import { cn } from '@/lib/utils'
 import { type ModeId, useWorkspace } from '@/state/workspace'
 
 const MODES: readonly { id: ModeId; label: string }[] = [
-  { id: 'generate', label: 'GENERATE' },
-  { id: 'voice-lab', label: 'VOICE LAB' },
-  { id: 'conversations', label: 'CONVERSATIONS' },
   { id: 'desk', label: 'DESK' },
+  { id: 'generate', label: 'GENERATE' },
+  { id: 'conversations', label: 'CONVERSATIONS' },
+  { id: 'voice-lab', label: 'VOICE LAB' },
 ]
 
 export function TopBar() {

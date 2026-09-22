@@ -121,7 +121,7 @@ function renderApp() {
   )
 }
 
-/** GENERATE | VOICE LAB | CONVERSATIONS | DESK is the whole top nav. */
+/** DESK | GENERATE | CONVERSATIONS | VOICE LAB is the whole top nav. */
 describe('lab modes', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', labFetch())
@@ -140,10 +140,10 @@ describe('lab modes', () => {
     const buttons = within(nav).getAllByRole('button')
     expect(buttons).toHaveLength(4)
     expect(buttons.map((button) => button.textContent)).toEqual([
-      'GENERATE',
-      'VOICE LAB',
-      'CONVERSATIONS',
       'DESK',
+      'GENERATE',
+      'CONVERSATIONS',
+      'VOICE LAB',
     ])
     expect(within(nav).queryByRole('button', { name: /WORKBENCH|SOURCES/ })).toBeNull()
     const generate = screen.getByRole('button', { name: 'GENERATE' })
