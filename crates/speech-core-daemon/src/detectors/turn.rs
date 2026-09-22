@@ -289,8 +289,14 @@ impl TurnManager {
                             if decision.end_sample == end_sample
                                 && decision.decision_sample == decision_sample
                                 && decision.available
-                                && !decision.timed_out =>
+                                && !decision.complete =>
                         {
+                            // A real incomplete verdict outranks the 250ms
+                            // inference budget. timed_out here means CPU was
+                            // slow, not "no decision" — fail-open on that
+                            // closed "Um yeah" 1ms before speech resumed
+                            // (08ea4c96). turn.7 fail-open is for ABSENCE of
+                            // a verdict, not a present incomplete one.
                             writer.write(&TurnEouSuppressedEvent {
                                 event: "turn_eou_suppressed",
                                 stream_id: stream_id.clone(),
@@ -355,16 +361,6 @@ impl TurnManager {
                             } else {
                                 return Ok(Vec::new());
                             }
-                        }
-                        Some(decision)
-                            if decision.end_sample == end_sample
-                                && decision.decision_sample == decision_sample
-                                && decision.available
-                                && decision.timed_out =>
-                        {
-                            // Fail open: Smart Turn timed out before reaching a complete decision,
-                            // so preserve the current VAD behavior rather than suppressing closure.
-                            close_reason = "smart_turn_timeout_vad_fallback";
                         }
                         _ => {
                             // Fail open: if Smart Turn is unavailable or did not produce a decision
@@ -964,6 +960,7 @@ impl TurnManager {
                 let min_vad_speech_samples = ms_to_samples(self.config.min_vad_speech_ms);
                 let model_progress = self.config.model_progress.clone();
                 let model_alignment_timeout_ms = self.config.model_alignment_timeout_ms;
+                let semantic_gate_enabled = self.config.semantic_gate_enabled;
                 let session = self.session_mut(&stream_id, &stream_session_id, &adapter_id);
                 // Stale guard: if a turn was already closed at or past this
                 // fallback's decision_sample, don't resurrect it.
@@ -1018,6 +1015,29 @@ impl TurnManager {
                     vad_decision_to_model_eou_ms: None,
                     daemon_mono_ns: now_mono_ns(),
                 })?;
+                let semantic_hold = semantic_gate_enabled
+                    && session.last_semantic_decision.is_some_and(|d| d.available && !d.complete);
+                if semantic_hold {
+                    // Live incomplete outranks a pure-silence timer. k8q.8 abort
+                    // re-armed and re-fired 21ms later, committing "When I try to"
+                    // after smart_turn held incomplete 4× (08ea4c96). human_hold
+                    // remains the stuck-turn last resort.
+                    writer.write(&TurnEouSuppressedEvent {
+                        event: "turn_eou_suppressed",
+                        stream_id: stream_id.clone(),
+                        stream_session_id: stream_session_id.clone(),
+                        adapter_id: adapter_id.clone(),
+                        source: "vad_acoustic_fallback",
+                        detector,
+                        reason: "acoustic_fallback_semantic_hold",
+                        end_sample,
+                        decision_sample,
+                        observed_speech_samples,
+                        min_required_samples: min_vad_speech_samples,
+                        daemon_mono_ns: now_mono_ns(),
+                    })?;
+                    return Ok(Vec::new());
+                }
                 if vad_close_enabled {
                     if let Some(ref model_progress) = model_progress {
                         wait_for_model_progress(
@@ -2519,7 +2539,9 @@ mod tests {
     }
 
     #[test]
-    fn smart_turn_timeout_fails_open_but_non_timeout_incomplete_suppresses() {
+    fn smart_turn_timeout_with_incomplete_verdict_suppresses() {
+        // 08ea4c96 close 1: p=0.012 incomplete but timed_out (303ms > 250ms)
+        // used to fail-open and commit "Um yeah" 1ms before speech resumed.
         let mut timed_out = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
             semantic_gate_enabled: true,
@@ -2533,17 +2555,12 @@ mod tests {
         let actions = timed_out.send(vad_end(0, 16_000, 17_920));
         let events = timed_out.drain_events();
 
-        assert_reset_action(&actions, "vad", "smart_turn_timeout_vad_fallback", 17_920);
-        assert_turn_closed(&events, "vad", true, "smart_turn_timeout_vad_fallback");
         assert!(
-            !events.iter().any(|event| {
-                event.get("event").and_then(Value::as_str) == Some("turn_eou_suppressed")
-                    && event.get("reason").and_then(Value::as_str)
-                        == Some("semantic_incomplete")
-            }),
-            "a timed-out Smart Turn incomplete decision must fail open to VAD, not suppress closure; \
-             got events: {events:#?}"
+            actions.is_empty(),
+            "timed-out incomplete must not fail-open to VAD; got actions: {actions:#?}"
         );
+        assert_suppressed(&events, "semantic", "semantic_incomplete");
+        assert_no_event(&events, "turn_closed");
 
         let mut incomplete = TurnHarness::new(TurnManagerConfig {
             vad_close_enabled: true,
@@ -3279,6 +3296,53 @@ mod tests {
             "vad_acoustic_fallback_low_probability_silence",
         );
     }
+
+    #[test]
+    fn acoustic_fallback_yields_to_active_semantic_incomplete_hold() {
+        // 08ea4c96 fixture 2: smart_turn held "When I try to" incomplete 4×;
+        // fallback ignored that hold, k8q.8 abort re-fired 21ms later, committed
+        // the mid-clause. A live incomplete outranks the silence timer.
+        let progress = ModelProgressMap::new();
+        progress.start_session_for_test(SESSION_ID);
+        progress.update(SESSION_ID, 56_000);
+        let mut harness = TurnHarness::new(TurnManagerConfig {
+            vad_close_enabled: true,
+            semantic_gate_enabled: true,
+            semantic_gate_close_enabled: true,
+            model_progress: Some(progress.clone()),
+            model_alignment_timeout_ms: 5,
+            ..Default::default()
+        });
+        harness.send(vad_start(0, 3_200));
+        harness.send(semantic_decision(16_000, 17_920, false, true, false));
+        harness.drain_events();
+        progress.record_token_snapshot(
+            SESSION_ID,
+            crate::model::CommittedTokenSnapshot {
+                index: 0,
+                text: " When I try to".to_owned(),
+                start_sample: 0,
+                end_sample: 20_000,
+            },
+        );
+        progress.record_token(SESSION_ID, 20_000);
+
+        let actions = harness.send(acoustic_fallback(0, 16_000, 56_000));
+        let events = harness.drain_events();
+
+        assert!(
+            actions.is_empty(),
+            "semantic hold must not rearm fallback: {actions:#?}"
+        );
+        assert_suppressed(
+            &events,
+            "vad_acoustic_fallback",
+            "acoustic_fallback_semantic_hold",
+        );
+        assert_no_event(&events, "turn_closed");
+        assert_no_event(&events, "transcript_committed");
+    }
+
 
 
     #[test]

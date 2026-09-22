@@ -1635,55 +1635,73 @@ mod tests {
     fn semantic_complete_closes_with_smart_turn_source() {
         let progress = ModelProgressMap::new();
         progress.start_session_for_test("test.session");
-        progress.record_token("test.session", 3_200);
         with_worker(
             TurnManagerConfig {
                 vad_close_enabled: true,
                 semantic_gate_enabled: true,
                 semantic_gate_close_enabled: true,
-                model_progress: Some(progress),
+                model_progress: Some(progress.clone()),
                 ..Default::default()
             },
             |worker, runtime, actions, _signal_batches| {
                 let logger = worker.logger.clone();
                 let mut writer = DetectorWriter::new(&logger, runtime.handle());
-                let signals = vec![
-                    DetectorSignal::VadSegmentStart {
-                        detector: "silero_vad",
-                        stream_id: "test.stream".into(),
-                        stream_session_id: "test.session".into(),
-                        adapter_id: "test.adapter".into(),
+                worker
+                    .handle_signals(
+                        vec![DetectorSignal::VadSegmentStart {
+                            detector: "silero_vad",
+                            stream_id: "test.stream".into(),
+                            stream_session_id: "test.session".into(),
+                            adapter_id: "test.adapter".into(),
+                            start_sample: 0,
+                            decision_sample: 3_200,
+                            confidence: Some(0.9),
+                        }],
+                        &mut writer,
+                    )
+                    .unwrap();
+                progress.record_token("test.session", 3_200);
+                progress.record_token_snapshot(
+                    "test.session",
+                    crate::model::CommittedTokenSnapshot {
+                        index: 0,
+                        text: " hello".to_owned(),
                         start_sample: 0,
-                        decision_sample: 3_200,
-                        confidence: Some(0.9),
+                        end_sample: 3_200,
                     },
-                    DetectorSignal::SemanticTurnDecision {
-                        detector: smart_turn::DETECTOR,
-                        stream_id: "test.stream".into(),
-                        stream_session_id: "test.session".into(),
-                        adapter_id: "test.adapter".into(),
-                        end_sample: 16_000,
-                        decision_sample: 17_920,
-                        complete: true,
-                        probability: Some(0.8),
-                        threshold: Some(0.5),
-                        timed_out: false,
-                        available: true,
-                        reason: "smart_turn_complete",
-                        duration_ms: Some(10.0),
-                    },
-                    DetectorSignal::VadSegmentEnd {
-                        detector: "silero_vad",
-                        stream_id: "test.stream".into(),
-                        stream_session_id: "test.session".into(),
-                        adapter_id: "test.adapter".into(),
-                        start_sample: 0,
-                        end_sample: 16_000,
-                        decision_sample: 17_920,
-                        confidence: Some(0.1),
-                    },
-                ];
-                worker.handle_signals(signals, &mut writer).unwrap();
+                );
+                worker
+                    .handle_signals(
+                        vec![
+                            DetectorSignal::SemanticTurnDecision {
+                                detector: smart_turn::DETECTOR,
+                                stream_id: "test.stream".into(),
+                                stream_session_id: "test.session".into(),
+                                adapter_id: "test.adapter".into(),
+                                end_sample: 16_000,
+                                decision_sample: 17_920,
+                                complete: true,
+                                probability: Some(0.8),
+                                threshold: Some(0.5),
+                                timed_out: false,
+                                available: true,
+                                reason: "smart_turn_complete",
+                                duration_ms: Some(10.0),
+                            },
+                            DetectorSignal::VadSegmentEnd {
+                                detector: "silero_vad",
+                                stream_id: "test.stream".into(),
+                                stream_session_id: "test.session".into(),
+                                adapter_id: "test.adapter".into(),
+                                start_sample: 0,
+                                end_sample: 16_000,
+                                decision_sample: 17_920,
+                                confidence: Some(0.1),
+                            },
+                        ],
+                        &mut writer,
+                    )
+                    .unwrap();
                 let actions = actions.lock().unwrap();
                 assert!(actions.iter().any(|action| matches!(
                     action,
