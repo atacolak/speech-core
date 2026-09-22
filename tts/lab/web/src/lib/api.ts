@@ -846,3 +846,105 @@ export function formatBytes(value?: number | null): string {
   const digits = unit === 0 ? 0 : 1
   return `${amount.toFixed(digits)} ${units[unit]}`
 }
+
+export type ConversationTurn = {
+  id: string
+  conversation_id: string
+  msg_seq: number
+  variation_seq: number
+  role: 'user' | 'assistant'
+  text: string
+  audio_artifact_id: string | null
+  voice_id: string | null
+  steer: string | null
+  generation: Record<string, unknown> | null
+  alignment: RunAlignment | null
+  chosen: boolean
+  started_at: number | null
+  ended_at: number | null
+}
+
+export type ConversationSummary = {
+  id: string
+  started_at: string
+  ended_at: string | null
+  saved: boolean
+  turn_count: number
+}
+
+export type ConversationDetail = ConversationSummary & { turns: ConversationTurn[] }
+
+export async function fetchConversations(): Promise<ConversationSummary[]> {
+  const response = await apiFetch('/api/conversations')
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  const body = (await response.json()) as { items: ConversationSummary[] }
+  return body.items
+}
+
+export async function fetchConversation(id: string): Promise<ConversationDetail> {
+  const response = await apiFetch(`/api/conversations/${id}`)
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as ConversationDetail
+}
+
+export async function putConversationRingLimit(ringLimit: number): Promise<{ ring_limit: number }> {
+  const response = await apiFetch('/api/conversations/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ring_limit: ringLimit }),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as { ring_limit: number }
+}
+
+export async function chooseTurnVariation(conversationId: string, turnId: string): Promise<ConversationTurn> {
+  const response = await apiFetch(`/api/conversations/${conversationId}/turns/${turnId}/choose`, {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as ConversationTurn
+}
+
+export async function saveTurnVariation(conversationId: string, turnId: string): Promise<{ run_id: string }> {
+  const response = await apiFetch(`/api/conversations/${conversationId}/turns/${turnId}/save`, {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as { run_id: string }
+}
+
+export async function saveConversation(conversationId: string): Promise<ConversationSummary> {
+  const response = await apiFetch(`/api/conversations/${conversationId}/save`, {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as ConversationSummary
+}
+
+export async function regenerateTurn(
+  conversationId: string,
+  turnId: string,
+  generation?: Record<string, unknown>,
+): Promise<ConversationTurn> {
+  const response = await apiFetch(`/api/conversations/${conversationId}/turns/${turnId}/regenerate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ generation }),
+  })
+  if (!response.ok) {
+    throw await readError(response, 'conversations')
+  }
+  return (await response.json()) as ConversationTurn
+}
