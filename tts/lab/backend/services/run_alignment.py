@@ -76,6 +76,32 @@ def align_run(store: Any, run_id: str, artifact_id: str) -> None:
         return
 
 
+def align_turn(store: Any, turn_id: str, artifact_id: str) -> None:
+    """Align one settled conversation turn on CPU and cache it. Never raises."""
+    try:
+        result = transcribe_alignment(store.get(artifact_id).path)
+        words = _words(result.get("words"))
+        if words:
+            alignment: dict[str, Any] = {
+                "status": READY,
+                "text": str(result.get("text") or "").strip(),
+                "words": words,
+            }
+        else:
+            alignment = unavailable_alignment()
+    except Exception:
+        alignment = unavailable_alignment()
+    try:
+        store.execute(
+            "UPDATE conversation_turns SET alignment_json = ?"
+            " WHERE id = ? AND alignment_json = ?",
+            (json.dumps(alignment), turn_id, json.dumps(pending_alignment())),
+        )
+        store.commit()
+    except Exception:
+        return
+
+
 class RunAlignments:
     """Deduplicated CPU alignment of settled runs; one daemon thread per run id."""
 
@@ -104,9 +130,34 @@ class RunAlignments:
             with self._lock:
                 self._active.discard(run_id)
 
+    def schedule_turn(self, store: Any, turn_id: str, artifact_id: str) -> None:
+        """Start alignment for a pending turn unless it is already running."""
+        key = f"turn:{turn_id}"
+        with self._lock:
+            if key in self._active:
+                return
+            self._active.add(key)
+        try:
+            threading.Thread(
+                target=self._run_turn,
+                args=(store, turn_id, artifact_id),
+                name=f"turn-align-{turn_id}",
+                daemon=True,
+            ).start()
+        except Exception:
+            with self._lock:
+                self._active.discard(key)
+
     def _run(self, store: Any, run_id: str, artifact_id: str) -> None:
         try:
             align_run(store, run_id, artifact_id)
         finally:
             with self._lock:
                 self._active.discard(run_id)
+
+    def _run_turn(self, store: Any, turn_id: str, artifact_id: str) -> None:
+        try:
+            align_turn(store, turn_id, artifact_id)
+        finally:
+            with self._lock:
+                self._active.discard(f"turn:{turn_id}")

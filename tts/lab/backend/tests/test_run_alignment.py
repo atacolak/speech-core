@@ -352,5 +352,166 @@ class RunAlignmentTest(unittest.TestCase):
         self.assertEqual(aligner.calls, 1)
 
 
+class TurnAlignmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from tts.lab.backend.app import create_app
+        from tts.lab.backend.runtime.worker import ScriptedWorkerHandle
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.factory = CountingWorkerFactory(
+            handle_factory=lambda: ScriptedWorkerHandle(
+                frames=[b"\x01\x00" * 480, b"\x02\x00" * 480, b"\x03\x00" * 480]
+            )
+        )
+        self.runtime = E2RuntimeManager(
+            vram=FixedVramProbe(free=12 * GIB),
+            leftover=NoopLeftover(),
+            worker_factory=self.factory,
+            required_vram_bytes=8 * GIB,
+            vram_margin_bytes=0,
+        )
+        self.runtime.load()
+        self.client = TestClient(create_app(root=self.root, leftover_parked=False, e2_runtime=self.runtime))
+        self.state = self.client.app.state.lab
+        self.store = self.state.store
+        ref = self.root / "ref.wav"
+        write_wav(ref, SAMPLE_RATE, np.zeros(2400, dtype=np.float32))
+        with ref.open("rb") as handle:
+            self.voice = self.client.post(
+                "/api/voices",
+                data={"name": "align", "transcript": "fixture"},
+                files={"audio": ("ref.wav", handle, "audio/wav")},
+            ).json()
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.runtime.unload()
+        self.tmp.cleanup()
+
+    def _capture_assistant_turn(self) -> dict:
+        self.client.post("/api/talker/voice", json={"voice_id": self.voice["id"]})
+        held = self.client.post("/api/runtime/live-call", json={"ttl_s": 45})
+        self.assertEqual(held.status_code, 200, held.text)
+        conversation_id = held.json()["conversation_id"]
+        pcm = self.client.post(
+            "/internal/leftover/v1/audio/speech",
+            json={
+                "input": "hello world",
+                "voice": "ryan",
+                "response_format": "pcm",
+                "stream": True,
+            },
+        )
+        self.assertEqual(pcm.status_code, 200, pcm.text)
+        row = self.store.execute(
+            "SELECT * FROM conversation_turns WHERE conversation_id = ? AND role = 'assistant'",
+            (conversation_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return dict(row)
+
+    def _turn_alignment(self, conversation_id: str, client: TestClient | None = None) -> dict:
+        response = (client or self.client).get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        turns = response.json()["turns"]
+        self.assertEqual(len(turns), 1)
+        return turns[0]["alignment"]
+
+    def _settled_turn(self, conversation_id: str, client: TestClient | None = None) -> dict:
+        deadline = time.monotonic() + POLL_S
+        while True:
+            response = (client or self.client).get(f"/api/conversations/{conversation_id}")
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            alignment = (body["turns"][0].get("alignment") or {})
+            if alignment.get("status") != "pending":
+                return body
+            if time.monotonic() >= deadline:
+                self.fail(f"turn alignment stayed pending: {response.text}")
+            time.sleep(0.02)
+
+    def test_turn_alignment_pending_then_ready_cached(self) -> None:
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            try:
+                turn = self._capture_assistant_turn()
+                self.assertTrue(aligner.entered.wait(timeout=POLL_S), "alignment never started")
+                self.assertFalse(aligner.release.is_set())
+                raw = self.store.execute(
+                    "SELECT alignment_json FROM conversation_turns WHERE id = ?",
+                    (turn["id"],),
+                ).fetchone()
+                self.assertEqual(json.loads(raw["alignment_json"]), {"status": "pending"})
+                self.assertEqual(
+                    self._turn_alignment(turn["conversation_id"]), {"status": "pending"}
+                )
+            finally:
+                aligner.release.set()
+            body = self._settled_turn(turn["conversation_id"])
+        self.assertEqual(
+            body["turns"][0]["alignment"],
+            {"status": "ready", "text": "hello world", "words": WORDS},
+        )
+        self.assertEqual(aligner.calls, 1)
+
+    def test_pending_turn_alignment_resumes_on_detail_read(self) -> None:
+        from tts.lab.backend.app import create_app
+
+        settled = self.root / "turn-pending.wav"
+        write_wav(settled, SAMPLE_RATE, np.zeros(2400, dtype=np.float32))
+        artifact = self.store.import_audio(settled)
+        conversation_id = "cv_pending_seed"
+        turn_id = "ct_pending_seed"
+        self.store.execute(
+            "INSERT INTO conversations (id, started_at, ended_at, saved, created_at)"
+            " VALUES (?, ?, NULL, 0, ?)",
+            (conversation_id, "2026-09-16T00:00:00Z", "2026-09-16T00:00:00Z"),
+        )
+        self.store.execute(
+            """
+            INSERT INTO conversation_turns (
+                id, conversation_id, msg_seq, variation_seq, role, text,
+                audio_artifact_id, voice_id, steer, generation_json, alignment_json,
+                chosen, started_at, ended_at, created_at
+            ) VALUES (?, ?, 0, 0, 'assistant', 'hello world', ?, ?, NULL, NULL, ?, 1, NULL, NULL, ?)
+            """,
+            (
+                turn_id,
+                conversation_id,
+                artifact.id,
+                self.voice["id"],
+                json.dumps({"status": "pending"}),
+                "2026-09-16T00:00:00Z",
+            ),
+        )
+        self.store.commit()
+        self.client.close()
+
+        aligner = FakeAlignment(held=True)
+        with patch(ALIGN_TARGET, new=aligner):
+            with TestClient(create_app(root=self.root, leftover_parked=False, e2_runtime=self.runtime)) as restarted:
+                listed = restarted.get(f"/api/conversations/{conversation_id}")
+                self.assertEqual(listed.status_code, 200, listed.text)
+                self.assertEqual(listed.json()["turns"][0]["alignment"], {"status": "pending"})
+                self.assertTrue(
+                    aligner.entered.wait(timeout=POLL_S), "detail never resumed alignment"
+                )
+                try:
+                    self.assertEqual(
+                        listed.json()["turns"][0]["alignment"], {"status": "pending"}
+                    )
+                finally:
+                    aligner.release.set()
+                body = self._settled_turn(conversation_id, restarted)
+        self.assertEqual(
+            body["turns"][0]["alignment"],
+            {"status": "ready", "text": "hello world", "words": WORDS},
+        )
+        self.assertEqual(aligner.paths, [str(artifact.path)])
+        self.assertEqual(aligner.calls, 1)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -176,3 +176,50 @@ def prune_unsaved_conversations(store: Any, ring_limit: int | None = None) -> in
     if extras:
         store.commit()
     return len(extras)
+
+
+def keep_turn_as_take(store: Any, turn: dict[str, Any]) -> str:
+    """Save one chosen assistant variation as a generate keep-take on its voice."""
+    from tts.wav import read_wav
+
+    run_id = new_id("run")
+    created = _now()
+    artifact = store.get(turn["audio_artifact_id"])
+    rate, samples = read_wav(artifact.path)
+    snapshot = {
+        "text": turn["text"],
+        "steer": turn["steer"],
+        "voice_profile_id": turn["voice_id"],
+        "generation": turn["generation"],
+        "conversation_turn_id": turn["id"],
+    }
+    store.execute(
+        """
+        INSERT INTO runs (
+            id, voice_id, request_json, output_artifact_id, effective_reference_json,
+            latency_ms, first_audio_ms, duration_s, rating, tags_json, created_at,
+            alignment_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            turn["voice_id"],
+            json.dumps(snapshot),
+            turn["audio_artifact_id"],
+            json.dumps({}),
+            0.0,
+            None,
+            float(len(samples)) / float(rate),
+            "keep",
+            json.dumps([]),
+            created,
+            turn["alignment_json"],
+        ),
+    )
+    store.pin(turn["audio_artifact_id"], reason=f"run:{run_id}")
+    store.execute(
+        "UPDATE voices SET latest_take_id = ?, updated_at = ? WHERE id = ?",
+        (run_id, created, turn["voice_id"]),
+    )
+    store.commit()
+    return run_id

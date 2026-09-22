@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator
@@ -9,6 +10,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from tts.lab.backend.services.conversations import insert_turn, open_conversation_id
+from tts.lab.backend.services.run_alignment import pending_alignment
 from tts.wav import write_wav
 
 SAMPLE_RATE = 24000  # 24 kHz s16le mono, per the hop contract
@@ -52,7 +54,15 @@ class ConversationRecorder:
                 steer=request.get("steer"),
                 generation=request.get("generation"),
             )
+            self._store.execute(
+                "UPDATE conversation_turns SET alignment_json = ? WHERE id = ?",
+                (json.dumps(pending_alignment()), turn["id"]),
+            )
             self._store.pin(artifact.id, reason=f"turn:{turn['id']}")
             self._store.commit()
+            try:
+                self._alignments.schedule_turn(self._store, turn["id"], artifact.id)
+            except Exception:
+                pass
         except Exception:
             return

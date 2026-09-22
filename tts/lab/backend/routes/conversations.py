@@ -11,7 +11,12 @@ import numpy as np
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, ConfigDict
 
-from tts.lab.backend.services.conversations import clamp_ring_limit, insert_turn
+from tts.lab.backend.services.conversations import (
+    clamp_ring_limit,
+    insert_turn,
+    keep_turn_as_take,
+    prune_unsaved_conversations,
+)
 from tts.lab.backend.store.session import write_conversation_ring_limit
 from tts.wav import write_wav
 
@@ -59,6 +64,35 @@ def _turn(row: Any) -> dict[str, Any]:
     }
 
 
+def _get_conversation_row(store: Any, conversation_id: str) -> Any:
+    row = store.execute(
+        "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"conversation not found: {conversation_id}")
+    return row
+
+
+def _get_turn_row(store: Any, conversation_id: str, turn_id: str) -> Any:
+    row = store.execute(
+        "SELECT * FROM conversation_turns WHERE id = ? AND conversation_id = ?",
+        (turn_id, conversation_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"turn not found: {turn_id}")
+    return row
+
+
+def _resume_pending_turns(state: Any, turns: list[Any]) -> None:
+    """A pending turn read after a restart gets its alignment thread back."""
+    for turn in turns:
+        alignment = _json_field(turn, "alignment_json")
+        artifact_id = turn["audio_artifact_id"]
+        if alignment is None or alignment.get("status") != "pending" or not artifact_id:
+            continue
+        state.run_alignments.schedule_turn(state.store, str(turn["id"]), str(artifact_id))
+
+
 @router.get("/api/conversations")
 def list_conversations(request: Request) -> dict[str, Any]:
     store = request.app.state.lab.store
@@ -70,17 +104,15 @@ def list_conversations(request: Request) -> dict[str, Any]:
 
 @router.get("/api/conversations/{conversation_id}")
 def get_conversation(request: Request, conversation_id: str) -> dict[str, Any]:
-    store = request.app.state.lab.store
-    row = store.execute(
-        "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"conversation not found: {conversation_id}")
+    state = request.app.state.lab
+    store = state.store
+    row = _get_conversation_row(store, conversation_id)
     turns = store.execute(
         "SELECT * FROM conversation_turns WHERE conversation_id = ?"
         " ORDER BY msg_seq, variation_seq",
         (conversation_id,),
     ).fetchall()
+    _resume_pending_turns(state, turns)
     return {**_summary(store, row), "turns": [_turn(turn) for turn in turns]}
 
 
@@ -137,3 +169,74 @@ async def post_user_turn(
         store.pin(artifact_id, reason=f"turn:{turn['id']}")
         store.commit()
     return _turn(turn)
+
+
+@router.post("/api/conversations/{conversation_id}/turns/{turn_id}/choose")
+def choose_turn(request: Request, conversation_id: str, turn_id: str) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    _get_conversation_row(store, conversation_id)
+    turn = _get_turn_row(store, conversation_id, turn_id)
+    store.execute(
+        """
+        UPDATE conversation_turns SET chosen = 0
+        WHERE conversation_id = ? AND msg_seq = ?
+        """,
+        (conversation_id, turn["msg_seq"]),
+    )
+    store.execute(
+        "UPDATE conversation_turns SET chosen = 1 WHERE id = ?",
+        (turn_id,),
+    )
+    store.commit()
+    row = store.execute(
+        "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+    ).fetchone()
+    return _turn(row)
+
+
+@router.post("/api/conversations/{conversation_id}/turns/{turn_id}/save")
+def save_turn(request: Request, conversation_id: str, turn_id: str) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    _get_conversation_row(store, conversation_id)
+    turn = dict(_get_turn_row(store, conversation_id, turn_id))
+    if (
+        turn["role"] != "assistant"
+        or not turn.get("audio_artifact_id")
+        or not turn.get("voice_id")
+    ):
+        raise HTTPException(status_code=422, detail="turn is not a savable assistant variation")
+    turn["generation"] = _json_field(turn, "generation_json")
+    run_id = keep_turn_as_take(store, turn)
+    return {"run_id": run_id}
+
+
+@router.post("/api/conversations/{conversation_id}/save")
+def save_conversation(request: Request, conversation_id: str) -> dict[str, Any]:
+    store = request.app.state.lab.store
+    row = _get_conversation_row(store, conversation_id)
+    store.execute(
+        "UPDATE conversations SET saved = 1 WHERE id = ?",
+        (conversation_id,),
+    )
+    store.commit()
+    turns = store.execute(
+        "SELECT * FROM conversation_turns WHERE conversation_id = ?"
+        " ORDER BY msg_seq, variation_seq",
+        (conversation_id,),
+    ).fetchall()
+    for turn in turns:
+        if (
+            turn["role"] != "assistant"
+            or not turn["chosen"]
+            or not turn["audio_artifact_id"]
+            or not turn["voice_id"]
+        ):
+            continue
+        payload = dict(turn)
+        payload["generation"] = _json_field(turn, "generation_json")
+        keep_turn_as_take(store, payload)
+    prune_unsaved_conversations(store)
+    row = store.execute(
+        "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    return _summary(store, row)
