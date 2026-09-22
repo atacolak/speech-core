@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { TakePlayer } from '@/components/take-player'
@@ -62,6 +62,21 @@ function voiceName(voices: Voice[], voiceId: string | null): string {
   return voices.find((voice) => voice.id === voiceId)?.name ?? voiceId
 }
 
+function firstUserText(turns: ConversationTurn[]): string | null {
+  const text = turns.find((turn) => turn.role === 'user')?.text.trim()
+  return text || null
+}
+
+function railTitle(
+  item: { id: string; title: string | null },
+  details: Array<{ id: string; turns: ConversationTurn[] } | undefined>,
+): string {
+  const stored = item.title?.trim()
+  if (stored) return stored
+  const detail = details.find((row) => row?.id === item.id)
+  return firstUserText(detail?.turns ?? []) || item.id
+}
+
 function TurnView({ turn }: { turn: ConversationTurn }) {
   const [timeline, setTimeline] = useState<PcmTimeline | null>(null)
   const [playing, setPlaying] = useState(false)
@@ -121,6 +136,17 @@ export function ConversationsPane() {
   const [regenErrors, setRegenErrors] = useState<Record<string, string>>({})
   const conversations = useQuery({ queryKey: ['conversations'], queryFn: fetchConversations })
   const voices = useQuery({ queryKey: ['voices'], queryFn: fetchVoices })
+  const untitledItems = useMemo(
+    () => (conversations.data ?? []).filter((item) => !item.title?.trim()),
+    [conversations.data],
+  )
+  const untitledDetails = useQueries({
+    queries: untitledItems.map((item) => ({
+      queryKey: ['conversation', item.id] as const,
+      queryFn: () => fetchConversation(item.id),
+    })),
+  })
+  const untitledRows = untitledDetails.map((query) => query.data)
   const detail = useQuery({
     queryKey: ['conversation', selectedId],
     queryFn: () => fetchConversation(selectedId!),
@@ -143,7 +169,7 @@ export function ConversationsPane() {
   const messages = detail.data ? groupTurns(detail.data.turns) : []
   const sessionTitle =
     detail.data?.title?.trim() ||
-    messages.find((message) => message.role === 'user')?.variations[0]?.text.trim() ||
+    firstUserText(detail.data?.turns ?? []) ||
     selectedId ||
     'conversation'
   const participantNames = useMemo(() => {
@@ -289,14 +315,14 @@ export function ConversationsPane() {
               )}
               onClick={() => setSelectedId(item.id)}
             >
-              <span className="block truncate">{item.title?.trim() || item.id}</span>
+              <span className="block truncate">{railTitle(item, untitledRows)}</span>
               {item.saved ? (
                 <span className="text-[11px] uppercase tracking-wide text-emerald-400">saved</span>
               ) : null}
             </button>
           ))}
         </aside>
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-5 overflow-y-auto p-4">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
           {detail.data && messages.length === 0 ? (
             <p className="text-sm text-zinc-400">
               no turns in this session. live-call opened it; leftover mouth pcm
@@ -310,7 +336,7 @@ export function ConversationsPane() {
             return (
               <div className={cn('flex flex-col gap-1', mine ? 'items-start' : 'items-end')} key={message.msgSeq}>
                 {speaker ? (
-                  <p className="text-[11px] font-normal text-zinc-500">
+                  <p className="text-[11px] font-normal text-zinc-500" data-testid="speaker-label">
                     {speaker.role === 'user' ? 'You' : voiceName(voices.data ?? [], speaker.voiceId)}
                   </p>
                 ) : null}

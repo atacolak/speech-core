@@ -74,6 +74,23 @@ class ConversationsApiTest(_ConversationsHttpCase):
         self.assertEqual(by_id[newer]["turn_count"], 2)
         self.assertIsNotNone(by_id[older]["ended_at"])
         self.assertIsNone(by_id[newer]["ended_at"])
+        self.assertEqual(by_id[older]["title"], "first")
+        self.assertEqual(by_id[newer]["title"], "hello")
+
+    def test_list_title_falls_back_to_first_user_text(self) -> None:
+        conversation_id = begin_session(self.store, None)
+        insert_turn(
+            self.store,
+            conversation_id,
+            role="user",
+            text="  Say one sentence to me.  ",
+        )
+        insert_turn(self.store, conversation_id, role="assistant", text="ok")
+        response = self.client.get("/api/conversations")
+        self.assertEqual(response.status_code, 200, response.text)
+        by_id = {item["id"]: item for item in response.json()["items"]}
+        self.assertEqual(by_id[conversation_id]["title"], "Say one sentence to me.")
+
 
     def test_detail_returns_variations_with_parsed_json(self) -> None:
         conversation_id = begin_session(self.store, None)

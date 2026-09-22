@@ -239,6 +239,35 @@ describe('conversations pane', () => {
     expect(marker.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
+  it('does not re-label user and assistant ping-pong', async () => {
+    vi.mocked(fetchConversation).mockResolvedValue(
+      detail([
+        turn({
+          id: 'ct_u0',
+          msg_seq: 0,
+          role: 'user',
+          text: 'first user',
+          voice_id: null,
+          audio_artifact_id: null,
+        }),
+        turn({ id: 'ct_a0', msg_seq: 1, text: 'first asst', voice_id: 'v1', audio_artifact_id: 'art_a' }),
+        turn({
+          id: 'ct_u1',
+          msg_seq: 2,
+          role: 'user',
+          text: 'second user',
+          voice_id: null,
+          audio_artifact_id: null,
+        }),
+        turn({ id: 'ct_a1', msg_seq: 3, text: 'second asst', voice_id: 'v1', audio_artifact_id: 'art_b' }),
+      ]),
+    )
+    renderPane()
+    expect(await screen.findByText('second asst')).toBeInTheDocument()
+    expect(screen.getAllByTestId('speaker-label').map((node) => node.textContent)).toEqual(['You'])
+    expect(screen.queryByTestId('speaker-label')).toHaveTextContent('You')
+  })
+
   it('shows the spoken-word box only while that turn is playing', async () => {
     vi.mocked(fetchConversation).mockResolvedValue(
       detail([
@@ -390,6 +419,40 @@ describe('conversations pane', () => {
     renderPane()
     expect(await screen.findByText('Understood')).toBeInTheDocument()
     expect(screen.getAllByText('Ford').length).toBeGreaterThan(0)
+  })
+
+  it('names the rail from first user text when list title is missing', async () => {
+    vi.mocked(fetchConversations).mockResolvedValue([
+      { ...SUMMARY, id: 'cv_27569bc252f2', title: null, turn_count: 2 },
+    ])
+    vi.mocked(fetchConversation).mockResolvedValue({
+      ...SUMMARY,
+      id: 'cv_27569bc252f2',
+      title: null,
+      turn_count: 2,
+      turns: [
+        turn({
+          id: 'ct_user',
+          msg_seq: 0,
+          role: 'user',
+          text: 'Say one sentence to me.',
+          voice_id: null,
+          audio_artifact_id: null,
+        }),
+        turn({
+          id: 'ct_asst',
+          msg_seq: 1,
+          text: 'Ready',
+          voice_id: 'v1',
+          audio_artifact_id: 'art_1',
+        }),
+      ],
+    })
+    renderPane()
+    expect(
+      await screen.findByRole('button', { name: /Say one sentence to me/i }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /cv_27569bc252f2/ })).toBeNull()
   })
 
   it('deletes a variation and a conversation', async () => {
